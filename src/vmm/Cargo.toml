@@ -84,5 +84,13 @@ harness = false
 name = "memory_access"
 harness = false
 
+[[bench]]
+name = "overlay_io"
+harness = false
+
+[[bench]]
+name = "baseline_io"
+harness = false
+
 [lints]
 workspace = true
