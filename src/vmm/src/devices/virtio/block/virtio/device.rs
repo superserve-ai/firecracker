@@ -14,6 +14,8 @@ use std::os::linux::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::path::Path;
+
 use block_io::FileEngine;
 use block_io::dirty_bitmap::DEFAULT_BLOCK_SIZE;
 use serde::{Deserialize, Serialize};
@@ -703,6 +705,20 @@ impl VirtioBlock {
         self.drain_and_flush(false);
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
             self.process_async_completion_queue();
+        }
+    }
+
+    /// Write a delta file for this device if it uses an overlay engine.
+    /// Returns `Ok(Some(stats))` if a delta was written, `Ok(None)` if not an overlay device.
+    pub fn write_delta(
+        &mut self,
+        delta_path: &Path,
+    ) -> Result<Option<block_io::delta::DeltaStats>, block_io::delta::DeltaError> {
+        if let FileEngine::Overlay(ref mut engine) = self.disk.file_engine {
+            let stats = engine.write_delta(delta_path)?;
+            Ok(Some(stats))
+        } else {
+            Ok(None)
         }
     }
 }

@@ -177,6 +177,18 @@ pub fn create_snapshot(
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
+    // Write delta files for overlay block devices if a delta directory is specified.
+    if let Some(ref delta_dir) = params.block_delta_dir {
+        vmm.device_manager
+            .write_block_deltas(delta_dir)
+            .map_err(|e| {
+                CreateSnapshotError::SnapshotBackingFile(
+                    "write_block_deltas",
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)),
+                )
+            })?;
+    }
+
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
     // for queue objects.

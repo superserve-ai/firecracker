@@ -1173,6 +1173,7 @@ mod tests {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
+                block_delta_dir: None,
             },
         )));
         #[cfg(target_arch = "x86_64")]

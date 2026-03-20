@@ -5,7 +5,7 @@
 
 pub mod device;
 mod event_handler;
-mod io;
+pub mod io;
 pub mod metrics;
 pub mod persist;
 pub mod request;

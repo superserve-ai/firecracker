@@ -7,10 +7,13 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use log::info;
 use vmm_sys_util::eventfd::EventFd;
 
+use std::path::Path;
+
 use super::BlockError;
 use super::persist::{BlockConstructorArgs, BlockState};
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
+use super::virtio::io::delta;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
@@ -113,6 +116,17 @@ impl Block {
         match self {
             Self::Virtio(_) => false,
             Self::VhostUser(_) => true,
+        }
+    }
+
+    /// Write a delta file if this block device uses an overlay engine.
+    pub fn write_delta(
+        &mut self,
+        delta_path: &Path,
+    ) -> Result<Option<delta::DeltaStats>, delta::DeltaError> {
+        match self {
+            Self::Virtio(b) => b.write_delta(delta_path),
+            Self::VhostUser(_) => Ok(None),
         }
     }
 }
