@@ -103,6 +103,7 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
             file_engine_type: None,
 
             socket: Some(value.socket),
+            base_path: None,
         }
     }
 }
@@ -411,6 +412,7 @@ mod tests {
             file_engine_type: None,
 
             socket: Some("sock".to_string()),
+            base_path: None,
         };
         VhostUserBlockConfig::try_from(&block_config).unwrap();
 
@@ -426,6 +428,7 @@ mod tests {
             file_engine_type: Some(FileEngineType::Sync),
 
             socket: None,
+            base_path: None,
         };
         VhostUserBlockConfig::try_from(&block_config).unwrap_err();
 
@@ -441,6 +444,7 @@ mod tests {
             file_engine_type: Some(FileEngineType::Sync),
 
             socket: Some("sock".to_string()),
+            base_path: None,
         };
         VhostUserBlockConfig::try_from(&block_config).unwrap_err();
     }

@@ -34,7 +34,7 @@ pub enum FileEngineTypeState {
 impl From<FileEngineType> for FileEngineTypeState {
     fn from(file_engine_type: FileEngineType) -> Self {
         match file_engine_type {
-            FileEngineType::Sync => FileEngineTypeState::Sync,
+            FileEngineType::Sync | FileEngineType::Overlay => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
         }
     }
@@ -162,6 +162,7 @@ mod tests {
             cache_type: CacheType::Writeback,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            base_path: None,
         };
 
         let block = VirtioBlock::new(config).unwrap();
@@ -203,6 +204,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            base_path: None,
         };
 
         let block = VirtioBlock::new(config).unwrap();

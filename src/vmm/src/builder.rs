@@ -877,6 +877,7 @@ pub(crate) mod tests {
                 file_engine_type: None,
 
                 socket: None,
+                base_path: None,
             };
 
             block_dev_configs
