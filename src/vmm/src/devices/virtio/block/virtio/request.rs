@@ -14,7 +14,8 @@ use crate::devices::virtio::block::virtio::device::DiskProperties;
 use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
 pub use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
-    VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
+    VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN,
+    VIRTIO_BLK_T_OUT,
 };
 use crate::devices::virtio::queue::DescriptorChain;
 use crate::logger::{IncMetric, error};
@@ -34,6 +35,7 @@ pub enum RequestType {
     Out,
     Flush,
     GetDeviceID,
+    Discard,
     Unsupported(u32),
 }
 
@@ -44,6 +46,7 @@ impl From<u32> for RequestType {
             VIRTIO_BLK_T_OUT => RequestType::Out,
             VIRTIO_BLK_T_FLUSH => RequestType::Flush,
             VIRTIO_BLK_T_GET_ID => RequestType::GetDeviceID,
+            VIRTIO_BLK_T_DISCARD => RequestType::Discard,
             t => RequestType::Unsupported(t),
         }
     }
@@ -176,6 +179,9 @@ impl PendingRequest {
             (Ok(transferred_data_len), RequestType::GetDeviceID) => {
                 Status::from_data(self.data_len, transferred_data_len, true)
             }
+            (Ok(_), RequestType::Discard) => Status::Ok {
+                num_bytes_to_mem: 0,
+            },
             (_, RequestType::Unsupported(op)) => Status::Unsupported { op },
             (Err(err), _) => Status::IoErr {
                 num_bytes_to_mem: 0,
@@ -308,6 +314,12 @@ impl Request {
                     return Err(VirtioBlockError::InvalidOffset);
                 }
             }
+            RequestType::Discard => {
+                // Discard segments are 16 bytes each (sector u64, num_sectors u32, flags u32).
+                if req.data_len == 0 || !req.data_len.is_multiple_of(16) {
+                    return Err(VirtioBlockError::InvalidDataLength);
+                }
+            }
             RequestType::GetDeviceID => {
                 if req.data_len < VIRTIO_BLK_ID_BYTES {
                     return Err(VirtioBlockError::InvalidDataLength);
@@ -383,6 +395,35 @@ impl Request {
                     .write(self.offset(), mem, self.data_addr, self.data_len, pending)
             }
             RequestType::Flush => disk.file_engine.flush(pending),
+            RequestType::Discard => {
+                // The discard data descriptor contains virtio_blk_discard_write_zeroes
+                // segments (16 bytes each: sector u64, num_sectors u32, flags u32).
+                // Parse and discard each segment.
+                let segment_size = 16u32;
+                let num_segments = self.data_len / segment_size;
+                let mut discard_err = None;
+
+                for i in 0..num_segments {
+                    let seg_addr = GuestAddress(self.data_addr.0 + u64::from(i * segment_size));
+                    let sector: u64 = mem.read_obj(seg_addr).unwrap_or(0);
+                    let num_sectors: u32 = mem
+                        .read_obj(GuestAddress(seg_addr.0 + 8))
+                        .unwrap_or(0);
+                    let offset = sector << SECTOR_SHIFT;
+                    let len = u64::from(num_sectors) << SECTOR_SHIFT;
+
+                    if let Err(e) = disk.file_engine.discard(offset, len as u32) {
+                        discard_err = Some(e);
+                        break;
+                    }
+                }
+
+                let res = match discard_err {
+                    Some(e) => Err(IoErr::FileEngine(e)),
+                    None => Ok(0),
+                };
+                return ProcessingResult::Executed(pending.finish(mem, res, block_metrics));
+            }
             RequestType::GetDeviceID => {
                 let res = mem
                     .write_slice(&disk.image_id, self.data_addr)
@@ -731,6 +772,7 @@ mod tests {
                 RequestType::Out => VIRTIO_BLK_T_OUT,
                 RequestType::Flush => VIRTIO_BLK_T_FLUSH,
                 RequestType::GetDeviceID => VIRTIO_BLK_T_GET_ID,
+                RequestType::Discard => VIRTIO_BLK_T_DISCARD,
                 RequestType::Unsupported(id) => id,
             }
         }
@@ -740,7 +782,7 @@ mod tests {
     fn request_type_flags(request_type: RequestType) -> u16 {
         match request_type {
             RequestType::In => VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
-            RequestType::Out => VIRTQ_DESC_F_NEXT,
+            RequestType::Out | RequestType::Discard => VIRTQ_DESC_F_NEXT,
             RequestType::Flush => VIRTQ_DESC_F_NEXT,
             RequestType::GetDeviceID => VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
             RequestType::Unsupported(_) => VIRTQ_DESC_F_NEXT,

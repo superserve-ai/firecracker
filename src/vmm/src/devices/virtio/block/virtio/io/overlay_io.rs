@@ -86,6 +86,48 @@ impl OverlayFileEngine {
         &mut self.overlay
     }
 
+    /// Discard blocks in the overlay: clear bitmap bits and punch holes in the overlay file.
+    pub fn discard(&mut self, offset: u64, len: u32) -> Result<(), OverlayIoError> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        // Clear bitmap bits for the discarded range.
+        let block_size = u64::from(self.bitmap.block_size());
+        let start_block = offset / block_size;
+        let end_offset = offset.saturating_add(u64::from(len)).saturating_sub(1);
+        let end_block = end_offset / block_size;
+        let clamped_end = end_block.min(self.bitmap.total_blocks() - 1);
+
+        for block in start_block..=clamped_end {
+            self.bitmap.unset(block);
+        }
+
+        // Punch a hole in the overlay file to reclaim host disk space.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.overlay.as_raw_fd();
+            // SAFETY: fallocate with FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE is safe
+            // on a valid fd with valid offset/len.
+            let ret = unsafe {
+                libc::fallocate(
+                    fd,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as i64,
+                    i64::from(len),
+                )
+            };
+            if ret != 0 {
+                // Hole punching failure is non-fatal — the bitmap is already cleared,
+                // so reads will go to base. We just don't reclaim the space.
+                let _ = std::io::Error::last_os_error();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Write a delta file containing only dirty blocks from this overlay.
     pub fn write_delta(
         &mut self,

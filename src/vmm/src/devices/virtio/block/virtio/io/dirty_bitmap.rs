@@ -72,6 +72,13 @@ impl DirtyBitmap {
         }
     }
 
+    /// Mark a specific block as clean.
+    pub fn unset(&mut self, block_idx: u64) {
+        if block_idx < self.total_blocks {
+            self.bits.set(block_idx as usize, false);
+        }
+    }
+
     /// Check whether a specific block index is dirty.
     pub fn is_set(&self, block_idx: u64) -> bool {
         if block_idx >= self.total_blocks {
