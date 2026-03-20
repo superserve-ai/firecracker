@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod async_io;
-pub mod dirty_bitmap;
-pub mod overlay_io;
 pub mod sync_io;
 
 use std::fmt::Debug;
