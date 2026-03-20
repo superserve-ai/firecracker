@@ -77,6 +77,10 @@ pub struct LoadSnapshotParams {
     pub resume_vm: bool,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
+    /// Optional directory containing block device delta files for cloning.
+    /// Each overlay device will look for `{drive_id}.delta` in this directory
+    /// and apply it to a fresh overlay, enabling fast VM cloning.
+    pub block_delta_dir: Option<PathBuf>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -106,6 +110,9 @@ pub struct LoadSnapshotConfig {
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
+    /// Optional directory containing block device delta files for cloning.
+    #[serde(default)]
+    pub block_delta_dir: Option<PathBuf>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

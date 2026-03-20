@@ -210,6 +210,62 @@ impl DiskProperties {
         })
     }
 
+    /// Create an overlay file engine by applying a delta to a fresh overlay.
+    /// Used for VM cloning: the delta contains only the dirty blocks from a source VM.
+    pub fn new_overlay_from_delta(
+        base_image_path: String,
+        overlay_path: String,
+        delta_path: &Path,
+    ) -> Result<Self, VirtioBlockError> {
+        let mut base_file = OpenOptions::new()
+            .read(true)
+            .open(PathBuf::from(&base_image_path))
+            .map_err(|x| VirtioBlockError::BackingFile(x, base_image_path.clone()))?;
+
+        let disk_size = Self::file_size(&base_image_path, &mut base_file)?;
+        let image_id = Self::build_disk_image_id(&base_file);
+
+        // Create a fresh sparse overlay.
+        let overlay_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(PathBuf::from(&overlay_path))
+            .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
+        overlay_file
+            .set_len(disk_size)
+            .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
+
+        let mut overlay_file = overlay_file;
+
+        // Apply the delta to populate the overlay and get the bitmap.
+        let (bitmap, _stats) = block_io::delta::apply_delta(&mut overlay_file, delta_path)
+            .map_err(|e| {
+                VirtioBlockError::BackingFile(
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)),
+                    delta_path.display().to_string(),
+                )
+            })?;
+
+        let overlay_engine = block_io::OverlayFileEngine::from_files(
+            base_file,
+            overlay_file,
+            disk_size,
+            bitmap.block_size(),
+            Some(bitmap),
+        )
+        .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(e)))?;
+
+        Ok(Self {
+            file_path: overlay_path,
+            base_path: Some(base_image_path),
+            file_engine: FileEngine::Overlay(overlay_engine),
+            nsectors: disk_size >> SECTOR_SHIFT,
+            image_id,
+        })
+    }
+
     /// Update the path to the file backing the block device
     pub fn update(
         &mut self,
