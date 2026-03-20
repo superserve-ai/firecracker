@@ -111,6 +111,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
+        block_delta_dir: snapshot_config.block_delta_dir,
     };
 
     // Construct the `ParsedRequest` object.

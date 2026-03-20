@@ -86,6 +86,10 @@ pub struct LoadSnapshotParams {
     pub network_overrides: Vec<NetworkOverride>,
     /// When set, the vsock backend UDS path will be overridden
     pub vsock_override: Option<VsockOverride>,
+    /// Optional directory containing block device delta files for cloning.
+    /// Each overlay device will look for `{drive_id}.delta` in this directory
+    /// and apply it to a fresh overlay, enabling fast VM cloning.
+    pub block_delta_dir: Option<PathBuf>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -118,6 +122,9 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to override the vsock backend UDS path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// Optional directory containing block device delta files for cloning.
+    #[serde(default)]
+    pub block_delta_dir: Option<PathBuf>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

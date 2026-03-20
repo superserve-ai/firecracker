@@ -68,6 +68,9 @@ pub struct OverlayState {
     pub block_size: u32,
     /// Total number of blocks in the bitmap.
     pub total_blocks: u64,
+    /// Optional delta directory for cloning. Not serialized — set at restore time.
+    #[serde(skip)]
+    pub delta_dir: Option<std::path::PathBuf>,
 }
 
 /// Holds info about the block device. Gets saved in snapshot.
@@ -86,6 +89,32 @@ pub struct VirtioBlockState {
     pub overlay_state: Option<OverlayState>,
 }
 
+impl VirtioBlock {
+    fn restore_overlay_from_bitmap(
+        overlay: &OverlayState,
+    ) -> Result<DiskProperties, VirtioBlockError> {
+        use crate::devices::virtio::block::virtio::io::dirty_bitmap::DirtyBitmap;
+
+        let bitmap = DirtyBitmap::deserialize(
+            &overlay.dirty_bitmap,
+            overlay.block_size,
+            overlay.total_blocks,
+        )
+        .map_err(|e| {
+            VirtioBlockError::FileEngine(io::BlockIoError::Overlay(
+                io::OverlayIoError::Bitmap(e),
+            ))
+        })?;
+
+        DiskProperties::new_overlay_with_bitmap(
+            overlay.base_path.clone(),
+            overlay.overlay_path.clone(),
+            overlay.block_size,
+            bitmap,
+        )
+    }
+}
+
 impl Persist<'_> for VirtioBlock {
     type State = VirtioBlockState;
     type ConstructorArgs = BlockConstructorArgs;
@@ -100,6 +129,7 @@ impl Persist<'_> for VirtioBlock {
                 dirty_bitmap: bitmap.serialize(),
                 block_size: bitmap.block_size(),
                 total_blocks: bitmap.total_blocks(),
+                delta_dir: None,
             })
         } else {
             None
@@ -127,25 +157,28 @@ impl Persist<'_> for VirtioBlock {
             .map_err(VirtioBlockError::RateLimiter)?;
 
         let disk_properties = if let Some(ref overlay) = state.overlay_state {
-            use crate::devices::virtio::block::virtio::io::dirty_bitmap::DirtyBitmap;
+            // Check if a delta directory was set (for cloning).
+            let delta_path = overlay
+                .delta_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("{}.delta", state.id)));
 
-            let bitmap = DirtyBitmap::deserialize(
-                &overlay.dirty_bitmap,
-                overlay.block_size,
-                overlay.total_blocks,
-            )
-            .map_err(|e| {
-                VirtioBlockError::FileEngine(io::BlockIoError::Overlay(
-                    io::OverlayIoError::Bitmap(e),
-                ))
-            })?;
-
-            DiskProperties::new_overlay_with_bitmap(
-                overlay.base_path.clone(),
-                overlay.overlay_path.clone(),
-                overlay.block_size,
-                bitmap,
-            )?
+            if let Some(ref delta_path) = delta_path {
+                if delta_path.exists() {
+                    // Clone path: apply delta to a fresh overlay.
+                    DiskProperties::new_overlay_from_delta(
+                        overlay.base_path.clone(),
+                        overlay.overlay_path.clone(),
+                        delta_path,
+                    )?
+                } else {
+                    // No delta file — fall through to bitmap restore.
+                    Self::restore_overlay_from_bitmap(overlay)?
+                }
+            } else {
+                // Normal restore: use the serialized bitmap.
+                Self::restore_overlay_from_bitmap(overlay)?
+            }
         } else {
             DiskProperties::new(
                 state.disk_path.clone(),

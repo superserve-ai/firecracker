@@ -420,6 +420,24 @@ pub fn restore_from_snapshot(
             .clone_from(&vsock_override.uds_path);
     }
 
+    // If block_delta_dir is set, stamp it onto overlay block device states
+    // so they apply deltas during restore (for cloning).
+    if let Some(ref delta_dir) = params.block_delta_dir {
+        use crate::devices::virtio::block::persist::BlockState;
+        for block_state in microvm_state
+            .device_states
+            .mmio_state
+            .block_devices
+            .iter_mut()
+        {
+            if let BlockState::Virtio(ref mut vs) = block_state.device_state {
+                if let Some(ref mut overlay) = vs.overlay_state {
+                    overlay.delta_dir = Some(delta_dir.clone());
+                }
+            }
+        }
+    }
+
     let track_dirty_pages = params.track_dirty_pages;
 
     let vcpu_count = microvm_state
