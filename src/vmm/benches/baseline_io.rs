@@ -79,7 +79,7 @@ fn temp_file() -> File {
 
 /// Create a temp file pre-filled with `size` bytes of data.
 fn filled_temp_file(size: u64) -> File {
-    let mut f = temp_file();
+    let f = temp_file();
     // Sparse-allocate: write one byte at the end so the file has the right
     // size without faulting in all pages.  Actual content doesn't matter
     // for throughput benchmarks.
@@ -279,7 +279,7 @@ fn bench_reset(c: &mut Criterion) {
                         std::process::id(),
                         rand_suffix()
                     ));
-                    let mut src = File::options()
+                    let src = File::options()
                         .read(true)
                         .write(true)
                         .create(true)
