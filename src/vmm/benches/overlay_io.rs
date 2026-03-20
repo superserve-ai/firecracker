@@ -4,19 +4,19 @@
 // Benchmarks for the overlay block engine and dirty bitmap:
 //
 //   DirtyBitmap
-//     bitmap_set_sequential   - set every bit in order (write-heavy workload)
-//     bitmap_set_random       - set bits at random offsets
-//     bitmap_clear_all        - zero the whole bitmap (reset critical path)
-//     bitmap_dirty_count      - count set bits (snapshot size estimation)
-//     bitmap_iter_dirty       - iterate over dirty blocks (snapshot serialisation)
+//     set_sequential    - set every block in order (write-heavy workload)
+//     set_random        - set blocks at random offsets
+//     clear_all         - zero the whole bitmap (reset critical path)
+//     dirty_block_count - count set bits (snapshot size estimation)
+//     iter_dirty        - iterate over dirty blocks (snapshot serialisation)
 //
 //   OverlayFileEngine
-//     overlay_write_sequential - sequential 4 KiB block writes
-//     overlay_write_random     - random 4 KiB block writes
-//     overlay_read_clean       - read 4 KiB blocks that are still in base
-//     overlay_read_dirty       - read 4 KiB blocks that are in upper
-//     overlay_reset            - truncate upper + clear bitmap (the killer metric)
-//     overlay_snapshot_scan    - iterate dirty bitmap to build a snapshot manifest
+//     write/sequential  - sequential 4 KiB block writes
+//     write/random      - random 4 KiB block writes
+//     read/clean        - read 4 KiB blocks that are still in base
+//     read/dirty        - read 4 KiB blocks that are in upper
+//     reset             - replace overlay + clear bitmap (the killer metric)
+//     snapshot_scan     - iterate dirty bitmap to build a snapshot manifest
 
 use std::fs::File;
 use std::hint::black_box;
@@ -24,22 +24,23 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use vmm::devices::virtio::block::virtio::io::dirty_bitmap::DirtyBitmap;
-use vmm::devices::virtio::block::virtio::io::overlay_io::{
-    DEFAULT_BLOCK_SIZE, OverlayFileEngine,
-};
+use vmm::devices::virtio::block::virtio::io::dirty_bitmap::{DEFAULT_BLOCK_SIZE, DirtyBitmap};
+use vmm::devices::virtio::block::virtio::io::overlay_io::OverlayFileEngine;
+use vmm::vmm_config::machine_config::HugePageConfig;
+use vmm::vstate::memory::{self, GuestAddress, GuestMemoryMmap, GuestRegionMmapExt};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /// Number of blocks used in overlay benchmarks. 256 MiB @ 4 KiB/block.
 const NUM_BLOCKS: usize = 65_536;
-/// All benchmarks use the production block size.
-const BLOCK_SIZE: u64 = DEFAULT_BLOCK_SIZE;
+/// Production block size.
+const BLOCK_SIZE: u32 = DEFAULT_BLOCK_SIZE;
+/// Disk size in bytes.
+const DISK_SIZE: u64 = NUM_BLOCKS as u64 * BLOCK_SIZE as u64;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/// Create a named temporary file that is deleted when the returned `File` is
-/// dropped.  We use `std::fs` directly so that benches stay independent.
+/// Create an anonymous temp file that is deleted when the `File` is dropped.
 fn temp_file() -> File {
     let path = std::env::temp_dir().join(format!(
         "overlay_bench_{}_{}",
@@ -53,23 +54,22 @@ fn temp_file() -> File {
         .truncate(true)
         .open(&path)
         .expect("failed to create temp file");
-    // Unlink now — the file stays alive through the File handle.
     let _ = std::fs::remove_file(&path);
     file
 }
 
-/// Very cheap LCG-based pseudo-random u64, seeded from the clock.
+/// Cheap LCG-based pseudo-random u64, seeded from the clock.
 fn rand_u64() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos() as u64;
-    seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+    seed.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
 }
 
-/// Shuffle a slice in-place with a deterministic LCG so that random-access
-/// benchmarks visit every block exactly once in unpredictable order.
+/// Shuffle a slice in-place with a deterministic LCG.
 fn shuffle(v: &mut Vec<usize>) {
     let mut state = rand_u64();
     let n = v.len();
@@ -82,24 +82,36 @@ fn shuffle(v: &mut Vec<usize>) {
     }
 }
 
+/// Create a `GuestMemoryMmap` backed by anonymous memory of `size` bytes.
+fn create_mem(size: usize) -> GuestMemoryMmap {
+    let regions = memory::anonymous(
+        std::iter::once((GuestAddress(0), size)),
+        false,
+        HugePageConfig::None,
+    )
+    .expect("failed to allocate guest memory");
+    GuestRegionMmapExt::into_region_ext(regions)
+}
+
 /// Create an overlay engine backed by two anonymous temp files.
-/// `base_size_bytes` bytes are written to base so reads don't hit EOF.
-fn make_engine(base_size_bytes: u64) -> OverlayFileEngine {
+/// The base file is written sparse so reads don't hit EOF.
+fn make_engine() -> OverlayFileEngine {
     let mut base = temp_file();
     let upper = temp_file();
+    // Sparse base: write one byte at the end to set file size.
+    base.write_at(&[0u8], DISK_SIZE - 1).unwrap();
+    // Overlay must be same size (sparse is fine).
+    upper.set_len(DISK_SIZE).unwrap();
+    OverlayFileEngine::from_files(base, upper, DISK_SIZE, BLOCK_SIZE, None).unwrap()
+}
 
-    if base_size_bytes > 0 {
-        // Write a sparse base: just seek and write one byte at the end so the
-        // OS knows the file size without allocating real blocks.
-        base.write_at(&[0u8], base_size_bytes - 1).unwrap();
+/// Write `dirty_blocks` sequential blocks into an engine via the overlay write path.
+fn dirty_engine(engine: &mut OverlayFileEngine, dirty_blocks: usize) {
+    let mem = create_mem(BLOCK_SIZE as usize);
+    for block in 0..dirty_blocks {
+        let offset = block as u64 * u64::from(BLOCK_SIZE);
+        engine.write(offset, &mem, GuestAddress(0), BLOCK_SIZE).unwrap();
     }
-
-    OverlayFileEngine::with_block_size(
-        base,
-        upper,
-        NUM_BLOCKS,
-        BLOCK_SIZE,
-    )
 }
 
 // ── DirtyBitmap benchmarks ─────────────────────────────────────────────────
@@ -111,10 +123,10 @@ fn bench_bitmap(c: &mut Criterion) {
     // Sequential set — simulates a workload that writes every block once.
     group.bench_function("set_sequential", |b| {
         b.iter_batched(
-            || DirtyBitmap::new(NUM_BLOCKS),
+            || DirtyBitmap::new(DISK_SIZE, BLOCK_SIZE).unwrap(),
             |mut bm| {
                 for i in 0..NUM_BLOCKS {
-                    bm.set(black_box(i));
+                    bm.set(black_box(i as u64 * u64::from(BLOCK_SIZE)), BLOCK_SIZE);
                 }
                 black_box(bm)
             },
@@ -125,13 +137,16 @@ fn bench_bitmap(c: &mut Criterion) {
     // Random set — simulates fragmented, real-world agent writes.
     let mut random_order: Vec<usize> = (0..NUM_BLOCKS).collect();
     shuffle(&mut random_order);
-    let random_order = random_order; // freeze
+    let random_order = random_order;
     group.bench_function("set_random", |b| {
         b.iter_batched(
-            || DirtyBitmap::new(NUM_BLOCKS),
+            || DirtyBitmap::new(DISK_SIZE, BLOCK_SIZE).unwrap(),
             |mut bm| {
                 for &i in &random_order {
-                    bm.set(black_box(i));
+                    bm.set(
+                        black_box(i as u64 * u64::from(BLOCK_SIZE)),
+                        BLOCK_SIZE,
+                    );
                 }
                 black_box(bm)
             },
@@ -139,41 +154,41 @@ fn bench_bitmap(c: &mut Criterion) {
         )
     });
 
-    // clear_all — this is the reset hot path: how fast can we zero the bitmap?
+    // clear — this is the reset hot path: how fast can we zero the bitmap?
     group.bench_function("clear_all", |b| {
         b.iter_batched(
             || {
-                let mut bm = DirtyBitmap::new(NUM_BLOCKS);
+                let mut bm = DirtyBitmap::new(DISK_SIZE, BLOCK_SIZE).unwrap();
                 for i in 0..NUM_BLOCKS {
-                    bm.set(i);
+                    bm.set(i as u64 * u64::from(BLOCK_SIZE), BLOCK_SIZE);
                 }
                 bm
             },
             |mut bm| {
-                bm.clear_all();
+                bm.clear();
                 black_box(bm)
             },
             BatchSize::SmallInput,
         )
     });
 
-    // dirty_block_count — called before every snapshot to estimate size.
+    // dirty_count — called before every snapshot to estimate size.
     group.bench_function("dirty_block_count", |b| {
-        let mut bm = DirtyBitmap::new(NUM_BLOCKS);
+        let mut bm = DirtyBitmap::new(DISK_SIZE, BLOCK_SIZE).unwrap();
         for i in (0..NUM_BLOCKS).step_by(2) {
-            bm.set(i); // 50 % dirty
+            bm.set(i as u64 * u64::from(BLOCK_SIZE), BLOCK_SIZE); // 50% dirty
         }
-        b.iter(|| black_box(bm.dirty_block_count()))
+        b.iter(|| black_box(bm.dirty_count()))
     });
 
     // iter_dirty — drives snapshot serialisation: visit each dirty block once.
     group.bench_function("iter_dirty", |b| {
-        let mut bm = DirtyBitmap::new(NUM_BLOCKS);
+        let mut bm = DirtyBitmap::new(DISK_SIZE, BLOCK_SIZE).unwrap();
         for i in (0..NUM_BLOCKS).step_by(2) {
-            bm.set(i); // 50 % dirty
+            bm.set(i as u64 * u64::from(BLOCK_SIZE), BLOCK_SIZE); // 50% dirty
         }
         b.iter(|| {
-            let mut count = 0usize;
+            let mut count = 0u64;
             for idx in bm.iter_dirty() {
                 count += black_box(idx);
             }
@@ -188,20 +203,18 @@ fn bench_bitmap(c: &mut Criterion) {
 
 fn bench_overlay_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("OverlayFileEngine/write");
-    let base_size = NUM_BLOCKS as u64 * BLOCK_SIZE;
-    let buf = vec![0xABu8; BLOCK_SIZE as usize];
 
     // Sequential write — represents a streaming workload (compiling, unpacking).
     group
-        .throughput(Throughput::Bytes(base_size))
+        .throughput(Throughput::Bytes(DISK_SIZE))
         .bench_function("sequential", |b| {
+            let mem = create_mem(BLOCK_SIZE as usize);
             b.iter_batched(
-                || make_engine(base_size),
+                make_engine,
                 |mut engine| {
                     for block in 0..NUM_BLOCKS {
-                        engine
-                            .write(black_box(block as u64 * BLOCK_SIZE), &buf)
-                            .unwrap();
+                        let offset = black_box(block as u64 * u64::from(BLOCK_SIZE));
+                        engine.write(offset, &mem, GuestAddress(0), BLOCK_SIZE).unwrap();
                     }
                     black_box(engine)
                 },
@@ -214,13 +227,13 @@ fn bench_overlay_write(c: &mut Criterion) {
     shuffle(&mut random_order);
     let random_order = random_order;
     group.bench_function("random", |b| {
+        let mem = create_mem(BLOCK_SIZE as usize);
         b.iter_batched(
-            || make_engine(base_size),
+            make_engine,
             |mut engine| {
                 for &block in &random_order {
-                    engine
-                        .write(black_box(block as u64 * BLOCK_SIZE), &buf)
-                        .unwrap();
+                    let offset = black_box(block as u64 * u64::from(BLOCK_SIZE));
+                    engine.write(offset, &mem, GuestAddress(0), BLOCK_SIZE).unwrap();
                 }
                 black_box(engine)
             },
@@ -233,48 +246,39 @@ fn bench_overlay_write(c: &mut Criterion) {
 
 fn bench_overlay_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("OverlayFileEngine/read");
-    let base_size = NUM_BLOCKS as u64 * BLOCK_SIZE;
-    let mut buf = vec![0u8; BLOCK_SIZE as usize];
 
     // Read clean blocks (from base) — the common case right after boot.
     group
-        .throughput(Throughput::Bytes(base_size))
+        .throughput(Throughput::Bytes(DISK_SIZE))
         .bench_function("clean_from_base", |b| {
+            let mem = create_mem(BLOCK_SIZE as usize);
             b.iter_batched(
-                || make_engine(base_size),
-                |engine| {
+                make_engine,
+                |mut engine| {
                     for block in 0..NUM_BLOCKS {
-                        engine
-                            .read(black_box(block as u64 * BLOCK_SIZE), &mut buf)
-                            .unwrap();
+                        let offset = black_box(block as u64 * u64::from(BLOCK_SIZE));
+                        engine.read(offset, &mem, GuestAddress(0), BLOCK_SIZE).unwrap();
                     }
-                    black_box(&buf);
                     black_box(engine)
                 },
                 BatchSize::PerIteration,
             )
         });
 
-    // Read dirty blocks (from upper) — after writes, reads must hit upper.
+    // Read dirty blocks (from overlay) — after writes, reads must hit upper.
     group.bench_function("dirty_from_upper", |b| {
+        let mem = create_mem(BLOCK_SIZE as usize);
         b.iter_batched(
             || {
-                let mut engine = make_engine(base_size);
-                let write_buf = vec![0xBBu8; BLOCK_SIZE as usize];
-                for block in 0..NUM_BLOCKS {
-                    engine
-                        .write(block as u64 * BLOCK_SIZE, &write_buf)
-                        .unwrap();
-                }
+                let mut engine = make_engine();
+                dirty_engine(&mut engine, NUM_BLOCKS);
                 engine
             },
-            |engine| {
+            |mut engine| {
                 for block in 0..NUM_BLOCKS {
-                    engine
-                        .read(black_box(block as u64 * BLOCK_SIZE), &mut buf)
-                        .unwrap();
+                    let offset = black_box(block as u64 * u64::from(BLOCK_SIZE));
+                    engine.read(offset, &mem, GuestAddress(0), BLOCK_SIZE).unwrap();
                 }
-                black_box(&buf);
                 black_box(engine)
             },
             BatchSize::PerIteration,
@@ -286,32 +290,34 @@ fn bench_overlay_read(c: &mut Criterion) {
 
 fn bench_overlay_reset(c: &mut Criterion) {
     let mut group = c.benchmark_group("OverlayFileEngine/reset");
-    let base_size = NUM_BLOCKS as u64 * BLOCK_SIZE;
 
     // This is THE key metric: how fast can we reclaim a sandbox for the next
-    // agent run?  Compare against the baseline of copying a full disk image.
+    // agent run?  Compare against baseline/reset/full_file_copy.
+    //
+    // Reset = swap in a fresh overlay file + create a clean engine (empty bitmap).
+    // The base file is shared and never touched.
     for dirty_fraction in [0.01, 0.10, 0.50, 1.00] {
         let dirty_blocks = ((NUM_BLOCKS as f64) * dirty_fraction) as usize;
         group
             .throughput(Throughput::Elements(dirty_blocks as u64))
             .bench_with_input(
-                BenchmarkId::new(
-                    "reset",
-                    format!("{:.0}%_dirty", dirty_fraction * 100.0),
-                ),
+                BenchmarkId::new("reset", format!("{:.0}%_dirty", dirty_fraction * 100.0)),
                 &dirty_blocks,
                 |b, &dirty_blocks| {
                     b.iter_batched(
                         || {
-                            let mut engine = make_engine(base_size);
-                            let buf = vec![0u8; BLOCK_SIZE as usize];
-                            for block in 0..dirty_blocks {
-                                engine.write(block as u64 * BLOCK_SIZE, &buf).unwrap();
-                            }
+                            // Setup: engine with N dirty blocks already written.
+                            let mut engine = make_engine();
+                            dirty_engine(&mut engine, dirty_blocks);
                             engine
                         },
                         |mut engine| {
-                            engine.reset().unwrap();
+                            // Reset: swap in a fresh overlay, which implicitly
+                            // creates a new engine state. We also replace the
+                            // overlay file to reclaim disk space.
+                            let new_overlay = temp_file();
+                            new_overlay.set_len(DISK_SIZE).unwrap();
+                            engine.update_overlay(new_overlay);
                             black_box(engine)
                         },
                         BatchSize::PerIteration,
@@ -325,29 +331,20 @@ fn bench_overlay_reset(c: &mut Criterion) {
 
 fn bench_overlay_snapshot_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("OverlayFileEngine/snapshot_scan");
-    let base_size = NUM_BLOCKS as u64 * BLOCK_SIZE;
 
-    // How fast can we build the list of dirty blocks to include in a
-    // snapshot?  Measured at different dirty fractions so we can see whether
-    // it scales with dirty count or total block count.
+    // How fast can we build the list of dirty blocks to include in a snapshot?
     for dirty_fraction in [0.01, 0.10, 0.50, 1.00] {
         let dirty_blocks = ((NUM_BLOCKS as f64) * dirty_fraction) as usize;
         group
             .throughput(Throughput::Elements(dirty_blocks as u64))
             .bench_with_input(
-                BenchmarkId::new(
-                    "scan",
-                    format!("{:.0}%_dirty", dirty_fraction * 100.0),
-                ),
+                BenchmarkId::new("scan", format!("{:.0}%_dirty", dirty_fraction * 100.0)),
                 &dirty_blocks,
                 |b, &dirty_blocks| {
-                    let mut engine = make_engine(base_size);
-                    let buf = vec![0u8; BLOCK_SIZE as usize];
-                    for block in 0..dirty_blocks {
-                        engine.write(block as u64 * BLOCK_SIZE, &buf).unwrap();
-                    }
+                    let mut engine = make_engine();
+                    dirty_engine(&mut engine, dirty_blocks);
                     b.iter(|| {
-                        let count: usize = engine.bitmap().iter_dirty().count();
+                        let count: u64 = engine.bitmap().iter_dirty().count() as u64;
                         black_box(count)
                     })
                 },
