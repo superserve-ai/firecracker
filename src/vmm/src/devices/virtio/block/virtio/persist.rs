@@ -11,6 +11,8 @@ use super::device::DiskProperties;
 use super::*;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
+use crate::devices::virtio::block::virtio::io::dirty_bitmap::DEFAULT_BLOCK_SIZE;
+use crate::devices::virtio::block::virtio::io::FileEngine;
 use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
@@ -29,13 +31,16 @@ pub enum FileEngineTypeState {
     Sync,
     /// Async File Engine.
     Async,
+    /// Overlay File Engine (sync COW with dirty bitmap).
+    Overlay,
 }
 
 impl From<FileEngineType> for FileEngineTypeState {
     fn from(file_engine_type: FileEngineType) -> Self {
         match file_engine_type {
-            FileEngineType::Sync | FileEngineType::Overlay => FileEngineTypeState::Sync,
+            FileEngineType::Sync => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
+            FileEngineType::Overlay => FileEngineTypeState::Overlay,
         }
     }
 }
@@ -45,21 +50,40 @@ impl From<FileEngineTypeState> for FileEngineType {
         match file_engine_type_state {
             FileEngineTypeState::Sync => FileEngineType::Sync,
             FileEngineTypeState::Async => FileEngineType::Async,
+            FileEngineTypeState::Overlay => FileEngineType::Overlay,
         }
     }
+}
+
+/// Overlay-specific state persisted in snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayState {
+    /// Path to the read-only base image.
+    pub base_path: String,
+    /// Path to the writable overlay file.
+    pub overlay_path: String,
+    /// Serialized dirty bitmap bytes.
+    pub dirty_bitmap: Vec<u8>,
+    /// Block size used for dirty tracking.
+    pub block_size: u32,
+    /// Total number of blocks in the bitmap.
+    pub total_blocks: u64,
 }
 
 /// Holds info about the block device. Gets saved in snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioBlockState {
-    id: String,
+    pub id: String,
     partuuid: Option<String>,
     cache_type: CacheType,
     root_device: bool,
-    disk_path: String,
+    pub disk_path: String,
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
     file_engine_type: FileEngineTypeState,
+    /// Overlay state, present only for overlay-backed block devices.
+    #[serde(default)]
+    pub overlay_state: Option<OverlayState>,
 }
 
 impl Persist<'_> for VirtioBlock {
@@ -68,7 +92,19 @@ impl Persist<'_> for VirtioBlock {
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {
-        // Save device state.
+        let overlay_state = if let FileEngine::Overlay(ref engine) = self.disk.file_engine {
+            let bitmap = engine.bitmap();
+            Some(OverlayState {
+                base_path: self.disk.base_path.clone().unwrap_or_default(),
+                overlay_path: self.disk.file_path.clone(),
+                dirty_bitmap: bitmap.serialize(),
+                block_size: bitmap.block_size(),
+                total_blocks: bitmap.total_blocks(),
+            })
+        } else {
+            None
+        };
+
         VirtioBlockState {
             id: self.id.clone(),
             partuuid: self.partuuid.clone(),
@@ -78,6 +114,7 @@ impl Persist<'_> for VirtioBlock {
             virtio_state: VirtioDeviceState::from_device(self),
             rate_limiter_state: self.rate_limiter.save(),
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
+            overlay_state,
         }
     }
 
@@ -89,11 +126,33 @@ impl Persist<'_> for VirtioBlock {
         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
             .map_err(VirtioBlockError::RateLimiter)?;
 
-        let disk_properties = DiskProperties::new(
-            state.disk_path.clone(),
-            is_read_only,
-            state.file_engine_type.into(),
-        )?;
+        let disk_properties = if let Some(ref overlay) = state.overlay_state {
+            use crate::devices::virtio::block::virtio::io::dirty_bitmap::DirtyBitmap;
+
+            let bitmap = DirtyBitmap::deserialize(
+                &overlay.dirty_bitmap,
+                overlay.block_size,
+                overlay.total_blocks,
+            )
+            .map_err(|e| {
+                VirtioBlockError::FileEngine(io::BlockIoError::Overlay(
+                    io::OverlayIoError::Bitmap(e),
+                ))
+            })?;
+
+            DiskProperties::new_overlay_with_bitmap(
+                overlay.base_path.clone(),
+                overlay.overlay_path.clone(),
+                overlay.block_size,
+                bitmap,
+            )?
+        } else {
+            DiskProperties::new(
+                state.disk_path.clone(),
+                is_read_only,
+                state.file_engine_type.into(),
+            )?
+        };
 
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
@@ -229,5 +288,101 @@ mod tests {
 
         // Test that block specific fields are the same.
         assert_eq!(restored_block.disk.file_path, block.disk.file_path);
+    }
+
+    #[test]
+    fn test_overlay_persistence() {
+        use std::io::Write;
+
+        // Create base image with known data.
+        let base_file = TempFile::new().unwrap();
+        let base_data = vec![0xAA_u8; 0x1000];
+        base_file.as_file().write_all(&base_data).unwrap();
+
+        // Create overlay file (empty, will be sized to match base).
+        let overlay_file = TempFile::new().unwrap();
+
+        let base_path = base_file.as_path().to_str().unwrap().to_string();
+        let overlay_path = overlay_file.as_path().to_str().unwrap().to_string();
+
+        let config = VirtioBlockConfig {
+            drive_id: "overlay_test".to_string(),
+            path_on_host: overlay_path.clone(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            cache_type: CacheType::Unsafe,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::Overlay,
+            base_path: Some(base_path.clone()),
+        };
+
+        let block = VirtioBlock::new(config).unwrap();
+
+        // Verify overlay state is present in save.
+        let block_state = block.save();
+        assert!(block_state.overlay_state.is_some());
+
+        let overlay_state = block_state.overlay_state.as_ref().unwrap();
+        assert_eq!(overlay_state.base_path, base_path);
+        assert_eq!(overlay_state.overlay_path, overlay_path);
+        assert_eq!(overlay_state.block_size, 4096);
+
+        // Serialize and deserialize.
+        let serialized = bitcode::serialize(&block_state).unwrap();
+        let restored_state: VirtioBlockState = bitcode::deserialize(&serialized).unwrap();
+
+        // Verify overlay state survived serialization.
+        assert!(restored_state.overlay_state.is_some());
+        let restored_overlay = restored_state.overlay_state.as_ref().unwrap();
+        assert_eq!(restored_overlay.base_path, base_path);
+        assert_eq!(restored_overlay.block_size, overlay_state.block_size);
+        assert_eq!(restored_overlay.total_blocks, overlay_state.total_blocks);
+        assert_eq!(restored_overlay.dirty_bitmap, overlay_state.dirty_bitmap);
+
+        // Restore the block device.
+        let guest_mem = default_mem();
+        let restored_block =
+            VirtioBlock::restore(BlockConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
+
+        // Verify restored device is overlay type.
+        assert_eq!(restored_block.file_engine_type(), FileEngineType::Overlay);
+        assert_eq!(restored_block.disk.file_path, overlay_path);
+        assert_eq!(restored_block.disk.base_path.as_deref(), Some(base_path.as_str()));
+    }
+
+    #[test]
+    fn test_old_snapshot_without_overlay_state() {
+        // Simulate restoring an old snapshot that has no overlay_state field.
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+
+        let config = VirtioBlockConfig {
+            drive_id: "test".to_string(),
+            path_on_host: f.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            cache_type: CacheType::Unsafe,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::default(),
+            base_path: None,
+        };
+
+        let block = VirtioBlock::new(config).unwrap();
+        let block_state = block.save();
+
+        // overlay_state should be None for non-overlay devices.
+        assert!(block_state.overlay_state.is_none());
+
+        // Serialize, deserialize, restore — should work fine.
+        let serialized = bitcode::serialize(&block_state).unwrap();
+        let restored_state: VirtioBlockState = bitcode::deserialize(&serialized).unwrap();
+        assert!(restored_state.overlay_state.is_none());
+
+        let guest_mem = default_mem();
+        let restored_block =
+            VirtioBlock::restore(BlockConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
+        assert_eq!(restored_block.file_engine_type(), FileEngineType::Sync);
     }
 }

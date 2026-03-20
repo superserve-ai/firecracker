@@ -58,6 +58,7 @@ pub enum FileEngineType {
 #[derive(Debug)]
 pub struct DiskProperties {
     pub file_path: String,
+    pub base_path: Option<String>,
     pub file_engine: FileEngine,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
@@ -104,6 +105,7 @@ impl DiskProperties {
 
         Ok(Self {
             file_path: disk_image_path,
+            base_path: None,
             file_engine: FileEngine::from_file(disk_image, file_engine_type)
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
@@ -160,6 +162,46 @@ impl DiskProperties {
 
         Ok(Self {
             file_path: overlay_path,
+            base_path: Some(base_image_path),
+            file_engine: FileEngine::Overlay(overlay_engine),
+            nsectors: disk_size >> SECTOR_SHIFT,
+            image_id,
+        })
+    }
+
+    /// Create an overlay file engine restoring from a previously saved bitmap.
+    pub fn new_overlay_with_bitmap(
+        base_image_path: String,
+        overlay_path: String,
+        block_size: u32,
+        bitmap: block_io::dirty_bitmap::DirtyBitmap,
+    ) -> Result<Self, VirtioBlockError> {
+        let mut base_file = OpenOptions::new()
+            .read(true)
+            .open(PathBuf::from(&base_image_path))
+            .map_err(|x| VirtioBlockError::BackingFile(x, base_image_path.clone()))?;
+
+        let disk_size = Self::file_size(&base_image_path, &mut base_file)?;
+        let image_id = Self::build_disk_image_id(&base_file);
+
+        let overlay_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(&overlay_path))
+            .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
+
+        let overlay_engine = block_io::OverlayFileEngine::from_files(
+            base_file,
+            overlay_file,
+            disk_size,
+            block_size,
+            Some(bitmap),
+        )
+        .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(e)))?;
+
+        Ok(Self {
+            file_path: overlay_path,
+            base_path: Some(base_image_path),
             file_engine: FileEngine::Overlay(overlay_engine),
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
