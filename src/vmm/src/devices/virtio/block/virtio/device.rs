@@ -271,7 +271,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            FileEngine::Sync(_) | FileEngine::Overlay(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -559,6 +559,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Overlay(_) => FileEngineType::Sync,
         }
     }
 
