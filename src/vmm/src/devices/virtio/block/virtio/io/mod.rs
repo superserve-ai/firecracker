@@ -197,6 +197,14 @@ impl FileEngine {
         }
     }
 
+    pub fn discard(&mut self, offset: u64, len: u32) -> Result<(), BlockIoError> {
+        match self {
+            FileEngine::Overlay(engine) => engine.discard(offset, len).map_err(BlockIoError::Overlay),
+            // Non-overlay engines don't support discard — this is a no-op.
+            FileEngine::Sync(_) | FileEngine::Async(_) => Ok(()),
+        }
+    }
+
     pub fn drain(&mut self, discard: bool) -> Result<(), BlockIoError> {
         match self {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
