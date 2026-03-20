@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use block_io::FileEngine;
+use block_io::dirty_bitmap::DEFAULT_BLOCK_SIZE;
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
@@ -41,7 +42,7 @@ use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 
-/// The engine file type, either Sync or Async (through io_uring).
+/// The engine file type, either Sync, Async (through io_uring), or Overlay (COW).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum FileEngineType {
     /// Use an Async engine, based on io_uring.
@@ -49,6 +50,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a sync COW overlay engine with dirty bitmap tracking.
+    Overlay,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -103,6 +106,61 @@ impl DiskProperties {
             file_path: disk_image_path,
             file_engine: FileEngine::from_file(disk_image, file_engine_type)
                 .map_err(VirtioBlockError::FileEngine)?,
+            nsectors: disk_size >> SECTOR_SHIFT,
+            image_id,
+        })
+    }
+
+    /// Create a new overlay file engine with a read-only base and a writable overlay.
+    pub fn new_overlay(
+        base_image_path: String,
+        overlay_path: String,
+        block_size: u32,
+    ) -> Result<Self, VirtioBlockError> {
+        let mut base_file = OpenOptions::new()
+            .read(true)
+            .open(PathBuf::from(&base_image_path))
+            .map_err(|x| VirtioBlockError::BackingFile(x, base_image_path.clone()))?;
+
+        let disk_size = Self::file_size(&base_image_path, &mut base_file)?;
+        let image_id = Self::build_disk_image_id(&base_file);
+
+        let overlay_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(PathBuf::from(&overlay_path))
+            .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
+
+        let overlay_size = overlay_file
+            .metadata()
+            .map_err(VirtioBlockError::GetFileMetadata)?
+            .len();
+
+        if overlay_size == 0 {
+            // Fresh overlay — set length to match base.
+            overlay_file
+                .set_len(disk_size)
+                .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
+        } else if overlay_size != disk_size {
+            return Err(VirtioBlockError::BackingFile(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "overlay size ({overlay_size}) does not match base size ({disk_size})"
+                    ),
+                ),
+                overlay_path,
+            ));
+        }
+
+        let overlay_engine =
+            block_io::OverlayFileEngine::from_files(base_file, overlay_file, disk_size, block_size, None)
+                .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(e)))?;
+
+        Ok(Self {
+            file_path: overlay_path,
+            file_engine: FileEngine::Overlay(overlay_engine),
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
         })
@@ -189,7 +247,7 @@ pub struct VirtioBlockConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: bool,
-    /// Path of the backing file on the host
+    /// Path of the backing file on the host (overlay path when io_engine is Overlay).
     pub path_on_host: String,
     /// Rate Limiter for I/O operations.
     pub rate_limiter: Option<RateLimiterConfig>,
@@ -197,6 +255,9 @@ pub struct VirtioBlockConfig {
     #[serde(default)]
     #[serde(rename = "io_engine")]
     pub file_engine_type: FileEngineType,
+    /// Read-only base image path for overlay mode.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
@@ -204,6 +265,16 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
 
     fn try_from(value: &BlockDeviceConfig) -> Result<Self, Self::Error> {
         if let (Some(path_on_host), None) = (&value.path_on_host, &value.socket) {
+            let engine_type = value.file_engine_type.unwrap_or_default();
+
+            // Validate overlay config: base_path required when engine is Overlay.
+            if engine_type == FileEngineType::Overlay && value.base_path.is_none() {
+                return Err(VirtioBlockError::Config);
+            }
+            if engine_type != FileEngineType::Overlay && value.base_path.is_some() {
+                return Err(VirtioBlockError::Config);
+            }
+
             Ok(Self {
                 drive_id: value.drive_id.clone(),
                 partuuid: value.partuuid.clone(),
@@ -213,7 +284,8 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
                 is_read_only: value.is_read_only.unwrap_or(false),
                 path_on_host: path_on_host.clone(),
                 rate_limiter: value.rate_limiter,
-                file_engine_type: value.file_engine_type.unwrap_or_default(),
+                file_engine_type: engine_type,
+                base_path: value.base_path.clone(),
             })
         } else {
             Err(VirtioBlockError::Config)
@@ -235,6 +307,7 @@ impl From<VirtioBlockConfig> for BlockDeviceConfig {
             file_engine_type: Some(value.file_engine_type),
 
             socket: None,
+            base_path: value.base_path,
         }
     }
 }
@@ -284,11 +357,20 @@ impl VirtioBlock {
     ///
     /// The given file must be seekable and sizable.
     pub fn new(config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
-        let disk_properties = DiskProperties::new(
-            config.path_on_host,
-            config.is_read_only,
-            config.file_engine_type,
-        )?;
+        let disk_properties = if config.file_engine_type == FileEngineType::Overlay {
+            let base_path = config
+                .base_path
+                .as_ref()
+                .ok_or(VirtioBlockError::Config)?
+                .clone();
+            DiskProperties::new_overlay(base_path, config.path_on_host.clone(), DEFAULT_BLOCK_SIZE)?
+        } else {
+            DiskProperties::new(
+                config.path_on_host.clone(),
+                config.is_read_only,
+                config.file_engine_type,
+            )?
+        };
 
         let rate_limiter = config
             .rate_limiter
@@ -350,6 +432,7 @@ impl VirtioBlock {
             cache_type: self.cache_type,
             rate_limiter: rl.into_option(),
             file_engine_type: self.file_engine_type(),
+            base_path: None,
         }
     }
 
@@ -559,7 +642,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
-            FileEngine::Overlay(_) => FileEngineType::Sync,
+            FileEngine::Overlay(_) => FileEngineType::Overlay,
         }
     }
 
@@ -729,6 +812,7 @@ mod tests {
             file_engine_type: Default::default(),
 
             socket: None,
+            base_path: None,
         };
         VirtioBlockConfig::try_from(&block_config).unwrap();
 
@@ -744,6 +828,7 @@ mod tests {
             file_engine_type: Default::default(),
 
             socket: Some("sock".to_string()),
+            base_path: None,
         };
         VirtioBlockConfig::try_from(&block_config).unwrap_err();
 
@@ -759,6 +844,7 @@ mod tests {
             file_engine_type: Default::default(),
 
             socket: Some("sock".to_string()),
+            base_path: None,
         };
         VirtioBlockConfig::try_from(&block_config).unwrap_err();
     }

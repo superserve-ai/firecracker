@@ -65,6 +65,9 @@ pub struct BlockDeviceConfig {
     // VhostUserBlock specific fields
     /// Path to the vhost-user socket.
     pub socket: Option<String>,
+
+    /// Read-only base image path for overlay mode. Required when io_engine is "Overlay".
+    pub base_path: Option<String>,
 }
 
 /// Only provided fields will be updated. I.e. if any optional fields
@@ -215,6 +218,7 @@ mod tests {
                 file_engine_type: self.file_engine_type,
 
                 socket: self.socket.clone(),
+                base_path: self.base_path.clone(),
             }
         }
     }
@@ -242,6 +246,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -276,6 +281,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -308,6 +314,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -337,6 +344,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -353,6 +361,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -380,6 +389,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -396,6 +406,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -412,6 +423,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -453,6 +465,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -469,6 +482,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -485,6 +499,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -527,6 +542,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -543,6 +559,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -615,6 +632,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
         // Switch roots and add a PARTUUID for the new one.
         let mut root_block_device_old = root_block_device;
@@ -631,6 +649,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         block_devs.insert(root_block_device_old, false).unwrap();
@@ -657,6 +676,7 @@ mod tests {
             file_engine_type: Some(FileEngineType::Sync),
 
             socket: None,
+            base_path: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -687,6 +707,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            base_path: None,
         };
 
         let block = Block::new(config).unwrap();

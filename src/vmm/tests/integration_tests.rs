@@ -416,6 +416,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         file_engine_type: None,
 
         socket: None,
+        base_path: None,
     };
 
     let req = VmmAction::InsertBlockDevice(config);

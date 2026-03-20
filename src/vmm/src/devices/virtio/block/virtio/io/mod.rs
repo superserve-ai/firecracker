@@ -69,6 +69,16 @@ impl FileEngine {
                 AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
             )),
             FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Overlay => {
+                // Overlay engines are not created via from_file — use
+                // DiskProperties::new_overlay() instead.
+                Err(BlockIoError::Overlay(
+                    overlay_io::OverlayIoError::SizeMismatch {
+                        base_size: 0,
+                        overlay_size: 0,
+                    },
+                ))
+            }
         }
     }
 

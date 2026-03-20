@@ -1236,6 +1236,7 @@ mod tests {
                 file_engine_type: None,
 
                 socket: None,
+                base_path: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::InsertNetworkDevice(
