@@ -331,6 +331,32 @@ impl DeviceManager {
         }
     }
 
+    /// Write delta files for all overlay block devices into the given directory.
+    /// Each delta file is named `{drive_id}.delta`.
+    pub fn write_block_deltas(
+        &self,
+        delta_dir: &std::path::Path,
+    ) -> Result<(), crate::devices::virtio::block::virtio::io::delta::DeltaError> {
+        use crate::devices::virtio::block::device::Block;
+        use crate::devices::virtio::device::VirtioDeviceType;
+
+        let _: Result<(), Infallible> =
+            self.mmio_devices
+                .for_each_virtio_mmio_device(|_, _, device| {
+                    let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+                    let mut locked_device = mmio_transport_locked.locked_device();
+                    if locked_device.device_type() == VirtioDeviceType::Block {
+                        let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
+                        let delta_path = delta_dir.join(format!("{}.delta", block.id()));
+                        if let Err(e) = block.write_delta(&delta_path) {
+                            error!("Failed to write block delta for {}: {:?}", block.id(), e);
+                        }
+                    }
+                    Ok(())
+                });
+        Ok(())
+    }
+
     /// Mark queue memory dirty for activated VirtIO devices
     pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
         // Go through MMIO VirtIO devices

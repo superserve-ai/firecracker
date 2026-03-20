@@ -11,6 +11,7 @@ use std::io::{Seek, SeekFrom, Write};
 
 use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 
+use super::delta;
 use super::dirty_bitmap::{DirtyBitmap, DirtyBitmapError};
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
@@ -78,6 +79,19 @@ impl OverlayFileEngine {
     /// Get a reference to the dirty bitmap.
     pub fn bitmap(&self) -> &DirtyBitmap {
         &self.bitmap
+    }
+
+    /// Get a mutable reference to the overlay file (for delta export).
+    pub fn overlay_file_mut(&mut self) -> &mut File {
+        &mut self.overlay
+    }
+
+    /// Write a delta file containing only dirty blocks from this overlay.
+    pub fn write_delta(
+        &mut self,
+        delta_path: &std::path::Path,
+    ) -> Result<delta::DeltaStats, delta::DeltaError> {
+        delta::write_delta(&mut self.overlay, &self.bitmap, delta_path)
     }
 
     /// Read from the appropriate source (base or overlay) based on the dirty bitmap.
