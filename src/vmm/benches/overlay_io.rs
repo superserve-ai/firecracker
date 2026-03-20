@@ -20,14 +20,13 @@
 
 use std::fs::File;
 use std::hint::black_box;
-use std::io::Write;
 use std::os::unix::fs::FileExt;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use vmm::devices::virtio::block::virtio::io::dirty_bitmap::{DEFAULT_BLOCK_SIZE, DirtyBitmap};
 use vmm::devices::virtio::block::virtio::io::overlay_io::OverlayFileEngine;
 use vmm::vmm_config::machine_config::HugePageConfig;
-use vmm::vstate::memory::{self, GuestAddress, GuestMemoryMmap, GuestRegionMmapExt};
+use vmm::vstate::memory::{self, test_utils, GuestAddress, GuestMemoryMmap};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -90,13 +89,13 @@ fn create_mem(size: usize) -> GuestMemoryMmap {
         HugePageConfig::None,
     )
     .expect("failed to allocate guest memory");
-    GuestRegionMmapExt::into_region_ext(regions)
+    test_utils::into_region_ext(regions)
 }
 
 /// Create an overlay engine backed by two anonymous temp files.
 /// The base file is written sparse so reads don't hit EOF.
 fn make_engine() -> OverlayFileEngine {
-    let mut base = temp_file();
+    let base = temp_file();
     let upper = temp_file();
     // Sparse base: write one byte at the end to set file size.
     base.write_at(&[0u8], DISK_SIZE - 1).unwrap();
