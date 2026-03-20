@@ -721,7 +721,18 @@ impl VirtioBlock {
     }
 
     /// Update the backing file and the config space of the block device.
+    /// Not supported for overlay devices — the bitmap would become inconsistent
+    /// with the new file, leading to silent data corruption.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
+        if matches!(self.disk.file_engine, FileEngine::Overlay(_)) {
+            return Err(VirtioBlockError::BackingFile(
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "hot-update is not supported for overlay block devices",
+                ),
+                disk_image_path,
+            ));
+        }
         self.disk.update(disk_image_path, self.read_only)?;
         self.config_space.capacity = self.disk.nsectors.to_le(); // virtio_block_config_space();
 
