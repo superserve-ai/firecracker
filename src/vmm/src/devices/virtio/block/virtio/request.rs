@@ -405,14 +405,34 @@ impl Request {
 
                 for i in 0..num_segments {
                     let seg_addr = GuestAddress(self.data_addr.0 + u64::from(i * segment_size));
-                    let sector: u64 = mem.read_obj(seg_addr).unwrap_or(0);
-                    let num_sectors: u32 = mem
-                        .read_obj(GuestAddress(seg_addr.0 + 8))
-                        .unwrap_or(0);
+                    let sector: u64 = match mem.read_obj(seg_addr) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            discard_err = Some(block_io::BlockIoError::Overlay(
+                                block_io::OverlayIoError::OverlaySeek(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "failed to read discard segment sector",
+                                )),
+                            ));
+                            break;
+                        }
+                    };
+                    let num_sectors: u32 = match mem.read_obj(GuestAddress(seg_addr.0 + 8)) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            discard_err = Some(block_io::BlockIoError::Overlay(
+                                block_io::OverlayIoError::OverlaySeek(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "failed to read discard segment num_sectors",
+                                )),
+                            ));
+                            break;
+                        }
+                    };
                     let offset = sector << SECTOR_SHIFT;
                     let len = u64::from(num_sectors) << SECTOR_SHIFT;
 
-                    if let Err(e) = disk.file_engine.discard(offset, len as u32) {
+                    if let Err(e) = disk.file_engine.discard(offset, len) {
                         discard_err = Some(e);
                         break;
                     }

@@ -117,6 +117,7 @@ pub fn write_delta(
 
     writer.write_all(&data_crc.to_le_bytes())?;
     writer.flush()?;
+    writer.get_ref().sync_all()?;
 
     Ok(DeltaStats {
         dirty_blocks: dirty_count,
