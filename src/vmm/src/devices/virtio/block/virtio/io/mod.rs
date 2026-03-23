@@ -71,13 +71,8 @@ impl FileEngine {
             )),
             FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
             FileEngineType::Overlay => {
-                // Overlay engines are not created via from_file — use
-                // DiskProperties::new_overlay() instead.
                 Err(BlockIoError::Overlay(
-                    overlay_io::OverlayIoError::SizeMismatch {
-                        base_size: 0,
-                        overlay_size: 0,
-                    },
+                    overlay_io::OverlayIoError::NotConstructibleFromFile,
                 ))
             }
         }
@@ -98,7 +93,8 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.file(),
             FileEngine::Sync(engine) => engine.file(),
-            FileEngine::Overlay(_) => unimplemented!("overlay engine has two files"),
+            // Overlay has two files — return the overlay (writable) file for test compatibility.
+            FileEngine::Overlay(engine) => engine.overlay_file(),
         }
     }
 
@@ -197,7 +193,7 @@ impl FileEngine {
         }
     }
 
-    pub fn discard(&mut self, offset: u64, len: u32) -> Result<(), BlockIoError> {
+    pub fn discard(&mut self, offset: u64, len: u64) -> Result<(), BlockIoError> {
         match self {
             FileEngine::Overlay(engine) => engine.discard(offset, len).map_err(BlockIoError::Overlay),
             // Non-overlay engines don't support discard — this is a no-op.

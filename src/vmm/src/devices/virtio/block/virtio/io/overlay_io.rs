@@ -33,6 +33,8 @@ pub enum OverlayIoError {
     OverlaySync(std::io::Error),
     /// Size mismatch: base={base_size}, overlay={overlay_size}
     SizeMismatch { base_size: u64, overlay_size: u64 },
+    /// Overlay engine cannot be created via from_file — use DiskProperties::new_overlay()
+    NotConstructibleFromFile,
     /// Bitmap error: {0}
     Bitmap(DirtyBitmapError),
 }
@@ -44,8 +46,8 @@ pub struct OverlayFileEngine {
     bitmap: DirtyBitmap,
 }
 
-// SAFETY: `File` is send and ultimately a POD.
-unsafe impl Send for OverlayFileEngine {}
+// OverlayFileEngine contains File and DirtyBitmap (Vec-backed), both of which are Send.
+// No manual unsafe impl needed — derived automatically.
 
 impl OverlayFileEngine {
     /// Create a new overlay engine from a read-only base file and a writable overlay file.
@@ -71,8 +73,11 @@ impl OverlayFileEngine {
         })
     }
 
-    /// Update the overlay file handle (e.g., for drive hot-update).
-    pub fn update_overlay(&mut self, overlay: File) {
+    /// Update the overlay file handle.
+    /// Note: this does NOT reset the bitmap. Callers must ensure the new overlay
+    /// is consistent with the current bitmap state. Hot-update of overlay devices
+    /// is rejected at the VirtioBlock level to prevent data corruption.
+    pub(crate) fn update_overlay(&mut self, overlay: File) {
         self.overlay = overlay;
     }
 
@@ -81,13 +86,19 @@ impl OverlayFileEngine {
         &self.bitmap
     }
 
+    /// Get a reference to the overlay file.
+    #[cfg(test)]
+    pub fn overlay_file(&self) -> &File {
+        &self.overlay
+    }
+
     /// Get a mutable reference to the overlay file (for delta export).
     pub fn overlay_file_mut(&mut self) -> &mut File {
         &mut self.overlay
     }
 
     /// Discard blocks in the overlay: clear bitmap bits and punch holes in the overlay file.
-    pub fn discard(&mut self, offset: u64, len: u32) -> Result<(), OverlayIoError> {
+    pub fn discard(&mut self, offset: u64, len: u64) -> Result<(), OverlayIoError> {
         if len == 0 {
             return Ok(());
         }
@@ -95,7 +106,7 @@ impl OverlayFileEngine {
         // Clear bitmap bits for the discarded range.
         let block_size = u64::from(self.bitmap.block_size());
         let start_block = offset / block_size;
-        let end_offset = offset.saturating_add(u64::from(len)).saturating_sub(1);
+        let end_offset = offset.saturating_add(len).saturating_sub(1);
         let end_block = end_offset / block_size;
         let clamped_end = end_block.min(self.bitmap.total_blocks() - 1);
 
@@ -115,7 +126,7 @@ impl OverlayFileEngine {
                     fd,
                     libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
                     offset as i64,
-                    i64::from(len),
+                    len as i64,
                 )
             };
             if ret != 0 {
@@ -235,7 +246,6 @@ impl OverlayFileEngine {
         count: u32,
     ) -> Result<u32, OverlayIoError> {
         let block_size = u64::from(self.bitmap.block_size());
-        let start_block = offset / block_size;
         let end_offset = offset + u64::from(count);
 
         let mut current_offset = offset;

@@ -333,12 +333,16 @@ impl DeviceManager {
 
     /// Write delta files for all overlay block devices into the given directory.
     /// Each delta file is named `{drive_id}.delta`.
+    /// Returns the first error encountered, if any.
     pub fn write_block_deltas(
         &self,
         delta_dir: &std::path::Path,
     ) -> Result<(), crate::devices::virtio::block::virtio::io::delta::DeltaError> {
         use crate::devices::virtio::block::device::Block;
         use crate::devices::virtio::device::VirtioDeviceType;
+
+        let mut first_error: Option<crate::devices::virtio::block::virtio::io::delta::DeltaError> =
+            None;
 
         let _: Result<(), Infallible> =
             self.mmio_devices
@@ -350,11 +354,18 @@ impl DeviceManager {
                         let delta_path = delta_dir.join(format!("{}.delta", block.id()));
                         if let Err(e) = block.write_delta(&delta_path) {
                             error!("Failed to write block delta for {}: {:?}", block.id(), e);
+                            if first_error.is_none() {
+                                first_error = Some(e);
+                            }
                         }
                     }
                     Ok(())
                 });
-        Ok(())
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Mark queue memory dirty for activated VirtIO devices

@@ -125,7 +125,7 @@ impl DirtyBitmap {
         self.bits
             .iter()
             .enumerate()
-            .filter(|(_, bit)| *bit == true)
+            .filter(|(_, bit)| **bit)
             .map(|(idx, _)| idx as u64)
     }
 
