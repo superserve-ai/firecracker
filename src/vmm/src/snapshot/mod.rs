@@ -25,6 +25,7 @@
 //! provided by the library clients (it is not tied to this crate).
 pub mod crc;
 mod persist;
+pub mod write_protect;
 use std::fmt::Debug;
 use std::io::{Read, Write};
 
