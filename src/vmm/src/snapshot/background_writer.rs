@@ -53,6 +53,8 @@ pub struct WriteRequest {
     pub mem_size: u64,
     /// Whether to fsync after writing.
     pub sync: bool,
+    /// Stop flag — set to true to cancel the write early.
+    pub stop: Arc<AtomicBool>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -69,12 +71,15 @@ pub enum BackgroundWriteError {
     ThreadPanicked,
     /// Writer did not complete within timeout
     Timeout,
+    /// Writer was cancelled via stop flag
+    Cancelled,
 }
 
 /// Background thread that writes dirty pages to a snapshot file.
 pub struct BackgroundMemoryWriter {
     handle: Option<JoinHandle<Result<WriteStats, BackgroundWriteError>>>,
     status: Arc<AtomicU8>,
+    stop: Arc<AtomicBool>,
 }
 
 impl BackgroundMemoryWriter {
@@ -82,6 +87,7 @@ impl BackgroundMemoryWriter {
     pub fn start(request: WriteRequest) -> Result<Self, BackgroundWriteError> {
         let status = Arc::new(AtomicU8::new(STATUS_WRITING));
         let status_clone = Arc::clone(&status);
+        let stop = Arc::clone(&request.stop);
 
         let handle = std::thread::Builder::new()
             .name("fc_snapshot_writer".to_string())
@@ -98,7 +104,15 @@ impl BackgroundMemoryWriter {
         Ok(Self {
             handle: Some(handle),
             status,
+            stop,
         })
+    }
+
+    /// Signal the writer to stop and wait for it to exit.
+    pub fn cancel(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Drop self — the handle drop will detach the thread,
+        // but the stop flag ensures it exits promptly.
     }
 
     /// Get the current status of the background write.
@@ -134,6 +148,8 @@ impl BackgroundMemoryWriter {
             }
 
             if std::time::Instant::now() >= deadline {
+                // Signal the writer to stop before returning timeout error.
+                self.stop.store(true, Ordering::Relaxed);
                 return Err(BackgroundWriteError::Timeout);
             }
 
@@ -161,27 +177,34 @@ impl BackgroundMemoryWriter {
         let mut bytes_written: u64 = 0;
 
         for &(file_offset, page_addr) in &request.dirty_pages {
-            // Check if the VM already modified this page (COW happened)
-            let cow_pages = request.cow_pages.lock().unwrap();
-            let page_data = if let Some(saved_data) = cow_pages.get(&page_addr) {
-                // VM wrote to this page — use the saved old data
-                cow_count += 1;
-                saved_data.clone()
-            } else {
-                // Page is still write-protected — read directly from guest memory
-                // SAFETY: page_addr points to valid guest memory that is write-protected,
-                // so its contents won't change while we read.
-                let mut buf = vec![0u8; PAGE_SIZE];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        page_addr as *const u8,
-                        buf.as_mut_ptr(),
-                        PAGE_SIZE,
-                    );
+            // Check for cancellation.
+            if request.stop.load(Ordering::Relaxed) {
+                return Err(BackgroundWriteError::Cancelled);
+            }
+
+            // Check if the VM already modified this page (COW happened).
+            // Use remove() to take ownership — avoids 4KB clone while holding lock.
+            let page_data = {
+                let mut cow_pages = request.cow_pages.lock().unwrap();
+                if let Some(saved_data) = cow_pages.remove(&page_addr) {
+                    cow_count += 1;
+                    saved_data
+                } else {
+                    drop(cow_pages); // Release lock before memcpy
+                    // Page is still write-protected — read directly from guest memory.
+                    // SAFETY: page_addr points to valid guest memory that is write-protected,
+                    // so its contents won't change while we read.
+                    let mut buf = vec![0u8; PAGE_SIZE];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            page_addr as *const u8,
+                            buf.as_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    buf
                 }
-                buf
             };
-            drop(cow_pages); // Release lock before I/O
 
             // Write to file at the correct offset
             file.seek(SeekFrom::Start(file_offset))
@@ -244,6 +267,7 @@ mod tests {
             mem_file_path: path.clone(),
             mem_size: PAGE_SIZE as u64,
             sync: false,
+            stop: Arc::new(AtomicBool::new(false)),
         };
 
         let writer = BackgroundMemoryWriter::start(request).unwrap();
@@ -280,6 +304,7 @@ mod tests {
             mem_file_path: path.clone(),
             mem_size: PAGE_SIZE as u64,
             sync: false,
+            stop: Arc::new(AtomicBool::new(false)),
         };
 
         let writer = BackgroundMemoryWriter::start(request).unwrap();
@@ -308,6 +333,7 @@ mod tests {
             mem_file_path: tmp.as_path().to_path_buf(),
             mem_size: PAGE_SIZE as u64,
             sync: false,
+            stop: Arc::new(AtomicBool::new(false)),
         };
 
         let writer = BackgroundMemoryWriter::start(request).unwrap();

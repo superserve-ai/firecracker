@@ -337,9 +337,11 @@ impl Vm {
         &self,
     ) -> Result<(Vec<(u64, u64)>, Vec<(u64, usize)>), VmError> {
         let dirty_bitmap = self.get_dirty_bitmap()?;
-        let page_size = get_page_size().map_err(|e| VmError::PageSize(e))?;
-        let mut dirty_pages = Vec::new();
-        let mut regions = Vec::new();
+        let page_size = get_page_size().map_err(VmError::PageSize)?;
+        // Pre-allocate based on total memory size to avoid reallocation during pause.
+        let total_pages = (self.guest_memory_size() as usize) / page_size;
+        let mut dirty_pages = Vec::with_capacity(total_pages);
+        let mut regions = Vec::with_capacity(4); // Typically 1-2 regions
         let mut file_offset: u64 = 0;
 
         for region in self.guest_memory().iter() {

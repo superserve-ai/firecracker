@@ -277,12 +277,14 @@ fn create_async_memory_snapshot(
 
     // 5. Start the background writer.
     let cow_pages = wp.cow_pages();
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = BackgroundMemoryWriter::start(WriteRequest {
         dirty_pages,
         cow_pages,
         mem_file_path: params.mem_file_path.clone(),
         mem_size: vmm.vm.guest_memory_size(),
         sync: true,
+        stop: stop_flag,
     })
     .map_err(CreateSnapshotError::AsyncBackgroundWrite)?;
 

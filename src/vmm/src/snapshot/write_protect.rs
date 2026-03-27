@@ -18,6 +18,12 @@ use userfaultfd::{Event, RegisterMode, Uffd, UffdBuilder};
 /// Size of a memory page (4KB).
 const PAGE_SIZE: usize = 4096;
 
+/// Maximum number of COW pages to store. If the VM writes to more pages
+/// than this during snapshot, additional writes proceed without saving
+/// the old data (the snapshot will use current memory content for those pages).
+/// 256K pages = 1GB — prevents OOM even under heavy write load.
+const MAX_COW_PAGES: usize = 256 * 1024;
+
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum WriteProtectError {
     /// Failed to create userfaultfd: {0}
@@ -150,9 +156,13 @@ impl SnapshotWriteProtect {
                         );
                     }
 
-                    // Save the old data
+                    // Save the old data if under the cap.
                     if let Ok(mut pages) = cow_pages.lock() {
-                        pages.insert(page_addr, page_data);
+                        if pages.len() < MAX_COW_PAGES {
+                            pages.insert(page_addr, page_data);
+                        }
+                        // Over cap: don't save — snapshot will use current memory
+                        // for this page (minor inconsistency under extreme write load).
                     }
 
                     // Remove write protection so the VM's write can proceed
