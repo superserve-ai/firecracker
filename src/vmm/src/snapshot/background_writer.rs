@@ -139,16 +139,17 @@ impl BackgroundMemoryWriter {
         let deadline = std::time::Instant::now() + timeout;
 
         loop {
-            if let Some(ref handle) = self.handle {
-                if handle.is_finished() {
-                    return self.wait();
-                }
-            } else {
+            // Check if finished using status flag (avoids borrow issues with handle).
+            let current_status = self.status.load(Ordering::Acquire);
+            if current_status == STATUS_COMPLETE || current_status == STATUS_ERROR {
+                return self.wait();
+            }
+
+            if self.handle.is_none() {
                 return Err(BackgroundWriteError::ThreadPanicked);
             }
 
             if std::time::Instant::now() >= deadline {
-                // Signal the writer to stop before returning timeout error.
                 self.stop.store(true, Ordering::Relaxed);
                 return Err(BackgroundWriteError::Timeout);
             }

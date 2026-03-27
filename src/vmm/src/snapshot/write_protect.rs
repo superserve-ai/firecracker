@@ -68,7 +68,7 @@ impl SnapshotWriteProtect {
     pub fn new(regions: &[(u64, usize)]) -> Result<Self, WriteProtectError> {
         let uffd = UffdBuilder::new()
             .close_on_exec(true)
-            .non_blocking(false) // blocking reads for the handler thread
+            .non_blocking(true) // non-blocking so handler thread can check stop_flag
             .user_mode_only(false)
             .create()
             .map_err(WriteProtectError::UffdCreate)?;
@@ -131,11 +131,16 @@ impl SnapshotWriteProtect {
         while !stop_flag.load(Ordering::Relaxed) {
             let event = match uffd.read_event() {
                 Ok(Some(event)) => event,
-                Ok(None) => continue,
+                Ok(None) => {
+                    // Non-blocking mode: no events pending. Sleep briefly to avoid busy-wait.
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    continue;
+                }
                 Err(_) => {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
                     continue;
                 }
             };
