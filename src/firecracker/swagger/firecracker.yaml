@@ -759,6 +759,26 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /snapshot/complete:
+    put:
+      summary: Completes an async snapshot. Post-boot only.
+      description:
+        Waits for an in-progress async background snapshot to complete,
+        cleans up write-protection, and resets dirty page tracking for
+        the next snapshot.
+      operationId: completeSnapshot
+      responses:
+        204:
+          description: Snapshot completed (or no snapshot was in progress)
+        400:
+          description: Snapshot completion failed
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /snapshot/load:
     put:
       summary: Loads a snapshot. Pre-boot only.

@@ -214,6 +214,12 @@ fn create_async_memory_snapshot(
     use crate::snapshot::write_protect::SnapshotWriteProtect;
     use crate::ActiveSnapshot;
 
+    // 0. Complete any previous async snapshot before starting a new one.
+    if vmm.active_snapshot.is_some() {
+        log::info!("completing previous async snapshot before starting new one");
+        vmm.complete_snapshot()?;
+    }
+
     // 1. Collect dirty page addresses and memory region info.
     let (dirty_pages, regions) = vmm.vm.collect_dirty_page_addrs()?;
 
@@ -240,9 +246,9 @@ fn create_async_memory_snapshot(
     let mut wp = SnapshotWriteProtect::new(&regions)
         .map_err(CreateSnapshotError::AsyncWriteProtect)?;
 
-    // 3. Write-protect all dirty pages.
-    for &(_, page_addr) in &dirty_pages {
-        wp.protect(page_addr, 4096)
+    // 3. Write-protect entire memory regions in bulk (much faster than per-page).
+    for &(addr, size) in &regions {
+        wp.protect(addr, size as u64)
             .map_err(CreateSnapshotError::AsyncWriteProtect)?;
     }
 
