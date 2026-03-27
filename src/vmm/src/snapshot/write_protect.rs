@@ -186,7 +186,7 @@ impl SnapshotWriteProtect {
 
     /// Unprotect all remaining protected ranges and stop the handler thread.
     /// Returns the collected COW pages.
-    pub fn finish(mut self) -> Result<HashMap<u64, Vec<u8>>, WriteProtectError> {
+    pub fn finish(&mut self) -> Result<HashMap<u64, Vec<u8>>, WriteProtectError> {
         // Signal the handler to stop
         self.stop_flag.store(true, Ordering::Relaxed);
 
@@ -198,16 +198,14 @@ impl SnapshotWriteProtect {
                 true,
             );
         }
+        self.protected_ranges.clear();
 
         // Wait for handler thread to exit
         if let Some(handle) = self.handler_thread.take() {
             let _ = handle.join();
         }
 
-        let cow_pages = match Arc::try_unwrap(self.cow_pages) {
-            Ok(mutex) => mutex.into_inner().unwrap(),
-            Err(arc) => arc.lock().unwrap().clone(),
-        };
+        let cow_pages = self.cow_pages.lock().unwrap().clone();
         Ok(cow_pages)
     }
 }

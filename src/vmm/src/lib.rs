@@ -367,7 +367,7 @@ impl Vmm {
         Option<crate::snapshot::background_writer::WriteStats>,
         crate::persist::CreateSnapshotError,
     > {
-        let snapshot = match self.active_snapshot.take() {
+        let mut snapshot = match self.active_snapshot.take() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -389,6 +389,7 @@ impl Vmm {
         // For Diff snapshots, preserve dirty tracking for subsequent diffs.
         if snapshot.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
             self.vm.reset_dirty_bitmap();
+            use crate::vstate::memory::GuestMemoryExtension;
             self.vm.guest_memory().reset_dirty();
         }
 

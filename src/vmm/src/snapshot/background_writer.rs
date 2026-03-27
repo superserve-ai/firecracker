@@ -10,7 +10,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -121,7 +121,7 @@ impl BackgroundMemoryWriter {
     }
 
     /// Wait for the background write to complete and return the stats.
-    pub fn wait(mut self) -> Result<WriteStats, BackgroundWriteError> {
+    pub fn wait(&mut self) -> Result<WriteStats, BackgroundWriteError> {
         match self.handle.take() {
             Some(handle) => handle
                 .join()
@@ -133,7 +133,7 @@ impl BackgroundMemoryWriter {
     /// Wait for the background write with a timeout.
     /// Returns `Err(Timeout)` if the writer doesn't finish within `timeout`.
     pub fn wait_timeout(
-        mut self,
+        &mut self,
         timeout: std::time::Duration,
     ) -> Result<WriteStats, BackgroundWriteError> {
         let deadline = std::time::Instant::now() + timeout;
