@@ -157,12 +157,22 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Async snapshot write-protect failed: {0}
+    AsyncWriteProtect(crate::snapshot::write_protect::WriteProtectError),
+    /// Async snapshot background write failed: {0}
+    AsyncBackgroundWrite(crate::snapshot::background_writer::BackgroundWriteError),
 }
 
 /// Snapshot version
 pub const SNAPSHOT_VERSION: Version = Version::new(9, 0, 0);
 
 /// Creates a Microvm snapshot.
+///
+/// When `params.async_snapshot` is true, uses background snapshot mode:
+/// the VM's dirty pages are write-protected and a background thread writes
+/// them to disk. The VM can resume immediately — any writes to protected
+/// pages are caught by the userfaultfd handler which saves the old data
+/// before allowing the write to proceed.
 pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
@@ -174,8 +184,12 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    if params.async_snapshot {
+        create_async_memory_snapshot(vmm, params)?;
+    } else {
+        vmm.vm
+            .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -183,6 +197,105 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
 
+    Ok(())
+}
+
+/// Start an async background memory snapshot.
+///
+/// 1. Gets the KVM dirty bitmap and collects dirty page addresses.
+/// 2. Creates a SnapshotWriteProtect handler that protects dirty pages.
+/// 3. Starts a background writer thread to write pages to disk.
+/// 4. Stores the active snapshot state in Vmm for later cleanup.
+fn create_async_memory_snapshot(
+    vmm: &mut Vmm,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
+    use crate::snapshot::background_writer::{BackgroundMemoryWriter, WriteRequest};
+    use crate::snapshot::write_protect::SnapshotWriteProtect;
+    use crate::ActiveSnapshot;
+
+    // 0. Complete any previous async snapshot before starting a new one.
+    if vmm.active_snapshot.is_some() {
+        log::info!("completing previous async snapshot before starting new one");
+        vmm.complete_snapshot()?;
+    }
+
+    // 1. Collect dirty page addresses and memory region info.
+    let (dirty_pages, regions) = vmm.vm.collect_dirty_page_addrs()?;
+
+    log::info!(
+        "async snapshot: {} dirty pages across {} regions",
+        dirty_pages.len(),
+        regions.len()
+    );
+
+    if dirty_pages.is_empty() {
+        // Nothing to write — create empty snapshot file.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&params.mem_file_path)
+            .map_err(|e| CreateSnapshotError::MemoryBackingFile("open", e))?;
+        file.set_len(vmm.vm.guest_memory_size())
+            .map_err(|e| CreateSnapshotError::MemoryBackingFile("set_length", e))?;
+        return Ok(());
+    }
+
+    // 2. Create write-protect handler and register memory regions.
+    let mut wp = SnapshotWriteProtect::new(&regions)
+        .map_err(CreateSnapshotError::AsyncWriteProtect)?;
+
+    // 3. Write-protect dirty pages in batches of contiguous pages.
+    //    Sorting by address lets us merge adjacent pages into single protect calls.
+    let mut sorted_pages: Vec<u64> = dirty_pages.iter().map(|&(_, addr)| addr).collect();
+    sorted_pages.sort_unstable();
+
+    let page_size: u64 = 4096;
+    let mut batch_start = sorted_pages[0];
+    let mut batch_len: u64 = page_size;
+
+    for i in 1..sorted_pages.len() {
+        if sorted_pages[i] == batch_start + batch_len {
+            // Contiguous — extend the batch.
+            batch_len += page_size;
+        } else {
+            // Gap — protect the current batch and start a new one.
+            wp.protect(batch_start, batch_len)
+                .map_err(CreateSnapshotError::AsyncWriteProtect)?;
+            batch_start = sorted_pages[i];
+            batch_len = page_size;
+        }
+    }
+    // Protect the last batch.
+    wp.protect(batch_start, batch_len)
+        .map_err(CreateSnapshotError::AsyncWriteProtect)?;
+
+    // 4. Start the COW handler thread.
+    wp.start_handler()
+        .map_err(CreateSnapshotError::AsyncWriteProtect)?;
+
+    // 5. Start the background writer.
+    let cow_pages = wp.cow_pages();
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = BackgroundMemoryWriter::start(WriteRequest {
+        dirty_pages,
+        cow_pages,
+        mem_file_path: params.mem_file_path.clone(),
+        mem_size: vmm.vm.guest_memory_size(),
+        sync: true,
+        stop: stop_flag,
+    })
+    .map_err(CreateSnapshotError::AsyncBackgroundWrite)?;
+
+    // 6. Store active snapshot state for later cleanup.
+    vmm.active_snapshot = Some(ActiveSnapshot {
+        write_protect: wp,
+        writer,
+        snapshot_type: params.snapshot_type,
+    });
+
+    log::info!("async snapshot started, VM can resume now");
     Ok(())
 }
 

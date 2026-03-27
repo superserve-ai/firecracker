@@ -329,9 +329,80 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    /// Active async snapshot state. Present while a background snapshot is in progress.
+    pub active_snapshot: Option<ActiveSnapshot>,
 }
 
+/// State of an in-progress async snapshot.
+pub struct ActiveSnapshot {
+    /// Write-protect COW handler (saves old page data when VM writes during snapshot).
+    pub write_protect: crate::snapshot::write_protect::SnapshotWriteProtect,
+    /// Background thread writing dirty pages to snapshot file.
+    pub writer: crate::snapshot::background_writer::BackgroundMemoryWriter,
+    /// Snapshot type — determines whether to reset dirty tracking on completion.
+    pub snapshot_type: crate::vmm_config::snapshot::SnapshotType,
+}
+
+impl std::fmt::Debug for ActiveSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveSnapshot")
+            .field("writer_status", &self.writer.status())
+            .finish()
+    }
+}
+
+// ActiveSnapshot cleanup happens automatically:
+// - SnapshotWriteProtect::drop() stops the handler thread and unprotects pages
+// - BackgroundMemoryWriter's thread detaches when the handle is dropped
+
 impl Vmm {
+    /// Complete an active async snapshot, cleaning up resources and resetting
+    /// dirty tracking for the next diff snapshot.
+    ///
+    /// Returns the write stats if a snapshot was in progress, or `None` if
+    /// no async snapshot was active.
+    pub fn complete_snapshot(
+        &mut self,
+    ) -> Result<
+        Option<crate::snapshot::background_writer::WriteStats>,
+        crate::persist::CreateSnapshotError,
+    > {
+        let mut snapshot = match self.active_snapshot.take() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Wait for the background writer to finish (30 second timeout).
+        let stats = snapshot
+            .writer
+            .wait_timeout(std::time::Duration::from_secs(30))
+            .map_err(crate::persist::CreateSnapshotError::AsyncBackgroundWrite)?;
+
+        // Unprotect all remaining pages and stop the COW handler.
+        let _cow_pages = snapshot
+            .write_protect
+            .finish()
+            .map_err(crate::persist::CreateSnapshotError::AsyncWriteProtect)?;
+
+        // For Full snapshots, reset dirty tracking so the next diff snapshot
+        // only captures pages changed after this point.
+        // For Diff snapshots, preserve dirty tracking for subsequent diffs.
+        if snapshot.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
+            self.vm.reset_dirty_bitmap();
+            use crate::vstate::memory::GuestMemoryExtension;
+            self.vm.guest_memory().reset_dirty();
+        }
+
+        log::info!(
+            "async snapshot complete: {} dirty pages, {} COW pages, {}us",
+            stats.dirty_pages,
+            stats.cow_pages,
+            stats.write_time_us,
+        );
+
+        Ok(Some(stats))
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()

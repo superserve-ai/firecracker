@@ -38,6 +38,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
+use crate::utils::get_page_size;
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,6 +92,8 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// Failed to get page size: {0}
+    PageSize(vmm_sys_util::errno::Error),
 }
 
 /// Contains Vm functions that are usable across CPU architectures
@@ -323,6 +326,65 @@ impl Vm {
                 Ok((mem_slot.slot, bitmap))
             })
             .collect()
+    }
+
+    /// Collect dirty page addresses for async snapshot.
+    ///
+    /// Returns `(dirty_pages, regions)` where:
+    /// - `dirty_pages`: Vec of (file_offset, host_virt_addr) for each dirty page
+    /// - `regions`: Vec of (host_virt_addr, size) for each memory region (for uffd registration)
+    pub fn collect_dirty_page_addrs(
+        &self,
+    ) -> Result<(Vec<(u64, u64)>, Vec<(u64, usize)>), VmError> {
+        let dirty_bitmap = self.get_dirty_bitmap()?;
+        let page_size = get_page_size().map_err(VmError::PageSize)?;
+        // Pre-allocate based on total memory size to avoid reallocation during pause.
+        let total_pages = (self.guest_memory_size() as usize) / page_size;
+        let mut dirty_pages = Vec::with_capacity(total_pages);
+        let mut regions = Vec::with_capacity(4); // Typically 1-2 regions
+        let mut file_offset: u64 = 0;
+
+        for region in self.guest_memory().iter() {
+            for (slot, plugged) in region.slots() {
+                let slot_size = slot.slice.len();
+
+                if !plugged {
+                    file_offset += slot_size as u64;
+                    continue;
+                }
+
+                let host_addr = slot.slice.ptr_guard().as_ptr() as u64;
+                regions.push((host_addr, slot_size));
+
+                if let Some(kvm_bitmap) = dirty_bitmap.get(&slot.slot) {
+                    for (i, v) in kvm_bitmap.iter().enumerate() {
+                        for j in 0..64 {
+                            let page_offset = (i * 64 + j) * page_size;
+                            if page_offset >= slot_size {
+                                break;
+                            }
+
+                            let is_dirty = ((v >> j) & 1u64) != 0;
+                            if is_dirty {
+                                dirty_pages.push((
+                                    file_offset + page_offset as u64,
+                                    host_addr + page_offset as u64,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                file_offset += slot_size as u64;
+            }
+        }
+
+        Ok((dirty_pages, regions))
+    }
+
+    /// Get total guest memory size in bytes.
+    pub fn guest_memory_size(&self) -> u64 {
+        mem_size_mib(self.guest_memory()) * 1024 * 1024
     }
 
     /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
