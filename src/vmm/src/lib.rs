@@ -329,6 +329,24 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    /// Active async snapshot state. Present while a background snapshot is in progress.
+    pub active_snapshot: Option<ActiveSnapshot>,
+}
+
+/// State of an in-progress async snapshot.
+pub struct ActiveSnapshot {
+    /// Write-protect COW handler (saves old page data when VM writes during snapshot).
+    pub write_protect: crate::snapshot::write_protect::SnapshotWriteProtect,
+    /// Background thread writing dirty pages to snapshot file.
+    pub writer: crate::snapshot::background_writer::BackgroundMemoryWriter,
+}
+
+impl std::fmt::Debug for ActiveSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveSnapshot")
+            .field("writer_status", &self.writer.status())
+            .finish()
+    }
 }
 
 impl Vmm {

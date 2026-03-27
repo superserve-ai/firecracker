@@ -45,6 +45,10 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
+    /// Use background snapshot (VM resumes immediately, memory written in background).
+    /// Default: false (blocking snapshot for backward compatibility).
+    #[serde(default)]
+    pub async_snapshot: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

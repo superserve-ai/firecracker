@@ -1572,6 +1572,11 @@ definitions:
         description:
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created.
+      async_snapshot:
+        type: boolean
+        description:
+          Use background snapshot mode. The VM resumes immediately while memory
+          is written to disk in the background. Default is false.
 
   NetworkOverride:
     type: object
