@@ -350,6 +350,48 @@ impl std::fmt::Debug for ActiveSnapshot {
 }
 
 impl Vmm {
+    /// Complete an active async snapshot, cleaning up resources and resetting
+    /// dirty tracking for the next diff snapshot.
+    ///
+    /// Returns the write stats if a snapshot was in progress, or `None` if
+    /// no async snapshot was active.
+    pub fn complete_snapshot(
+        &mut self,
+    ) -> Result<
+        Option<crate::snapshot::background_writer::WriteStats>,
+        crate::persist::CreateSnapshotError,
+    > {
+        let snapshot = match self.active_snapshot.take() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Wait for the background writer to finish.
+        let stats = snapshot
+            .writer
+            .wait()
+            .map_err(crate::persist::CreateSnapshotError::AsyncBackgroundWrite)?;
+
+        // Unprotect all remaining pages and stop the COW handler.
+        let _cow_pages = snapshot
+            .write_protect
+            .finish()
+            .map_err(crate::persist::CreateSnapshotError::AsyncWriteProtect)?;
+
+        // Reset dirty tracking so the next snapshot only captures new changes.
+        self.vm.reset_dirty_bitmap();
+        self.vm.guest_memory().reset_dirty();
+
+        log::info!(
+            "async snapshot complete: {} dirty pages, {} COW pages, {}us",
+            stats.dirty_pages,
+            stats.cow_pages,
+            stats.write_time_us,
+        );
+
+        Ok(Some(stats))
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()
