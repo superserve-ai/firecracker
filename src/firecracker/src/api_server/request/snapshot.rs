@@ -30,6 +30,7 @@ pub(crate) fn parse_put_snapshot(
     match request_type_from_path {
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
+            "complete" => Ok(ParsedRequest::new_sync(VmmAction::CompleteSnapshot)),
             "load" => parse_put_snapshot_load(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),

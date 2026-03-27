@@ -67,6 +67,8 @@ pub enum BackgroundWriteError {
     SpawnThread(std::io::Error),
     /// Writer thread panicked
     ThreadPanicked,
+    /// Writer did not complete within timeout
+    Timeout,
 }
 
 /// Background thread that writes dirty pages to a snapshot file.
@@ -111,6 +113,31 @@ impl BackgroundMemoryWriter {
                 .join()
                 .map_err(|_| BackgroundWriteError::ThreadPanicked)?,
             None => Err(BackgroundWriteError::ThreadPanicked),
+        }
+    }
+
+    /// Wait for the background write with a timeout.
+    /// Returns `Err(Timeout)` if the writer doesn't finish within `timeout`.
+    pub fn wait_timeout(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> Result<WriteStats, BackgroundWriteError> {
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            if let Some(ref handle) = self.handle {
+                if handle.is_finished() {
+                    return self.wait();
+                }
+            } else {
+                return Err(BackgroundWriteError::ThreadPanicked);
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(BackgroundWriteError::Timeout);
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

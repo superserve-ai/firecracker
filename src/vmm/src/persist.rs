@@ -246,11 +246,30 @@ fn create_async_memory_snapshot(
     let mut wp = SnapshotWriteProtect::new(&regions)
         .map_err(CreateSnapshotError::AsyncWriteProtect)?;
 
-    // 3. Write-protect entire memory regions in bulk (much faster than per-page).
-    for &(addr, size) in &regions {
-        wp.protect(addr, size as u64)
-            .map_err(CreateSnapshotError::AsyncWriteProtect)?;
+    // 3. Write-protect dirty pages in batches of contiguous pages.
+    //    Sorting by address lets us merge adjacent pages into single protect calls.
+    let mut sorted_pages: Vec<u64> = dirty_pages.iter().map(|&(_, addr)| addr).collect();
+    sorted_pages.sort_unstable();
+
+    let page_size: u64 = 4096;
+    let mut batch_start = sorted_pages[0];
+    let mut batch_len: u64 = page_size;
+
+    for i in 1..sorted_pages.len() {
+        if sorted_pages[i] == batch_start + batch_len {
+            // Contiguous — extend the batch.
+            batch_len += page_size;
+        } else {
+            // Gap — protect the current batch and start a new one.
+            wp.protect(batch_start, batch_len)
+                .map_err(CreateSnapshotError::AsyncWriteProtect)?;
+            batch_start = sorted_pages[i];
+            batch_len = page_size;
+        }
     }
+    // Protect the last batch.
+    wp.protect(batch_start, batch_len)
+        .map_err(CreateSnapshotError::AsyncWriteProtect)?;
 
     // 4. Start the COW handler thread.
     wp.start_handler()
@@ -271,6 +290,7 @@ fn create_async_memory_snapshot(
     vmm.active_snapshot = Some(ActiveSnapshot {
         write_protect: wp,
         writer,
+        snapshot_type: params.snapshot_type,
     });
 
     log::info!("async snapshot started, VM can resume now");

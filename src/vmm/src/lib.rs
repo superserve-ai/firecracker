@@ -339,6 +339,8 @@ pub struct ActiveSnapshot {
     pub write_protect: crate::snapshot::write_protect::SnapshotWriteProtect,
     /// Background thread writing dirty pages to snapshot file.
     pub writer: crate::snapshot::background_writer::BackgroundMemoryWriter,
+    /// Snapshot type — determines whether to reset dirty tracking on completion.
+    pub snapshot_type: crate::vmm_config::snapshot::SnapshotType,
 }
 
 impl std::fmt::Debug for ActiveSnapshot {
@@ -348,6 +350,10 @@ impl std::fmt::Debug for ActiveSnapshot {
             .finish()
     }
 }
+
+// ActiveSnapshot cleanup happens automatically:
+// - SnapshotWriteProtect::drop() stops the handler thread and unprotects pages
+// - BackgroundMemoryWriter's thread detaches when the handle is dropped
 
 impl Vmm {
     /// Complete an active async snapshot, cleaning up resources and resetting
@@ -366,10 +372,10 @@ impl Vmm {
             None => return Ok(None),
         };
 
-        // Wait for the background writer to finish.
+        // Wait for the background writer to finish (30 second timeout).
         let stats = snapshot
             .writer
-            .wait()
+            .wait_timeout(std::time::Duration::from_secs(30))
             .map_err(crate::persist::CreateSnapshotError::AsyncBackgroundWrite)?;
 
         // Unprotect all remaining pages and stop the COW handler.
@@ -378,9 +384,13 @@ impl Vmm {
             .finish()
             .map_err(crate::persist::CreateSnapshotError::AsyncWriteProtect)?;
 
-        // Reset dirty tracking so the next snapshot only captures new changes.
-        self.vm.reset_dirty_bitmap();
-        self.vm.guest_memory().reset_dirty();
+        // For Full snapshots, reset dirty tracking so the next diff snapshot
+        // only captures pages changed after this point.
+        // For Diff snapshots, preserve dirty tracking for subsequent diffs.
+        if snapshot.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
+            self.vm.reset_dirty_bitmap();
+            self.vm.guest_memory().reset_dirty();
+        }
 
         log::info!(
             "async snapshot complete: {} dirty pages, {} COW pages, {}us",

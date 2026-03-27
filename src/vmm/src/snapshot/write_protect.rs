@@ -202,6 +202,25 @@ impl SnapshotWriteProtect {
     }
 }
 
+impl Drop for SnapshotWriteProtect {
+    fn drop(&mut self) {
+        // Ensure the handler thread stops and pages are unprotected.
+        self.stop_flag.store(true, Ordering::Relaxed);
+
+        for &(addr, len) in &self.protected_ranges {
+            let _ = self.uffd.remove_write_protection(
+                addr as *mut std::ffi::c_void,
+                len as usize,
+                true,
+            );
+        }
+
+        if let Some(handle) = self.handler_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
