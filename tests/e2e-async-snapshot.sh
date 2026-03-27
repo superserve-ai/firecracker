@@ -160,7 +160,7 @@ SNAP_RESULT=$(api PUT /snapshot/create "$SOCK" -d "{
 check "async snapshot API returns 204" "echo '$SNAP_RESULT' | grep -q '204'"
 
 # Complete the snapshot
-COMPLETE_RESULT=$(api PUT /snapshot/complete "$SOCK" -w "%{http_code}")
+COMPLETE_RESULT=$(api PUT /snapshot/complete "$SOCK" -d '{}' -w "%{http_code}")
 check "complete snapshot returns 204" "echo '$COMPLETE_RESULT' | grep -q '204'"
 
 # Verify files exist and are non-empty
@@ -188,12 +188,10 @@ VM_DIR="$WORKDIR/vm2-sync"
 pause_vm "$SOCK"
 sleep 0.5
 
-SYNC_MS=$(time_ms api PUT /snapshot/create "$SOCK" -d "{
-    \"snapshot_path\": \"$VM_DIR/snapshot.bin\",
-    \"mem_file_path\": \"$VM_DIR/mem.bin\",
-    \"snapshot_type\": \"Full\",
-    \"async_snapshot\": false
-}")
+SYNC_START=$(date +%s%N)
+api PUT /snapshot/create "$SOCK" -d "{\"snapshot_path\":\"$VM_DIR/snapshot.bin\",\"mem_file_path\":\"$VM_DIR/mem.bin\",\"snapshot_type\":\"Full\",\"async_snapshot\":false}" > /dev/null
+SYNC_END=$(date +%s%N)
+SYNC_MS=$(( (SYNC_END - SYNC_START) / 1000000 ))
 info "sync snapshot: ${SYNC_MS}ms"
 check "sync snapshot file exists" "[ -s $VM_DIR/mem.bin ]"
 kill_vm "vm2-sync"
@@ -206,16 +204,14 @@ VM_DIR="$WORKDIR/vm2-async"
 pause_vm "$SOCK"
 sleep 0.5
 
-ASYNC_MS=$(time_ms api PUT /snapshot/create "$SOCK" -d "{
-    \"snapshot_path\": \"$VM_DIR/snapshot.bin\",
-    \"mem_file_path\": \"$VM_DIR/mem.bin\",
-    \"snapshot_type\": \"Full\",
-    \"async_snapshot\": true
-}")
+ASYNC_START=$(date +%s%N)
+api PUT /snapshot/create "$SOCK" -d "{\"snapshot_path\":\"$VM_DIR/snapshot.bin\",\"mem_file_path\":\"$VM_DIR/mem.bin\",\"snapshot_type\":\"Full\",\"async_snapshot\":true}" > /dev/null
+ASYNC_END=$(date +%s%N)
+ASYNC_MS=$(( (ASYNC_END - ASYNC_START) / 1000000 ))
 info "async snapshot API call: ${ASYNC_MS}ms"
 
 # Complete it
-api PUT /snapshot/complete "$SOCK" -w "%{http_code}" > /dev/null
+api PUT /snapshot/complete "$SOCK" -d '{}' -w "%{http_code}" > /dev/null
 
 check "async snapshot file exists" "[ -s $VM_DIR/mem.bin ]"
 
@@ -249,7 +245,7 @@ api PUT /snapshot/create "$SOCK" -d "{
     \"async_snapshot\": true
 }" > /dev/null
 
-api PUT /snapshot/complete "$SOCK" > /dev/null
+api PUT /snapshot/complete "$SOCK" -d '{}' > /dev/null
 kill_vm "vm3-create"
 sleep 1
 
@@ -300,7 +296,7 @@ api PUT /snapshot/create "$SOCK" -d "{
     \"snapshot_type\": \"Full\",
     \"async_snapshot\": true
 }" > /dev/null
-api PUT /snapshot/complete "$SOCK" > /dev/null
+api PUT /snapshot/complete "$SOCK" -d '{}' > /dev/null
 
 FULL_SIZE=$(stat -c %s "$VM_DIR/mem1.bin" 2>/dev/null || stat -f %z "$VM_DIR/mem1.bin" 2>/dev/null)
 info "full snapshot mem size: ${FULL_SIZE} bytes"
@@ -314,13 +310,11 @@ sleep 2
 pause_vm "$SOCK"
 sleep 0.5
 
-DIFF_MS=$(time_ms api PUT /snapshot/create "$SOCK" -d "{
-    \"snapshot_path\": \"$VM_DIR/snap2.bin\",
-    \"mem_file_path\": \"$VM_DIR/mem1.bin\",
-    \"snapshot_type\": \"Diff\",
-    \"async_snapshot\": true
-}")
-api PUT /snapshot/complete "$SOCK" > /dev/null
+DIFF_START=$(date +%s%N)
+api PUT /snapshot/create "$SOCK" -d "{\"snapshot_path\":\"$VM_DIR/snap2.bin\",\"mem_file_path\":\"$VM_DIR/mem1.bin\",\"snapshot_type\":\"Diff\",\"async_snapshot\":true}" > /dev/null
+DIFF_END=$(date +%s%N)
+DIFF_MS=$(( (DIFF_END - DIFF_START) / 1000000 ))
+api PUT /snapshot/complete "$SOCK" -d '{}' > /dev/null
 
 info "diff async snapshot: ${DIFF_MS}ms"
 check "diff snapshot updates mem file" "[ -s $VM_DIR/mem1.bin ]"
@@ -333,13 +327,11 @@ sleep 2
 pause_vm "$SOCK"
 sleep 0.5
 
-DIFF2_MS=$(time_ms api PUT /snapshot/create "$SOCK" -d "{
-    \"snapshot_path\": \"$VM_DIR/snap3.bin\",
-    \"mem_file_path\": \"$VM_DIR/mem1.bin\",
-    \"snapshot_type\": \"Diff\",
-    \"async_snapshot\": true
-}")
-api PUT /snapshot/complete "$SOCK" > /dev/null
+DIFF2_START=$(date +%s%N)
+api PUT /snapshot/create "$SOCK" -d "{\"snapshot_path\":\"$VM_DIR/snap3.bin\",\"mem_file_path\":\"$VM_DIR/mem1.bin\",\"snapshot_type\":\"Diff\",\"async_snapshot\":true}" > /dev/null
+DIFF2_END=$(date +%s%N)
+DIFF2_MS=$(( (DIFF2_END - DIFF2_START) / 1000000 ))
+api PUT /snapshot/complete "$SOCK" -d '{}' > /dev/null
 
 info "second diff snapshot: ${DIFF2_MS}ms"
 check "second diff snapshot succeeds" "[ -s $VM_DIR/snap3.bin ]"
@@ -378,7 +370,7 @@ SECOND_RESULT=$(api PUT /snapshot/create "$SOCK" -d "{
 check "second snapshot while first in progress returns 204" "echo '$SECOND_RESULT' | grep -q '204'"
 
 # Complete the second
-api PUT /snapshot/complete "$SOCK" > /dev/null
+api PUT /snapshot/complete "$SOCK" -d '{}' > /dev/null
 
 check "first snapshot file created (auto-completed)" "[ -s $VM_DIR/mem-a.bin ]"
 check "second snapshot file created" "[ -s $VM_DIR/mem-b.bin ]"
@@ -417,7 +409,7 @@ check "VM still running after async snapshot + resume" "kill -0 $FC_PID 2>/dev/n
 # Now complete (should work even after resume)
 pause_vm "$SOCK"
 sleep 0.5
-api PUT /snapshot/complete "$SOCK" > /dev/null
+api PUT /snapshot/complete "$SOCK" -d '{}' > /dev/null
 check "complete after resume succeeds" "[ -s $VM_DIR/mem.bin ]"
 
 kill_vm "vm6"
