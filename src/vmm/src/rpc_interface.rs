@@ -62,6 +62,8 @@ pub enum VmmAction {
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
+    /// Wait for an in-progress async snapshot to complete and clean up resources.
+    CompleteSnapshot,
     /// Get the balloon device configuration.
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
@@ -483,6 +485,7 @@ impl<'a> PrebootApiController<'a> {
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
+            | CompleteSnapshot
             | FlushMetrics
             | Pause
             | Resume
@@ -679,6 +682,13 @@ impl RuntimeApiController {
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            CompleteSnapshot => {
+                let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
+                locked_vmm
+                    .complete_snapshot()
+                    .map(|_| VmmData::Empty)
+                    .map_err(VmmActionError::CreateSnapshot)
+            }
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -1174,8 +1184,10 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
+                async_snapshot: false,
             },
         )));
+        check_unsupported(preboot_request(VmmAction::CompleteSnapshot));
         #[cfg(target_arch = "x86_64")]
         check_unsupported(preboot_request(VmmAction::SendCtrlAltDel));
         check_unsupported(preboot_request(VmmAction::UpdateMemoryHotplugSize(

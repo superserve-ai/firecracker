@@ -45,11 +45,12 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
-    /// Optional directory for block device delta files. When set, overlay block
-    /// devices will write delta files (containing only dirty blocks) into this
-    /// directory, named `{drive_id}.delta`.
+    /// Optional directory for block device delta files.
     #[serde(default)]
     pub block_delta_dir: Option<PathBuf>,
+    /// Use background snapshot (VM resumes immediately, memory written in background).
+    #[serde(default)]
+    pub async_snapshot: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
