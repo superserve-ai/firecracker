@@ -15,8 +15,8 @@ set -euo pipefail
 
 VANILLA_BIN="${1:?Usage: $0 <vanilla_binary> <our_binary>}"
 OUR_BIN="${2:?Usage: $0 <vanilla_binary> <our_binary>}"
-KERNEL="${KERNEL:-/var/lib/sandtrace/kernel/vmlinux.bin}"
-ROOTFS="${ROOTFS:-/var/lib/sandtrace/rootfs/alpine-rootfs.ext4}"
+KERNEL="${KERNEL:-/var/lib/bench/kernel/vmlinux.bin}"
+ROOTFS="${ROOTFS:-/var/lib/bench/rootfs/rootfs.ext4}"
 WORKDIR="/tmp/pause-resume-bench-$$"
 
 BOLD='\033[1m'
