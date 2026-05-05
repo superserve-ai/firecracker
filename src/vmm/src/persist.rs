@@ -262,14 +262,15 @@ fn write_overlay_sidecar(
         }
     }
 
-    let path = overlay_sidecar_path(snapshot_path);
     if sidecar.devices.is_empty() {
-        // Make sure no stale side-car from a previous overlay-enabled save
-        // sticks around when this snapshot has no overlay devices.
-        let _ = std::fs::remove_file(&path);
+        // No overlay devices — don't write a side-car at all. This keeps the
+        // on-disk shape identical to vanilla Firecracker for non-overlay
+        // workloads, and avoids issuing unlink/remove_file syscalls (which
+        // are not in Firecracker's seccomp allowlist).
         return Ok(());
     }
 
+    let path = overlay_sidecar_path(snapshot_path);
     let bytes = bitcode::serialize(&sidecar)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode sidecar: {e}")))?;
     let mut f = OpenOptions::new()
