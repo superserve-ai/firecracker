@@ -262,14 +262,17 @@ fn write_overlay_sidecar(
         }
     }
 
-    if sidecar.devices.is_empty() {
-        // No overlay devices — don't write a side-car at all. This keeps the
-        // on-disk shape identical to vanilla Firecracker for non-overlay
-        // workloads, and avoids issuing unlink/remove_file syscalls (which
-        // are not in Firecracker's seccomp allowlist).
-        return Ok(());
-    }
-
+    // Always write the side-car, even when `sidecar.devices` is empty.
+    //
+    // `snapshot_state_to_file` opens the main vmstate.snap with
+    // `truncate(true)`, so the same path can legitimately be reused. If a
+    // prior save at this path had overlay state, a stale `.overlay` would
+    // sit alongside the new (non-overlay) vmstate.snap and `read_overlay_sidecar`
+    // would happily inject phantom OverlayState into the wrong devices on
+    // load. Writing an empty side-car here truncates any stale content via
+    // `OpenOptions::truncate(true)` — the same syscall path the main
+    // snapshot write uses, so it's already in Firecracker's seccomp allowlist
+    // (no `unlink` involved).
     let path = overlay_sidecar_path(snapshot_path);
     let bytes = bitcode::serialize(&sidecar)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode sidecar: {e}")))?;
