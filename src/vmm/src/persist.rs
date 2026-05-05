@@ -159,8 +159,13 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(9, 1, 0);
+/// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
+/// persisted out-of-band in a side-car file, so the bitcode payload of
+/// `vmstate.snap` is byte-identical to vanilla Firecracker. Bumping the
+/// minor here would make vanilla reject this binary's saves
+/// (`Snapshot::load` requires `minor <= ours`), creating a one-way door
+/// with no operational benefit.
+pub const SNAPSHOT_VERSION: Version = Version::new(9, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
