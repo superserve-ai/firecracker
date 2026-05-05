@@ -7,7 +7,7 @@
 //! file using a dirty bitmap. Writes always go to the overlay.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 
@@ -21,12 +21,16 @@ pub enum OverlayIoError {
     BaseSeek(std::io::Error),
     /// Base read transfer: {0}
     BaseTransfer(GuestMemoryError),
+    /// Base host read (copy-up): {0}
+    BaseHostRead(std::io::Error),
     /// Overlay seek: {0}
     OverlaySeek(std::io::Error),
     /// Overlay read transfer: {0}
     OverlayReadTransfer(GuestMemoryError),
     /// Overlay write transfer: {0}
     OverlayWriteTransfer(GuestMemoryError),
+    /// Overlay host write (copy-up): {0}
+    OverlayHostWrite(std::io::Error),
     /// Overlay flush: {0}
     OverlayFlush(std::io::Error),
     /// Overlay sync: {0}
@@ -172,6 +176,25 @@ impl OverlayFileEngine {
     }
 
     /// Write to the overlay and mark blocks as dirty.
+    ///
+    /// Copy-on-write semantics: when a write would only partially cover a
+    /// currently-clean block, the rest of the block is read from `base` and
+    /// written to `overlay` first. Without this copy-up step the unwritten
+    /// portion of the block would silently read back as zeros (the overlay
+    /// file is sparse) instead of the original base data.
+    ///
+    /// Three cases of interest, all relative to the dirty-bitmap block size:
+    ///
+    /// - The first block is partially written (write starts mid-block) and is
+    ///   currently clean → copy-up that block from base.
+    /// - The last block is partially written (write ends mid-block) and is
+    ///   currently clean → copy-up that block from base.
+    /// - Middle blocks fully covered by the write don't need copy-up — they
+    ///   are overwritten in their entirety.
+    ///
+    /// When the write covers a single partial block, the first-block branch
+    /// handles it; the last-block branch is skipped because it would refer
+    /// to the same block.
     pub fn write(
         &mut self,
         offset: u64,
@@ -179,6 +202,40 @@ impl OverlayFileEngine {
         addr: GuestAddress,
         count: u32,
     ) -> Result<u32, OverlayIoError> {
+        let block_size = u64::from(self.bitmap.block_size());
+        let count_u64 = u64::from(count);
+        let end_offset = offset + count_u64;
+
+        // A block needs copy-up if the write doesn't fully cover it AND
+        // the block is currently clean. "Fully covered" means the write
+        // starts at-or-before the block start and ends at-or-after the
+        // block end — anything else leaves bytes unwritten in the overlay.
+        let first_block_idx = offset / block_size;
+        let first_block_start = first_block_idx * block_size;
+        let first_block_end = first_block_start + block_size;
+        let first_fully_covered =
+            offset == first_block_start && end_offset >= first_block_end;
+        if !first_fully_covered && !self.bitmap.is_set(first_block_idx) {
+            self.copy_up_block(first_block_start, block_size)?;
+        }
+
+        // Last touched block, but only when it's a different block from the
+        // first (single-block writes are already handled above).
+        if count_u64 > 0 {
+            let last_block_idx = (end_offset - 1) / block_size;
+            if last_block_idx != first_block_idx {
+                let last_block_start = last_block_idx * block_size;
+                let last_block_end = last_block_start + block_size;
+                // The write necessarily reaches into this block, so the
+                // start side is covered; the only unwritten portion would
+                // be a tail past `end_offset`.
+                if end_offset < last_block_end && !self.bitmap.is_set(last_block_idx) {
+                    self.copy_up_block(last_block_start, block_size)?;
+                }
+            }
+        }
+
+        // Apply the actual partial / full write.
         self.overlay
             .seek(SeekFrom::Start(offset))
             .map_err(OverlayIoError::OverlaySeek)?;
@@ -188,6 +245,39 @@ impl OverlayFileEngine {
 
         self.bitmap.set(offset, count);
         Ok(count)
+    }
+
+    /// Read `block_size` bytes from `base` at `block_offset` and write them
+    /// to `overlay` at the same offset. Used by `write` to lift unwritten
+    /// portions of partially-written blocks before applying the new data.
+    ///
+    /// `base` and `overlay` are the same logical size (enforced at engine
+    /// construction), so `block_offset + block_size` is always within range.
+    fn copy_up_block(
+        &mut self,
+        block_offset: u64,
+        block_size: u64,
+    ) -> Result<(), OverlayIoError> {
+        let block_size = block_size as usize;
+        let mut buf = vec![0u8; block_size];
+
+        self.base
+            .seek(SeekFrom::Start(block_offset))
+            .map_err(OverlayIoError::BaseSeek)?;
+        // read_exact: base has been size-checked at engine construction, so
+        // any short read here is a hard error rather than EOF-at-tail.
+        self.base
+            .read_exact(&mut buf)
+            .map_err(OverlayIoError::BaseHostRead)?;
+
+        self.overlay
+            .seek(SeekFrom::Start(block_offset))
+            .map_err(OverlayIoError::OverlaySeek)?;
+        self.overlay
+            .write_all(&buf)
+            .map_err(OverlayIoError::OverlayHostWrite)?;
+
+        Ok(())
     }
 
     /// Flush the overlay file to disk. Base is read-only and never needs flushing.
@@ -511,5 +601,112 @@ mod tests {
 
         // Bitmap should still show 1 dirty block.
         assert_eq!(engine.bitmap().dirty_count(), 1);
+    }
+
+    /// Sub-block write must copy the unwritten portion of the block from base.
+    ///
+    /// Without copy-up, the overlay file is sparse beyond the written bytes
+    /// and the reader incorrectly returns zeros for the unwritten range —
+    /// silent data corruption.
+    #[test]
+    fn test_partial_write_copies_up_unwritten_prefix_of_block() {
+        let base_data = vec![0xAA_u8; FILE_LEN as usize];
+        let mut engine = create_engine(&base_data);
+
+        // Write 512 bytes of 0xBB to the START of block 0 (offset 0).
+        let mem = create_mem();
+        mem.write(&vec![0xBB_u8; 512], GuestAddress(0)).unwrap();
+        engine.write(0, &mem, GuestAddress(0), 512).unwrap();
+
+        // Read the next 3584 bytes — still inside block 0 — should still be
+        // 0xAA from base, not 0x00 from a sparse overlay file.
+        let mem = create_mem();
+        engine.read(512, &mem, GuestAddress(0), 3584).unwrap();
+        let mut buf = vec![0u8; 3584];
+        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+        assert_eq!(buf, vec![0xAA_u8; 3584]);
+    }
+
+    /// Symmetric case: write the END of a block, read the prefix back.
+    /// The prefix must come from base, not the sparse overlay.
+    #[test]
+    fn test_partial_write_copies_up_unwritten_suffix_of_block() {
+        let base_data = vec![0xAA_u8; FILE_LEN as usize];
+        let mut engine = create_engine(&base_data);
+
+        // Write the last 512 bytes of block 0 (offset 3584..4096).
+        let mem = create_mem();
+        mem.write(&vec![0xBB_u8; 512], GuestAddress(0)).unwrap();
+        engine.write(3584, &mem, GuestAddress(0), 512).unwrap();
+
+        // Read the first 3584 bytes of block 0 — should be 0xAA from base.
+        let mem = create_mem();
+        engine.read(0, &mem, GuestAddress(0), 3584).unwrap();
+        let mut buf = vec![0u8; 3584];
+        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+        assert_eq!(buf, vec![0xAA_u8; 3584]);
+    }
+
+    /// Write spans two blocks, partial at both ends. Both unwritten edges
+    /// must be copied up from base.
+    #[test]
+    fn test_partial_write_spanning_two_blocks_copies_up_both_edges() {
+        // Use distinguishable base data so a stray copy-up failure is obvious.
+        let mut base_data = vec![0u8; FILE_LEN as usize];
+        for (i, b) in base_data.iter_mut().enumerate() {
+            // Block 0 = 0xAA, block 1 = 0xCC, rest don't matter.
+            *b = if i < 4096 { 0xAA } else { 0xCC };
+        }
+        let mut engine = create_engine(&base_data);
+
+        // Write 4096 bytes of 0xBB starting at offset 2048 — covers the
+        // second half of block 0 and the first half of block 1.
+        let mem = create_mem();
+        mem.write(&vec![0xBB_u8; 4096], GuestAddress(0)).unwrap();
+        engine.write(2048, &mem, GuestAddress(0), 4096).unwrap();
+
+        // First half of block 0 must still be 0xAA.
+        let mem = create_mem();
+        engine.read(0, &mem, GuestAddress(0), 2048).unwrap();
+        let mut buf = vec![0u8; 2048];
+        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+        assert_eq!(buf, vec![0xAA_u8; 2048], "block 0 prefix corrupted");
+
+        // Second half of block 1 must still be 0xCC.
+        let mem = create_mem();
+        engine.read(6144, &mem, GuestAddress(0), 2048).unwrap();
+        let mut buf = vec![0u8; 2048];
+        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+        assert_eq!(buf, vec![0xCC_u8; 2048], "block 1 suffix corrupted");
+    }
+
+    /// A full-block-aligned write doesn't need copy-up; sanity check that
+    /// the fast path is unchanged.
+    #[test]
+    fn test_full_block_write_does_not_corrupt_neighbours() {
+        let mut base_data = vec![0u8; FILE_LEN as usize];
+        for (i, b) in base_data.iter_mut().enumerate() {
+            *b = match i / 4096 {
+                0 => 0xAA,
+                1 => 0xBB,
+                2 => 0xCC,
+                _ => 0xDD,
+            };
+        }
+        let mut engine = create_engine(&base_data);
+
+        // Overwrite block 1 entirely with 0xEE.
+        let mem = create_mem();
+        mem.write(&vec![0xEE_u8; 4096], GuestAddress(0)).unwrap();
+        engine.write(4096, &mem, GuestAddress(0), 4096).unwrap();
+
+        // Block 0 still 0xAA, block 1 now 0xEE, block 2 still 0xCC.
+        let mem = create_mem();
+        engine.read(0, &mem, GuestAddress(0), 12288).unwrap();
+        let mut buf = vec![0u8; 12288];
+        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+        assert_eq!(&buf[0..4096], &vec![0xAA_u8; 4096][..], "block 0");
+        assert_eq!(&buf[4096..8192], &vec![0xEE_u8; 4096][..], "block 1");
+        assert_eq!(&buf[8192..12288], &vec![0xCC_u8; 4096][..], "block 2");
     }
 }
