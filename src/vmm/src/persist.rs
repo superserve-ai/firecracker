@@ -217,7 +217,106 @@ fn snapshot_state_to_file(
         .map_err(|err| SnapshotBackingFile("flush", err))?;
     snapshot_file
         .sync_all()
-        .map_err(|err| SnapshotBackingFile("sync_all", err))
+        .map_err(|err| SnapshotBackingFile("sync_all", err))?;
+
+    // Write the overlay side-car after the main snapshot so the bitcode
+    // payload stays byte-identical to vanilla Firecracker. Vanilla snapshots
+    // simply have no side-car file; the loader treats that as "no overlay".
+    write_overlay_sidecar(microvm_state, snapshot_path).map_err(|err| {
+        SnapshotBackingFile(
+            "overlay_sidecar",
+            io::Error::new(io::ErrorKind::Other, format!("{err}")),
+        )
+    })
+}
+
+/// Path of the overlay side-car for a given vmstate snapshot path.
+fn overlay_sidecar_path(snapshot_path: &Path) -> std::path::PathBuf {
+    let mut p = snapshot_path.as_os_str().to_owned();
+    p.push(".overlay");
+    p.into()
+}
+
+/// Side-car payload: maps drive_id → OverlayState. Bitcode-encoded.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OverlaySidecar {
+    devices: Vec<(String, crate::devices::virtio::block::virtio::persist::OverlayState)>,
+}
+
+/// Walk the block devices in `microvm_state`, extract any `overlay_state`
+/// populated by `VirtioBlock::save`, and write them to the side-car file.
+/// No-op (no file written) when no block device has overlay state, keeping
+/// vanilla snapshots indistinguishable on disk.
+fn write_overlay_sidecar(
+    microvm_state: &MicrovmState,
+    snapshot_path: &Path,
+) -> Result<(), io::Error> {
+    use crate::devices::virtio::block::persist::BlockState;
+
+    let mut sidecar = OverlaySidecar::default();
+    for block_state in &microvm_state.device_states.mmio_state.block_devices {
+        if let BlockState::Virtio(ref vs) = block_state.device_state {
+            if let Some(ref overlay) = vs.overlay_state {
+                sidecar.devices.push((vs.id.clone(), overlay.clone()));
+            }
+        }
+    }
+
+    let path = overlay_sidecar_path(snapshot_path);
+    if sidecar.devices.is_empty() {
+        // Make sure no stale side-car from a previous overlay-enabled save
+        // sticks around when this snapshot has no overlay devices.
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+
+    let bytes = bitcode::serialize(&sidecar)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode sidecar: {e}")))?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+    f.write_all(&bytes)?;
+    f.flush()?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Load the overlay side-car (if it exists) and inject its `OverlayState`
+/// entries back into the matching block devices in `microvm_state`. Snapshots
+/// produced by vanilla Firecracker (or by this binary on a host with no
+/// overlay devices) won't have a side-car, in which case this is a no-op.
+fn read_overlay_sidecar(
+    microvm_state: &mut MicrovmState,
+    snapshot_path: &Path,
+) -> Result<(), io::Error> {
+    use crate::devices::virtio::block::persist::BlockState;
+
+    let path = overlay_sidecar_path(snapshot_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let sidecar: OverlaySidecar = bitcode::deserialize(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("decode sidecar: {e}")))?;
+
+    let mut by_id: std::collections::HashMap<String, _> =
+        sidecar.devices.into_iter().collect();
+    for block_state in microvm_state
+        .device_states
+        .mmio_state
+        .block_devices
+        .iter_mut()
+    {
+        if let BlockState::Virtio(ref mut vs) = block_state.device_state {
+            if let Some(overlay) = by_id.remove(&vs.id) {
+                vs.overlay_state = Some(overlay);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates that snapshot CPU vendor matches the host CPU vendor.
@@ -484,6 +583,8 @@ pub enum SnapshotStateFromFileError {
     Load(#[from] crate::snapshot::SnapshotError),
     /// Unknown Network Device.
     UnknownNetworkDevice,
+    /// Failed to read overlay side-car: {0}
+    Io(std::io::Error),
 }
 
 fn snapshot_state_from_file(
@@ -491,8 +592,14 @@ fn snapshot_state_from_file(
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
     let mut snapshot_reader = File::open(snapshot_path)?;
     let snapshot = Snapshot::load(&mut snapshot_reader)?;
+    let mut state = snapshot.data;
 
-    Ok(snapshot.data)
+    // Vanilla / pre-overlay snapshots have no side-car and this is a no-op,
+    // which is exactly the backward-compat path: old snapshots load fine, the
+    // restored block devices simply use the sync engine.
+    read_overlay_sidecar(&mut state, snapshot_path).map_err(SnapshotStateFromFileError::Io)?;
+
+    Ok(state)
 }
 
 /// Error type for [`guest_memory_from_file`].

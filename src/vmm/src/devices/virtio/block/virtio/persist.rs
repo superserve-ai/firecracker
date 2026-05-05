@@ -85,7 +85,16 @@ pub struct VirtioBlockState {
     rate_limiter_state: RateLimiterState,
     file_engine_type: FileEngineTypeState,
     /// Overlay state, present only for overlay-backed block devices.
-    #[serde(default)]
+    ///
+    /// `#[serde(skip)]` keeps this field out of the bitcode-serialized snapshot
+    /// payload entirely so that snapshots remain byte-compatible with vanilla
+    /// Firecracker (which doesn't know about overlay). The overlay state is
+    /// persisted out-of-band in a side-car file (`<vmstate.snap>.overlay`)
+    /// written by `persist::write_overlay_sidecar` and read back by
+    /// `persist::read_overlay_sidecar`. `#[serde(default)]` ensures the field
+    /// is `None` when the snapshot is loaded; the side-car loader then
+    /// populates it for overlay-backed devices.
+    #[serde(skip, default)]
     pub overlay_state: Option<OverlayState>,
 }
 
@@ -352,7 +361,7 @@ mod tests {
 
         let block = VirtioBlock::new(config).unwrap();
 
-        // Verify overlay state is present in save.
+        // Verify overlay state is present in the in-memory save.
         let block_state = block.save();
         assert!(block_state.overlay_state.is_some());
 
@@ -361,19 +370,16 @@ mod tests {
         assert_eq!(overlay_state.overlay_path, overlay_path);
         assert_eq!(overlay_state.block_size, 4096);
 
-        // Serialize and deserialize.
+        // overlay_state is `#[serde(skip)]` so it does NOT survive bitcode
+        // round-trip — it's persisted out-of-band in the side-car file by
+        // `crate::persist::write_overlay_sidecar`. After deserialization the
+        // field is `None`; production code re-injects it from the side-car.
         let serialized = bitcode::serialize(&block_state).unwrap();
-        let restored_state: VirtioBlockState = bitcode::deserialize(&serialized).unwrap();
+        let mut restored_state: VirtioBlockState = bitcode::deserialize(&serialized).unwrap();
+        assert!(restored_state.overlay_state.is_none());
 
-        // Verify overlay state survived serialization.
-        assert!(restored_state.overlay_state.is_some());
-        let restored_overlay = restored_state.overlay_state.as_ref().unwrap();
-        assert_eq!(restored_overlay.base_path, base_path);
-        assert_eq!(restored_overlay.block_size, overlay_state.block_size);
-        assert_eq!(restored_overlay.total_blocks, overlay_state.total_blocks);
-        assert_eq!(restored_overlay.dirty_bitmap, overlay_state.dirty_bitmap);
-
-        // Restore the block device.
+        // Simulate the side-car re-injecting the overlay state, then restore.
+        restored_state.overlay_state = block_state.overlay_state.clone();
         let guest_mem = default_mem();
         let restored_block =
             VirtioBlock::restore(BlockConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
