@@ -211,9 +211,21 @@ impl Persist<'_> for VirtioBlock {
         let avail_features = state.virtio_state.avail_features;
         let acked_features = state.virtio_state.acked_features;
 
-        let config_space = ConfigSpace {
+        // Match the live-create path: when the device is overlay-backed, the
+        // VIRTIO_BLK_F_DISCARD config-space fields must be valid per
+        // virtio-spec 1.2 §5.2.4. avail_features comes from the snapshot, so
+        // we key off the file-engine type rather than re-checking the bit.
+        let mut config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            ..Default::default()
         };
+        if state.file_engine_type == FileEngineTypeState::Overlay {
+            use crate::devices::virtio::block::virtio::SECTOR_SIZE;
+            use crate::devices::virtio::block::virtio::io::dirty_bitmap::DEFAULT_BLOCK_SIZE;
+            config_space.max_discard_sectors = u32::MAX.to_le();
+            config_space.max_discard_seg = 1u32.to_le();
+            config_space.discard_sector_alignment = (DEFAULT_BLOCK_SIZE / SECTOR_SIZE).to_le();
+        }
 
         Ok(VirtioBlock {
             avail_features,

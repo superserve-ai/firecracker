@@ -429,8 +429,26 @@ impl Request {
                             break;
                         }
                     };
-                    let offset = sector << SECTOR_SHIFT;
+                    // Bounds-check the segment before passing it to the
+                    // engine. A malicious or buggy guest can pass huge sector
+                    // values; without this check we'd silently saturate inside
+                    // discard() and report success on a no-op range, or worse.
                     let len = u64::from(num_sectors) << SECTOR_SHIFT;
+                    let disk_size = disk.nsectors << SECTOR_SHIFT;
+                    let offset_opt = sector.checked_shl(u32::from(SECTOR_SHIFT));
+                    let in_bounds = offset_opt
+                        .and_then(|o| o.checked_add(len))
+                        .is_some_and(|end| end <= disk_size);
+                    if !in_bounds {
+                        discard_err = Some(block_io::BlockIoError::Overlay(
+                            block_io::OverlayIoError::OverlaySeek(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "discard segment out of bounds",
+                            )),
+                        ));
+                        break;
+                    }
+                    let offset = offset_opt.expect("checked above");
 
                     if let Err(e) = disk.file_engine.discard(offset, len) {
                         discard_err = Some(e);

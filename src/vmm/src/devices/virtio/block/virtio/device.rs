@@ -317,10 +317,31 @@ impl DiskProperties {
     }
 }
 
+/// `virtio_blk_config` per virtio-spec 1.2 §5.2.4. Field offsets are
+/// load-bearing: the guest reads e.g. `max_discard_sectors` at the spec's
+/// fixed offset (36) regardless of which optional fields we actually use.
+/// Fields whose feature bit isn't negotiated are read by the guest as zero,
+/// which matches `Default::default()` here.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
 pub struct ConfigSpace {
     pub capacity: u64,
+    pub size_max: u32,
+    pub seg_max: u32,
+    pub geometry_cylinders: u16,
+    pub geometry_heads: u8,
+    pub geometry_sectors: u8,
+    pub blk_size: u32,
+    pub topology_physical_block_exp: u8,
+    pub topology_alignment_offset: u8,
+    pub topology_min_io_size: u16,
+    pub topology_opt_io_size: u32,
+    pub writeback: u8,
+    pub unused0: u8,
+    pub num_queues: u16,
+    pub max_discard_sectors: u32,
+    pub max_discard_seg: u32,
+    pub discard_sector_alignment: u32,
 }
 
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
@@ -497,9 +518,31 @@ impl VirtioBlock {
 
         let queues = BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
-        let config_space = ConfigSpace {
+        let mut config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            ..Default::default()
         };
+
+        // When advertising VIRTIO_BLK_F_DISCARD the spec requires the three
+        // discard config-space fields to be valid. Default-zero means
+        // "unsupported/undefined" depending on guest kernel version; populate
+        // conservative values matching the overlay engine's semantics.
+        if config.file_engine_type == FileEngineType::Overlay {
+            // No per-request cap on discard size — the engine handles arbitrary
+            // ranges by trimming bitmap bits and punching overlay holes. u32::MAX
+            // sectors expressed in 512-byte units is well above any plausible
+            // disk we'd attach.
+            config_space.max_discard_sectors = u32::MAX.to_le();
+            // Single discard segment per request (the virtio spec lets the
+            // guest pack multiple, but advertising 1 forces the simpler path).
+            config_space.max_discard_seg = 1u32.to_le();
+            // Discard granularity = the dirty-bitmap block size, expressed in
+            // 512-byte sectors. Guests that honour this round their discards
+            // to whole bitmap blocks, which is exactly what `discard()` needs
+            // to clear bitmap bits cleanly.
+            config_space.discard_sector_alignment =
+                (super::io::dirty_bitmap::DEFAULT_BLOCK_SIZE / SECTOR_SIZE).to_le();
+        }
 
         Ok(VirtioBlock {
             avail_features,
@@ -1040,11 +1083,17 @@ mod tests {
             // This will read the number of sectors.
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
             // The config space is little endian.
-            let expected_config_space = ConfigSpace { capacity: 8 };
+            let expected_config_space = ConfigSpace {
+                capacity: 8,
+                ..Default::default()
+            };
             assert_eq!(actual_config_space, expected_config_space);
 
             // Invalid read.
-            let expected_config_space = ConfigSpace { capacity: 696969 };
+            let expected_config_space = ConfigSpace {
+                capacity: 696969,
+                ..Default::default()
+            };
             actual_config_space = expected_config_space;
             block.read_config(
                 std::mem::size_of::<ConfigSpace>() as u64 + 1,
@@ -1057,11 +1106,68 @@ mod tests {
     }
 
     #[test]
+    fn test_overlay_advertises_discard_config_fields() {
+        // Build a tiny overlay block device by constructing its VirtioBlockConfig
+        // directly (the shared test helper assumes a single backing file).
+        use vmm_sys_util::tempfile::TempFile;
+        const FILE_LEN: u64 = 0x1000;
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(FILE_LEN).unwrap();
+        let overlay = TempFile::new().unwrap();
+        overlay.as_file().set_len(FILE_LEN).unwrap();
+
+        let cfg = VirtioBlockConfig {
+            drive_id: "overlay-test".to_string(),
+            path_on_host: overlay.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            cache_type: CacheType::Unsafe,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::Overlay,
+            base_path: Some(base.as_path().to_str().unwrap().to_string()),
+        };
+        let block = VirtioBlock::new(cfg).unwrap();
+
+        // VIRTIO_BLK_F_DISCARD must be advertised so the guest knows the
+        // discard config-space fields are valid.
+        assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
+
+        // Read the full config space.
+        let mut cfg_space = ConfigSpace::default();
+        block.read_config(0, cfg_space.as_mut_slice());
+
+        // capacity = file size in 512-byte sectors.
+        assert_eq!(cfg_space.capacity, FILE_LEN >> SECTOR_SHIFT);
+
+        // Discard fields per virtio-spec 1.2 §5.2.4: must be valid (non-zero
+        // / non-default) when DISCARD is negotiated.
+        assert_eq!(cfg_space.max_discard_sectors, u32::MAX);
+        assert_eq!(cfg_space.max_discard_seg, 1);
+        assert_eq!(
+            cfg_space.discard_sector_alignment,
+            super::io::dirty_bitmap::DEFAULT_BLOCK_SIZE / SECTOR_SIZE
+        );
+
+        // Spot-check the on-wire offset of max_discard_sectors. Per spec it
+        // sits at offset 36 — guests read it from there regardless of how we
+        // organise the struct, so a regression in `repr(C)` layout would
+        // silently break DISCARD even if the named field looks correct.
+        let mut bytes = [0u8; 64];
+        block.read_config(0, &mut bytes);
+        let mds_at_offset_36 = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+        assert_eq!(mds_at_offset_36, u32::MAX);
+    }
+
+    #[test]
     fn test_virtio_write_config() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let mut block = default_block(engine);
 
-            let expected_config_space = ConfigSpace { capacity: 696969 };
+            let expected_config_space = ConfigSpace {
+                capacity: 696969,
+                ..Default::default()
+            };
             block.write_config(0, expected_config_space.as_slice());
 
             let mut actual_config_space = ConfigSpace::default();
@@ -1071,6 +1177,7 @@ mod tests {
             // If privileged user writes to `/dev/mem`, in block config space - byte by byte.
             let expected_config_space = ConfigSpace {
                 capacity: 0x1122334455667788,
+                ..Default::default()
             };
             let expected_config_space_slice = expected_config_space.as_slice();
             for (i, b) in expected_config_space_slice.iter().enumerate() {
@@ -1082,6 +1189,7 @@ mod tests {
             // Invalid write.
             let new_config_space = ConfigSpace {
                 capacity: 0xDEADBEEF,
+                ..Default::default()
             };
             block.write_config(5, new_config_space.as_slice());
             // Make sure nothing got written.
