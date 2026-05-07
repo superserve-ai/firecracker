@@ -208,6 +208,20 @@ fn snapshot_state_to_file(
     snapshot_path: &Path,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
+
+    // Zero side-car before main: a torn save leaves a 0-byte sentinel rather
+    // than NEW main + STALE OverlayState. `rename` isn't in the seccomp allowlist.
+    {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(overlay_sidecar_path(snapshot_path))
+            .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero", err))?;
+        f.sync_all()
+            .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero_sync", err))?;
+    }
+
     let mut snapshot_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -224,9 +238,6 @@ fn snapshot_state_to_file(
         .sync_all()
         .map_err(|err| SnapshotBackingFile("sync_all", err))?;
 
-    // Write the overlay side-car after the main snapshot so the bitcode
-    // payload stays byte-identical to vanilla Firecracker. Vanilla snapshots
-    // simply have no side-car file; the loader treats that as "no overlay".
     write_overlay_sidecar(microvm_state, snapshot_path).map_err(|err| {
         SnapshotBackingFile(
             "overlay_sidecar",
@@ -308,6 +319,13 @@ fn read_overlay_sidecar(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
+    // 0-byte file is the torn-save sentinel from `snapshot_state_to_file`.
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("overlay side-car at {path:?} is empty (torn snapshot save)"),
+        ));
+    }
     let sidecar: OverlaySidecar = bitcode::deserialize(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("decode sidecar: {e}")))?;
 

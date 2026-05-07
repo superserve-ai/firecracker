@@ -147,15 +147,12 @@ impl DiskProperties {
                 .set_len(disk_size)
                 .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
         } else if overlay_size != disk_size {
-            return Err(VirtioBlockError::BackingFile(
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "overlay size ({overlay_size}) does not match base size ({disk_size})"
-                    ),
-                ),
-                overlay_path,
-            ));
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(
+                block_io::OverlayIoError::SizeMismatch {
+                    base_size: disk_size,
+                    overlay_size,
+                },
+            )));
         }
 
         let overlay_engine =
@@ -191,6 +188,19 @@ impl DiskProperties {
             .write(true)
             .open(PathBuf::from(&overlay_path))
             .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
+
+        let overlay_size = overlay_file
+            .metadata()
+            .map_err(VirtioBlockError::GetFileMetadata)?
+            .len();
+        if overlay_size != disk_size {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(
+                block_io::OverlayIoError::SizeMismatch {
+                    base_size: disk_size,
+                    overlay_size,
+                },
+            )));
+        }
 
         let overlay_engine = block_io::OverlayFileEngine::from_files(
             base_file,

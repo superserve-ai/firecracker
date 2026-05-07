@@ -24,6 +24,8 @@ pub enum DirtyBitmapError {
     ZeroDiskSize,
     /// Block index {index} out of bounds (total_blocks={total_blocks})
     OutOfBounds { index: u64, total_blocks: u64 },
+    /// Disk size overflow: disk_size_bytes={disk_size_bytes}, block_size={block_size}
+    DiskSizeOverflow { disk_size_bytes: u64, block_size: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +49,10 @@ impl DirtyBitmap {
         // Ceiling division: number of blocks needed to cover the entire disk.
         let total_blocks = disk_size_bytes
             .checked_add(block_size_u64 - 1)
-            .expect("disk size overflow")
+            .ok_or(DirtyBitmapError::DiskSizeOverflow {
+                disk_size_bytes,
+                block_size,
+            })?
             / block_size_u64;
 
         Ok(Self {
@@ -92,12 +97,15 @@ impl DirtyBitmap {
     /// Returns:
     /// - `Some(true)` if all blocks in the range are dirty
     /// - `Some(false)` if all blocks in the range are clean
-    /// - `None` if the range contains a mix of dirty and clean blocks
+    /// - `None` if the range is mixed, or starts past the disk end
     pub fn is_range_uniform(&self, offset: u64, len: u32) -> Option<bool> {
         if len == 0 {
             return Some(false);
         }
         let start_block = self.offset_to_block(offset);
+        if start_block >= self.total_blocks {
+            return None;
+        }
         let end_offset = offset.saturating_add(u64::from(len)).saturating_sub(1);
         let end_block = self.offset_to_block(end_offset).min(self.total_blocks - 1);
 
