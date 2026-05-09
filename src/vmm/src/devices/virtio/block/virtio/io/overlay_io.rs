@@ -13,6 +13,7 @@ use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 
 use super::delta;
 use super::dirty_bitmap::{DirtyBitmap, DirtyBitmapError};
+use crate::logger::warn;
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -134,9 +135,11 @@ impl OverlayFileEngine {
                 )
             };
             if ret != 0 {
-                // Hole punching failure is non-fatal — the bitmap is already cleared,
-                // so reads will go to base. We just don't reclaim the space.
-                let _ = std::io::Error::last_os_error();
+                // Non-fatal: bitmap is already cleared so reads stay correct, we just
+                // don't reclaim host space. Log so silent leakage on filesystems
+                // without PUNCH_HOLE support (NFS, tmpfs, ext3) shows up.
+                let err = std::io::Error::last_os_error();
+                warn!("overlay discard: hole punch failed offset={offset} len={len}: {err}");
             }
         }
 

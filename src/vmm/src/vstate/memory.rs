@@ -204,8 +204,11 @@ impl<'a> GuestMemorySlot<'a> {
         // Advance the cursor even if the trailing pages are clean, so that the
         // next slot starts writing at the correct offset.
         if skip_size > 0 {
+            let offset = skip_size
+                .try_into()
+                .map_err(|_| MemoryError::SlotSizeTooLarge)?;
             writer
-                .seek(SeekFrom::Current(skip_size.try_into().unwrap()))
+                .seek(SeekFrom::Current(offset))
                 .map_err(MemoryError::SeekError)?;
         }
 
