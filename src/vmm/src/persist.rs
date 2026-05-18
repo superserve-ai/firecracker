@@ -346,6 +346,49 @@ fn read_overlay_sidecar(
     Ok(())
 }
 
+/// Read the overlay side-car at `sidecar_path`, returning the
+/// `(drive_id, OverlayState)` pairs it holds. Returns an empty `Vec` when
+/// the file does not exist; errors on the torn-save sentinel (0 bytes).
+pub fn read_overlay_sidecar_devices(
+    sidecar_path: &Path,
+) -> Result<Vec<(String, crate::devices::virtio::block::virtio::persist::OverlayState)>, io::Error>
+{
+    let bytes = match std::fs::read(sidecar_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("overlay side-car at {sidecar_path:?} is empty (torn snapshot save)"),
+        ));
+    }
+    let sidecar: OverlaySidecar = bitcode::deserialize(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("decode sidecar: {e}")))?;
+    Ok(sidecar.devices)
+}
+
+/// Write the overlay side-car at `sidecar_path`. Truncates and fsyncs.
+/// Same on-disk format as `write_overlay_sidecar`.
+pub fn write_overlay_sidecar_devices(
+    devices: Vec<(String, crate::devices::virtio::block::virtio::persist::OverlayState)>,
+    sidecar_path: &Path,
+) -> Result<(), io::Error> {
+    let sidecar = OverlaySidecar { devices };
+    let bytes = bitcode::serialize(&sidecar)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode sidecar: {e}")))?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(sidecar_path)?;
+    f.write_all(&bytes)?;
+    f.flush()?;
+    f.sync_all()?;
+    Ok(())
+}
+
 /// Validates that snapshot CPU vendor matches the host CPU vendor.
 ///
 /// # Errors

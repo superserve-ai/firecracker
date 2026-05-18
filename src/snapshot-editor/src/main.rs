@@ -6,12 +6,14 @@ use clap::{Parser, Subcommand};
 mod edit_memory;
 #[cfg(target_arch = "aarch64")]
 mod edit_vmstate;
+mod flatten;
 mod info;
 mod utils;
 
 use edit_memory::{EditMemoryError, EditMemorySubCommand, edit_memory_command};
 #[cfg(target_arch = "aarch64")]
 use edit_vmstate::{EditVmStateError, EditVmStateSubCommand, edit_vmstate_command};
+use flatten::{FlattenError, FlattenSubCommand, flatten_command};
 use info::{InfoVmStateError, InfoVmStateSubCommand, info_vmstate_command};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -23,6 +25,8 @@ enum SnapEditorError {
     EditVmState(#[from] EditVmStateError),
     /// Error during getting info from a vmstate file: {0}
     InfoVmState(#[from] InfoVmStateError),
+    /// Error during flatten: {0}
+    Flatten(#[from] FlattenError),
 }
 
 #[derive(Debug, Parser)]
@@ -41,6 +45,8 @@ enum Command {
     EditVmstate(EditVmStateSubCommand),
     #[command(subcommand)]
     InfoVmstate(InfoVmStateSubCommand),
+    #[command(subcommand)]
+    Flatten(FlattenSubCommand),
 }
 
 fn main_exec() -> Result<(), SnapEditorError> {
@@ -51,6 +57,7 @@ fn main_exec() -> Result<(), SnapEditorError> {
         #[cfg(target_arch = "aarch64")]
         Command::EditVmstate(command) => edit_vmstate_command(command)?,
         Command::InfoVmstate(command) => info_vmstate_command(command)?,
+        Command::Flatten(command) => flatten_command(command)?,
     }
 
     Ok(())
