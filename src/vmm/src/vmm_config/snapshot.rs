@@ -50,6 +50,12 @@ pub struct CreateSnapshotParams {
     /// directory, named `{drive_id}.delta`.
     #[serde(default)]
     pub block_delta_dir: Option<PathBuf>,
+    /// If true, bake each overlay's dirty blocks into its base.ext4 in place
+    /// and zero the side-car bitmap. Restores skip apply_delta. Only safe at
+    /// template-creation time — corrupts bases shared with other live VMs.
+    /// Requires `block_delta_dir`.
+    #[serde(default)]
+    pub flatten: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

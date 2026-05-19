@@ -845,6 +845,25 @@ impl VirtioBlock {
             Ok(None)
         }
     }
+
+    /// Bake overlay into base + clear bitmap; returns the cleared bitmap
+    /// (serialized) for side-car update. `Ok(None)` for non-overlay devices.
+    pub fn flatten_into_base(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, block_io::overlay_io::OverlayIoError> {
+        if let FileEngine::Overlay(ref mut engine) = self.disk.file_engine {
+            let base_path = self.disk.base_path.as_ref().ok_or_else(|| {
+                block_io::overlay_io::OverlayIoError::FlattenBaseOpen(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "overlay engine missing base_path",
+                ))
+            })?;
+            engine.apply_overlay_to_base(Path::new(base_path))?;
+            Ok(Some(engine.bitmap().serialize()))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl VirtioDevice for VirtioBlock {
@@ -1156,7 +1175,8 @@ mod tests {
         assert_eq!(cfg_space.max_discard_seg, 1);
         assert_eq!(
             cfg_space.discard_sector_alignment,
-            super::io::dirty_bitmap::DEFAULT_BLOCK_SIZE / SECTOR_SIZE
+            crate::devices::virtio::block::virtio::io::dirty_bitmap::DEFAULT_BLOCK_SIZE
+                / SECTOR_SIZE
         );
 
         // Spot-check the on-wire offset of max_discard_sectors. Per spec it

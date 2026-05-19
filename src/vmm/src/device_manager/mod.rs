@@ -353,6 +353,70 @@ impl DeviceManager {
         }
     }
 
+    /// For each overlay block device: bake its dirty blocks into base.ext4
+    /// and zero the matching `OverlayState.dirty_bitmap` in `microvm_state`
+    /// so the side-car written next is born zero. See
+    /// `OverlayFileEngine::apply_overlay_to_base` for the safety contract.
+    pub fn flatten_overlays_into_base(
+        &self,
+        microvm_state: &mut crate::persist::MicrovmState,
+    ) -> Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError> {
+        use std::collections::HashMap;
+
+        use crate::devices::virtio::block::device::Block;
+        use crate::devices::virtio::block::persist::BlockState;
+
+        let mut cleared_bitmaps: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut first_error: Option<
+            crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
+        > = None;
+
+        let _: Result<(), Infallible> =
+            self.mmio_devices
+                .for_each_virtio_mmio_device(|_, _, device| {
+                    let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+                    let mut locked_device = mmio_transport_locked.locked_device();
+                    if locked_device.device_type() == VirtioDeviceType::Block {
+                        let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
+                        match block.flatten_into_base() {
+                            Ok(Some(cleared)) => {
+                                cleared_bitmaps.insert(block.id().to_string(), cleared);
+                            }
+                            Ok(None) => {} // non-overlay device
+                            Err(e) => {
+                                error!("flatten failed for {}: {:?}", block.id(), e);
+                                if first_error.is_none() {
+                                    first_error = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        // Zero the matching bitmaps in microvm_state; non-overlay devices untouched.
+        for block_state in microvm_state
+            .device_states
+            .mmio_state
+            .block_devices
+            .iter_mut()
+        {
+            if let BlockState::Virtio(ref mut vs) = block_state.device_state {
+                if let Some(ref mut overlay) = vs.overlay_state {
+                    if let Some(cleared) = cleared_bitmaps.get(&vs.id) {
+                        overlay.dirty_bitmap = cleared.clone();
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Mark queue memory dirty for activated VirtIO devices
     pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
         // Go through MMIO VirtIO devices

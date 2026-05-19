@@ -129,6 +129,19 @@ impl Block {
             Self::VhostUser(_) => Ok(None),
         }
     }
+
+    /// Bake the overlay into base.ext4; returns the cleared bitmap for side-car update.
+    pub fn flatten_into_base(
+        &mut self,
+    ) -> Result<
+        Option<Vec<u8>>,
+        crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
+    > {
+        match self {
+            Self::Virtio(b) => b.flatten_into_base(),
+            Self::VhostUser(_) => Ok(None),
+        }
+    }
 }
 
 impl VirtioDevice for Block {

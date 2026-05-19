@@ -157,6 +157,12 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// `flatten: true` requires `block_delta_dir` to be set
+    FlattenRequiresDeltaDir,
+    /// Flatten overlays into base failed: {0}
+    FlattenOverlays(
+        crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
+    ),
 }
 
 /// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
@@ -173,9 +179,20 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
+    let mut microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
+
+    if params.flatten {
+        if params.block_delta_dir.is_none() {
+            return Err(CreateSnapshotError::FlattenRequiresDeltaDir);
+        }
+        // Side-car is born zero (mutates microvm_state before serialization);
+        // empty-form deltas fall out of the existing write_block_deltas call.
+        vmm.device_manager
+            .flatten_overlays_into_base(&mut microvm_state)
+            .map_err(CreateSnapshotError::FlattenOverlays)?;
+    }
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 

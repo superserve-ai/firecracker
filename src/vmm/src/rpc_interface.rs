@@ -1174,6 +1174,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
+                flatten: false,
             },
         )));
         #[cfg(target_arch = "x86_64")]
