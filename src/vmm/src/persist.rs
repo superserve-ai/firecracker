@@ -157,6 +157,9 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    // Both restore branches (with/without delta_dir) would be correct after
+    // flatten. This check exists for on-disk layout consistency: sandboxes
+    // always pass delta_dir and expect to find an (empty-form) delta file.
     /// `flatten: true` requires `block_delta_dir` to be set
     FlattenRequiresDeltaDir,
     /// Flatten overlays into base failed: {0}

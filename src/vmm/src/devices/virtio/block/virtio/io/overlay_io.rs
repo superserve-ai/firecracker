@@ -174,6 +174,10 @@ impl OverlayFileEngine {
     /// page-cache-warm transfer, so integrity depends on the overlay being
     /// trustworthy at call time (which it is in the build-then-snapshot
     /// flow, where the overlay was just written by this engine).
+    ///
+    /// CALLER MUST ensure the owning VM is paused — concurrent guest I/O
+    /// against the overlay during this call can produce inconsistent base
+    /// content. `create_snapshot` already gates this on PatchVM(paused).
     pub fn apply_overlay_to_base(
         &mut self,
         base_path: &std::path::Path,
@@ -840,6 +844,40 @@ mod tests {
             baked[3 * BLOCK..4 * BLOCK].iter().all(|&b| b == 0x33),
             "block 3 baked"
         );
+    }
+
+    #[test]
+    fn test_apply_overlay_to_base_idempotent() {
+        const BLOCK: usize = DEFAULT_BLOCK_SIZE as usize;
+        const N_BLOCKS: usize = 4;
+        const SIZE: usize = BLOCK * N_BLOCKS;
+
+        let base_tmp = TempFile::new().unwrap();
+        std::fs::write(base_tmp.as_path(), vec![0xAA_u8; SIZE]).unwrap();
+        let overlay_tmp = TempFile::new().unwrap();
+        std::fs::write(overlay_tmp.as_path(), vec![0u8; SIZE]).unwrap();
+
+        let base = File::open(base_tmp.as_path()).unwrap();
+        let overlay = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(overlay_tmp.as_path())
+            .unwrap();
+        // Fresh engine with empty bitmap (no dirty blocks).
+        let mut engine = OverlayFileEngine::from_files(
+            base,
+            overlay,
+            SIZE as u64,
+            DEFAULT_BLOCK_SIZE,
+            None,
+        )
+        .unwrap();
+
+        // First call: empty bitmap, no writes.
+        engine.apply_overlay_to_base(base_tmp.as_path()).unwrap();
+        // Second call on the now-flat engine: still a no-op, must succeed.
+        engine.apply_overlay_to_base(base_tmp.as_path()).unwrap();
+        assert_eq!(engine.bitmap().dirty_count(), 0);
     }
 
     #[test]
