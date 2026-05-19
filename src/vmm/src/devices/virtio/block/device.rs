@@ -140,10 +140,10 @@ impl Block {
         }
     }
 
-    /// Path to base.ext4 if this is an overlay device. Used by flatten pre-flight.
-    pub fn overlay_base_path(&self) -> Option<&str> {
+    /// (base path, expected size) if this is an overlay device.
+    pub fn overlay_base_info(&self) -> Option<(&str, u64)> {
         match self {
-            Self::Virtio(b) => b.overlay_base_path(),
+            Self::Virtio(b) => b.overlay_base_info(),
             Self::VhostUser(_) => None,
         }
     }

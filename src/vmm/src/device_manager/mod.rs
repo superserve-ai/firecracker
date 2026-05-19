@@ -378,18 +378,39 @@ impl DeviceManager {
                     let locked_device = mmio_transport_locked.locked_device();
                     if locked_device.device_type() == VirtioDeviceType::Block {
                         let block = locked_device.as_any().downcast_ref::<Block>().unwrap();
-                        if let Some(base_path) = block.overlay_base_path() {
-                            if let Err(e) = OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .open(base_path)
-                            {
-                                error!(
-                                    "flatten pre-flight: cannot open base for {}: {}",
-                                    block.id(),
-                                    e
-                                );
-                                preflight_errors.push(OverlayIoError::FlattenBaseOpen(e));
+                        if let Some((base_path, expected)) = block.overlay_base_info() {
+                            match OpenOptions::new().read(true).write(true).open(base_path) {
+                                Err(e) => {
+                                    error!(
+                                        "flatten pre-flight: cannot open base for {}: {}",
+                                        block.id(),
+                                        e
+                                    );
+                                    preflight_errors.push(OverlayIoError::FlattenBaseOpen(e));
+                                }
+                                Ok(f) => match f.metadata() {
+                                    Err(e) => {
+                                        error!(
+                                            "flatten pre-flight: stat base for {}: {}",
+                                            block.id(),
+                                            e
+                                        );
+                                        preflight_errors.push(OverlayIoError::FlattenBaseOpen(e));
+                                    }
+                                    Ok(meta) if meta.len() != expected => {
+                                        error!(
+                                            "flatten pre-flight: base size mismatch for {}: expected {}, actual {}",
+                                            block.id(), expected, meta.len()
+                                        );
+                                        preflight_errors.push(
+                                            OverlayIoError::FlattenBaseSizeMismatch {
+                                                expected,
+                                                actual: meta.len(),
+                                            },
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                },
                             }
                         }
                     }

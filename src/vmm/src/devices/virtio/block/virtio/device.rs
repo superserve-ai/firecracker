@@ -861,10 +861,13 @@ impl VirtioBlock {
         Ok(())
     }
 
-    /// Path to base.ext4 if this device uses an overlay engine.
-    pub fn overlay_base_path(&self) -> Option<&str> {
-        if matches!(self.disk.file_engine, FileEngine::Overlay(_)) {
-            self.disk.base_path.as_deref()
+    /// Path to base.ext4 and its expected size (block_size * total_blocks)
+    /// if this device uses an overlay engine. Used by flatten pre-flight.
+    pub fn overlay_base_info(&self) -> Option<(&str, u64)> {
+        if let FileEngine::Overlay(ref engine) = self.disk.file_engine {
+            let path = self.disk.base_path.as_deref()?;
+            let expected = u64::from(engine.bitmap().block_size()) * engine.bitmap().total_blocks();
+            Some((path, expected))
         } else {
             None
         }
