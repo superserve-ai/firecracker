@@ -147,6 +147,17 @@ impl Block {
             Self::VhostUser(_) => None,
         }
     }
+
+    /// Test fixture: mutable access to overlay engine. Gated by `test-fixtures`.
+    #[cfg(feature = "test-fixtures")]
+    pub fn overlay_engine_mut_for_test(
+        &mut self,
+    ) -> Option<&mut crate::devices::virtio::block::virtio::io::overlay_io::OverlayFileEngine> {
+        match self {
+            Self::Virtio(b) => b.overlay_engine_mut_for_test(),
+            Self::VhostUser(_) => None,
+        }
+    }
 }
 
 impl VirtioDevice for Block {

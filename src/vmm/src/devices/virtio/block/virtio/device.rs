@@ -861,6 +861,19 @@ impl VirtioBlock {
         Ok(())
     }
 
+    /// Test fixture: mutable access to this device's overlay engine.
+    /// Gated by `test-fixtures` so production builds never see it.
+    #[cfg(feature = "test-fixtures")]
+    pub fn overlay_engine_mut_for_test(
+        &mut self,
+    ) -> Option<&mut block_io::overlay_io::OverlayFileEngine> {
+        if let FileEngine::Overlay(ref mut engine) = self.disk.file_engine {
+            Some(engine)
+        } else {
+            None
+        }
+    }
+
     /// Path to base.ext4 and its expected size (block_size * total_blocks)
     /// if this device uses an overlay engine. Used by flatten pre-flight.
     pub fn overlay_base_info(&self) -> Option<(&str, u64)> {

@@ -101,6 +101,29 @@ impl OverlayFileEngine {
         &self.bitmap
     }
 
+    /// Test fixture: write `content` to the overlay at `block_idx` and mark
+    /// the block dirty. Gated by `test-fixtures`.
+    #[cfg(feature = "test-fixtures")]
+    pub fn force_dirty_block(
+        &mut self,
+        block_idx: u64,
+        content: &[u8],
+    ) -> Result<(), OverlayIoError> {
+        use std::os::unix::fs::FileExt;
+        let block_size = self.bitmap.block_size();
+        assert_eq!(
+            content.len(),
+            block_size as usize,
+            "force_dirty_block: content length must equal block_size"
+        );
+        let offset = block_idx * u64::from(block_size);
+        self.overlay
+            .write_all_at(content, offset)
+            .map_err(OverlayIoError::OverlayHostWrite)?;
+        self.bitmap.set(offset, block_size);
+        Ok(())
+    }
+
     /// Get a reference to the overlay file.
     #[cfg(test)]
     pub fn overlay_file(&self) -> &File {
@@ -182,6 +205,9 @@ impl OverlayFileEngine {
         &mut self,
         base_path: &std::path::Path,
     ) -> Result<(), OverlayIoError> {
+        // Second FD onto the same base file (engine already holds an RO one).
+        // Both share the page cache and the VM is paused, so writes through
+        // this FD become visible via the RO FD after `sync_all` below.
         let mut base = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -200,19 +226,17 @@ impl OverlayFileEngine {
                 actual: actual_size,
             });
         }
+        // Positional I/O (pread/pwrite): no seek syscall per block, halves
+        // the syscall count for large flattens and makes the intent obvious.
+        use std::os::unix::fs::FileExt;
         let mut buf = vec![0u8; block_size as usize];
 
         for block_idx in self.bitmap.iter_dirty() {
             let offset = block_idx * u64::from(block_size);
             self.overlay
-                .seek(SeekFrom::Start(offset))
-                .map_err(OverlayIoError::OverlaySeek)?;
-            self.overlay
-                .read_exact(&mut buf)
+                .read_exact_at(&mut buf, offset)
                 .map_err(OverlayIoError::FlattenOverlayRead)?;
-            base.seek(SeekFrom::Start(offset))
-                .map_err(OverlayIoError::BaseSeek)?;
-            base.write_all(&buf)
+            base.write_all_at(&buf, offset)
                 .map_err(OverlayIoError::FlattenBaseWrite)?;
         }
 

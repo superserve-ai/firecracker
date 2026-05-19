@@ -342,6 +342,19 @@ impl Vmm {
         self.instance_info.clone()
     }
 
+    /// Test fixture: forwards to `DeviceManager::force_dirty_block_for_test`.
+    /// Gated by `test-fixtures`.
+    #[cfg(feature = "test-fixtures")]
+    pub fn force_dirty_block_for_test(
+        &self,
+        drive_id: &str,
+        block_idx: u64,
+        content: &[u8],
+    ) -> Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError> {
+        self.device_manager
+            .force_dirty_block_for_test(drive_id, block_idx, content)
+    }
+
     /// Gets MMDS reference, if any.
     pub fn get_mmds(&self) -> Option<Arc<Mutex<Mmds>>> {
         let mut mmds = None;

@@ -12,6 +12,9 @@ bench = false
 default = []
 tracing = ["log-instrument"]
 gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
+# Exposes test-only mutators (`force_dirty_block` etc.) for integration
+# tests that need pre-flatten overlay state. NOT for production builds.
+test-fixtures = []
 
 [dependencies]
 

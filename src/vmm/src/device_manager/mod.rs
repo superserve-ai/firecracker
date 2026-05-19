@@ -369,15 +369,20 @@ impl DeviceManager {
         use crate::devices::virtio::block::device::Block;
         use crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError;
 
-        // Pre-flight: open every base RW (drop the handle). Logs all errors, returns first.
-        let mut preflight_errors: Vec<OverlayIoError> = Vec::new();
+        // Pre-flight: open every base RW (drop the handle). Caller guarantees
+        // the VM is paused, so files are stable between this pass and the
+        // mutation below. Logs all errors; returns the first.
+        let mut preflight_err: Option<OverlayIoError> = None;
         let _: Result<(), Infallible> =
             self.mmio_devices
                 .for_each_virtio_mmio_device(|_, _, device| {
                     let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
                     let locked_device = mmio_transport_locked.locked_device();
                     if locked_device.device_type() == VirtioDeviceType::Block {
-                        let block = locked_device.as_any().downcast_ref::<Block>().unwrap();
+                        let block = locked_device
+                            .as_any()
+                            .downcast_ref::<Block>()
+                            .expect("Block device_type guard mismatch");
                         if let Some((base_path, expected)) = block.overlay_base_info() {
                             match OpenOptions::new().read(true).write(true).open(base_path) {
                                 Err(e) => {
@@ -386,7 +391,7 @@ impl DeviceManager {
                                         block.id(),
                                         e
                                     );
-                                    preflight_errors.push(OverlayIoError::FlattenBaseOpen(e));
+                                    preflight_err.get_or_insert(OverlayIoError::FlattenBaseOpen(e));
                                 }
                                 Ok(f) => match f.metadata() {
                                     Err(e) => {
@@ -395,14 +400,15 @@ impl DeviceManager {
                                             block.id(),
                                             e
                                         );
-                                        preflight_errors.push(OverlayIoError::FlattenBaseOpen(e));
+                                        preflight_err
+                                            .get_or_insert(OverlayIoError::FlattenBaseOpen(e));
                                     }
                                     Ok(meta) if meta.len() != expected => {
                                         error!(
                                             "flatten pre-flight: base size mismatch for {}: expected {}, actual {}",
                                             block.id(), expected, meta.len()
                                         );
-                                        preflight_errors.push(
+                                        preflight_err.get_or_insert(
                                             OverlayIoError::FlattenBaseSizeMismatch {
                                                 expected,
                                                 actual: meta.len(),
@@ -416,30 +422,72 @@ impl DeviceManager {
                     }
                     Ok(())
                 });
-        if let Some(first) = preflight_errors.into_iter().next() {
-            return Err(first);
+        if let Some(err) = preflight_err {
+            return Err(err);
         }
 
         // Mutation pass; see docstring for the partial-failure contract.
-        let mut errors: Vec<OverlayIoError> = Vec::new();
+        let mut mutation_err: Option<OverlayIoError> = None;
         let _: Result<(), Infallible> =
             self.mmio_devices
                 .for_each_virtio_mmio_device(|_, _, device| {
                     let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
                     let mut locked_device = mmio_transport_locked.locked_device();
                     if locked_device.device_type() == VirtioDeviceType::Block {
-                        let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
+                        let block = locked_device
+                            .as_mut_any()
+                            .downcast_mut::<Block>()
+                            .expect("Block device_type guard mismatch");
                         if let Err(e) = block.flatten_into_base() {
                             error!("flatten failed for {}: {:?}", block.id(), e);
-                            errors.push(e);
+                            mutation_err.get_or_insert(e);
                         }
                     }
                     Ok(())
                 });
-        if let Some(first) = errors.into_iter().next() {
-            return Err(first);
+        if let Some(err) = mutation_err {
+            return Err(err);
         }
         Ok(())
+    }
+
+    /// Test fixture: inject `content` into the overlay block device with
+    /// id `drive_id` at `block_idx`, marking the bitmap dirty. Panics if
+    /// no overlay device matches. Gated by `test-fixtures`.
+    #[cfg(feature = "test-fixtures")]
+    pub fn force_dirty_block_for_test(
+        &self,
+        drive_id: &str,
+        block_idx: u64,
+        content: &[u8],
+    ) -> Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError> {
+        use crate::devices::virtio::block::device::Block;
+
+        let mut result: Option<
+            Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError>,
+        > = None;
+        let _: Result<(), Infallible> =
+            self.mmio_devices
+                .for_each_virtio_mmio_device(|_, _, device| {
+                    if result.is_some() {
+                        return Ok(());
+                    }
+                    let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+                    let mut locked_device = mmio_transport_locked.locked_device();
+                    if locked_device.device_type() == VirtioDeviceType::Block {
+                        let block = locked_device
+                            .as_mut_any()
+                            .downcast_mut::<Block>()
+                            .expect("Block device_type guard mismatch");
+                        if block.id() == drive_id {
+                            if let Some(engine) = block.overlay_engine_mut_for_test() {
+                                result = Some(engine.force_dirty_block(block_idx, content));
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+        result.unwrap_or_else(|| panic!("no overlay block device with id {drive_id}"))
     }
 
     /// Mark queue memory dirty for activated VirtIO devices
