@@ -130,16 +130,21 @@ impl Block {
         }
     }
 
-    /// Bake the overlay into base.ext4; returns the cleared bitmap for side-car update.
+    /// Bake the overlay into base.ext4 + clear engine bitmap. No-op for non-overlay devices.
     pub fn flatten_into_base(
         &mut self,
-    ) -> Result<
-        Option<Vec<u8>>,
-        crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
-    > {
+    ) -> Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError> {
         match self {
             Self::Virtio(b) => b.flatten_into_base(),
-            Self::VhostUser(_) => Ok(None),
+            Self::VhostUser(_) => Ok(()),
+        }
+    }
+
+    /// Path to base.ext4 if this is an overlay device. Used by flatten pre-flight.
+    pub fn overlay_base_path(&self) -> Option<&str> {
+        match self {
+            Self::Virtio(b) => b.overlay_base_path(),
+            Self::VhostUser(_) => None,
         }
     }
 }

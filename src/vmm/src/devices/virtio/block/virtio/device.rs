@@ -846,11 +846,9 @@ impl VirtioBlock {
         }
     }
 
-    /// Bake overlay into base + clear bitmap; returns the cleared bitmap
-    /// (serialized) for side-car update. `Ok(None)` for non-overlay devices.
-    pub fn flatten_into_base(
-        &mut self,
-    ) -> Result<Option<Vec<u8>>, block_io::overlay_io::OverlayIoError> {
+    /// Bake overlay's dirty blocks into base.ext4 + clear the engine bitmap.
+    /// No-op for non-overlay devices.
+    pub fn flatten_into_base(&mut self) -> Result<(), block_io::overlay_io::OverlayIoError> {
         if let FileEngine::Overlay(ref mut engine) = self.disk.file_engine {
             let base_path = self.disk.base_path.as_ref().ok_or_else(|| {
                 block_io::overlay_io::OverlayIoError::FlattenBaseOpen(std::io::Error::new(
@@ -859,9 +857,16 @@ impl VirtioBlock {
                 ))
             })?;
             engine.apply_overlay_to_base(Path::new(base_path))?;
-            Ok(Some(engine.bitmap().serialize()))
+        }
+        Ok(())
+    }
+
+    /// Path to base.ext4 if this device uses an overlay engine.
+    pub fn overlay_base_path(&self) -> Option<&str> {
+        if matches!(self.disk.file_engine, FileEngine::Overlay(_)) {
+            self.disk.base_path.as_deref()
         } else {
-            Ok(None)
+            None
         }
     }
 }

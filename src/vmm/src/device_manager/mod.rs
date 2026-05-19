@@ -353,24 +353,54 @@ impl DeviceManager {
         }
     }
 
-    /// For each overlay block device: bake its dirty blocks into base.ext4
-    /// and zero the matching `OverlayState.dirty_bitmap` in `microvm_state`
-    /// so the side-car written next is born zero. See
-    /// `OverlayFileEngine::apply_overlay_to_base` for the safety contract.
+    /// Bake every overlay device's dirty blocks into base.ext4 + clear the
+    /// engine bitmap. Must be called before `save_state` so the captured
+    /// `MicrovmState` reflects post-flatten state.
+    ///
+    /// Pre-flight opens every base RW to surface path/permission errors
+    /// before mutation. On multi-disk partial failure, already-flattened
+    /// disks stay flattened (live reads remain correct because engine
+    /// bitmap matches base content); retry is idempotent.
     pub fn flatten_overlays_into_base(
         &self,
-        microvm_state: &mut crate::persist::MicrovmState,
     ) -> Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError> {
-        use std::collections::HashMap;
+        use std::fs::OpenOptions;
 
         use crate::devices::virtio::block::device::Block;
-        use crate::devices::virtio::block::persist::BlockState;
+        use crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError;
 
-        let mut cleared_bitmaps: HashMap<String, Vec<u8>> = HashMap::new();
-        let mut first_error: Option<
-            crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
-        > = None;
+        // Pre-flight: open every base RW (drop the handle). Logs all errors, returns first.
+        let mut preflight_errors: Vec<OverlayIoError> = Vec::new();
+        let _: Result<(), Infallible> =
+            self.mmio_devices
+                .for_each_virtio_mmio_device(|_, _, device| {
+                    let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+                    let locked_device = mmio_transport_locked.locked_device();
+                    if locked_device.device_type() == VirtioDeviceType::Block {
+                        let block = locked_device.as_any().downcast_ref::<Block>().unwrap();
+                        if let Some(base_path) = block.overlay_base_path() {
+                            if let Err(e) = OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .open(base_path)
+                            {
+                                error!(
+                                    "flatten pre-flight: cannot open base for {}: {}",
+                                    block.id(),
+                                    e
+                                );
+                                preflight_errors.push(OverlayIoError::FlattenBaseOpen(e));
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+        if let Some(first) = preflight_errors.into_iter().next() {
+            return Err(first);
+        }
 
+        // Mutation pass; see docstring for the partial-failure contract.
+        let mut errors: Vec<OverlayIoError> = Vec::new();
         let _: Result<(), Infallible> =
             self.mmio_devices
                 .for_each_virtio_mmio_device(|_, _, device| {
@@ -378,42 +408,16 @@ impl DeviceManager {
                     let mut locked_device = mmio_transport_locked.locked_device();
                     if locked_device.device_type() == VirtioDeviceType::Block {
                         let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
-                        match block.flatten_into_base() {
-                            Ok(Some(cleared)) => {
-                                cleared_bitmaps.insert(block.id().to_string(), cleared);
-                            }
-                            Ok(None) => {} // non-overlay device
-                            Err(e) => {
-                                error!("flatten failed for {}: {:?}", block.id(), e);
-                                if first_error.is_none() {
-                                    first_error = Some(e);
-                                }
-                            }
+                        if let Err(e) = block.flatten_into_base() {
+                            error!("flatten failed for {}: {:?}", block.id(), e);
+                            errors.push(e);
                         }
                     }
                     Ok(())
                 });
-
-        if let Some(e) = first_error {
-            return Err(e);
+        if let Some(first) = errors.into_iter().next() {
+            return Err(first);
         }
-
-        // Zero the matching bitmaps in microvm_state; non-overlay devices untouched.
-        for block_state in microvm_state
-            .device_states
-            .mmio_state
-            .block_devices
-            .iter_mut()
-        {
-            if let BlockState::Virtio(ref mut vs) = block_state.device_state {
-                if let Some(ref mut overlay) = vs.overlay_state {
-                    if let Some(cleared) = cleared_bitmaps.get(&vs.id) {
-                        overlay.dirty_bitmap = cleared.clone();
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 

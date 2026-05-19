@@ -179,20 +179,21 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let mut microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
+    if params.flatten && params.block_delta_dir.is_none() {
+        return Err(CreateSnapshotError::FlattenRequiresDeltaDir);
+    }
 
+    // Flatten before save_state so the captured microvm_state reflects
+    // post-flatten engine state — no separate side-car mutation needed.
     if params.flatten {
-        if params.block_delta_dir.is_none() {
-            return Err(CreateSnapshotError::FlattenRequiresDeltaDir);
-        }
-        // Side-car is born zero (mutates microvm_state before serialization);
-        // empty-form deltas fall out of the existing write_block_deltas call.
         vmm.device_manager
-            .flatten_overlays_into_base(&mut microvm_state)
+            .flatten_overlays_into_base()
             .map_err(CreateSnapshotError::FlattenOverlays)?;
     }
+
+    let microvm_state = vmm
+        .save_state(vm_info)
+        .map_err(CreateSnapshotError::MicrovmState)?;
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
