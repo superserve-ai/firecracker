@@ -169,6 +169,11 @@ impl OverlayFileEngine {
     /// concurrently reading it. Used by `CreateSnapshot { flatten: true }`.
     /// Errors loud if base size doesn't match `block_size * total_blocks`
     /// rather than silently extending/truncating the disk image.
+    ///
+    /// No CRC validation on the overlay→base copy: it's a same-process,
+    /// page-cache-warm transfer, so integrity depends on the overlay being
+    /// trustworthy at call time (which it is in the build-then-snapshot
+    /// flow, where the overlay was just written by this engine).
     pub fn apply_overlay_to_base(
         &mut self,
         base_path: &std::path::Path,
