@@ -402,12 +402,11 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         .handle_request(VmmAction::CreateSnapshot(params))
         .expect("flatten snapshot must succeed");
 
-    // Empty-form delta on disk: 32-byte header, dirty_count at offset 24.
-    let delta_path = format!("{delta_dir}/data.delta");
-    let header = std::fs::read(&delta_path).expect("delta written");
-    assert!(header.len() >= 32, "delta header truncated");
-    let dirty_count = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    assert_eq!(dirty_count, 0, "delta dirty_count must be 0 after flatten");
+    assert_eq!(
+        delta_dirty_count(format!("{delta_dir}/data.delta")),
+        0,
+        "delta dirty_count must be 0 after flatten"
+    );
 
     // Side-car must exist (non-zero — torn-save sentinel is empty file).
     let sidecar_path = format!("{}.overlay", snapshot_file.as_path().to_str().unwrap());
@@ -479,6 +478,9 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
 
     let vmm = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
 
+    // 200ms cushion — without it Pause can race boot on slow runners.
+    thread::sleep(Duration::from_millis(200));
+
     // Pause BEFORE injecting dirty bits — mutating engine state while the
     // guest can read it would create a transient filesystem inconsistency
     // visible to the guest. After pause, no concurrent device I/O.
@@ -517,10 +519,11 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
         "flatten corrupted clean block 0"
     );
 
-    // Empty-form delta: dirty_count at header offset 24 must be 0.
-    let delta_bytes = std::fs::read(format!("{delta_dir}/data.delta")).unwrap();
-    let dirty_count = u64::from_le_bytes(delta_bytes[24..32].try_into().unwrap());
-    assert_eq!(dirty_count, 0, "delta dirty_count must be 0 after flatten");
+    assert_eq!(
+        delta_dirty_count(format!("{delta_dir}/data.delta")),
+        0,
+        "delta dirty_count must be 0 after flatten"
+    );
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 
@@ -550,6 +553,17 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
     let restored_vmm = preboot.built_vmm.take().unwrap();
     assert_eq!(restored_vmm.lock().unwrap().instance_info.state, VmState::Running);
     restored_vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+// dirty_count is the 4th u64 in the delta header — see
+// src/vmm/src/devices/virtio/block/virtio/io/delta.rs for the full layout.
+const DELTA_HEADER_DIRTY_COUNT_OFFSET: usize = 24;
+
+fn delta_dirty_count(path: impl AsRef<std::path::Path>) -> u64 {
+    let bytes = std::fs::read(&path).expect("delta file");
+    assert!(bytes.len() >= 32, "delta header truncated");
+    let end = DELTA_HEADER_DIRTY_COUNT_OFFSET + 8;
+    u64::from_le_bytes(bytes[DELTA_HEADER_DIRTY_COUNT_OFFSET..end].try_into().unwrap())
 }
 
 // Helper: drive a CreateSnapshot with flatten=true through the controller
@@ -740,8 +754,7 @@ fn test_flatten_skips_non_overlay_device() {
         "non-overlay drive should not emit a delta file"
     );
     // Overlay drive's delta should exist + be empty-form.
-    let delta = std::fs::read(format!("{delta_dir}/overlay_drive.delta")).unwrap();
-    assert_eq!(u64::from_le_bytes(delta[24..32].try_into().unwrap()), 0);
+    assert_eq!(delta_dirty_count(format!("{delta_dir}/overlay_drive.delta")), 0);
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
