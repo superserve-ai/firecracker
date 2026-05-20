@@ -146,6 +146,8 @@ mod tests {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
+            block_delta_dir: None,
+            flatten: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -160,6 +162,8 @@ mod tests {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
+            block_delta_dir: None,
+            flatten: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -188,6 +192,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: false,
             network_overrides: vec![],
+            block_delta_dir: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -218,6 +223,7 @@ mod tests {
             track_dirty_pages: true,
             resume_vm: false,
             network_overrides: vec![],
+            block_delta_dir: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -248,6 +254,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            block_delta_dir: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -287,6 +294,7 @@ mod tests {
                 iface_id: String::from("eth0"),
                 host_dev_name: String::from("vmtap2"),
             }],
+            block_delta_dir: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -314,6 +322,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            block_delta_dir: None,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(

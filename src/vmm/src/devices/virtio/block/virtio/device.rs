@@ -845,6 +845,46 @@ impl VirtioBlock {
             Ok(None)
         }
     }
+
+    /// Bake overlay's dirty blocks into base.ext4 + clear the engine bitmap.
+    /// No-op for non-overlay devices.
+    pub fn flatten_into_base(&mut self) -> Result<(), block_io::overlay_io::OverlayIoError> {
+        if let FileEngine::Overlay(ref mut engine) = self.disk.file_engine {
+            let base_path = self.disk.base_path.as_ref().ok_or_else(|| {
+                block_io::overlay_io::OverlayIoError::FlattenBaseOpen(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "overlay engine missing base_path",
+                ))
+            })?;
+            engine.apply_overlay_to_base(Path::new(base_path))?;
+        }
+        Ok(())
+    }
+
+    /// Test fixture: mutable access to this device's overlay engine.
+    /// Gated by `test-fixtures` so production builds never see it.
+    #[cfg(feature = "test-fixtures")]
+    pub fn overlay_engine_mut_for_test(
+        &mut self,
+    ) -> Option<&mut block_io::overlay_io::OverlayFileEngine> {
+        if let FileEngine::Overlay(ref mut engine) = self.disk.file_engine {
+            Some(engine)
+        } else {
+            None
+        }
+    }
+
+    /// Path to base.ext4 and its expected size (block_size * total_blocks)
+    /// if this device uses an overlay engine. Used by flatten pre-flight.
+    pub fn overlay_base_info(&self) -> Option<(&str, u64)> {
+        if let FileEngine::Overlay(ref engine) = self.disk.file_engine {
+            let path = self.disk.base_path.as_deref()?;
+            let expected = u64::from(engine.bitmap().block_size()) * engine.bitmap().total_blocks();
+            Some((path, expected))
+        } else {
+            None
+        }
+    }
 }
 
 impl VirtioDevice for VirtioBlock {
@@ -1156,7 +1196,8 @@ mod tests {
         assert_eq!(cfg_space.max_discard_seg, 1);
         assert_eq!(
             cfg_space.discard_sector_alignment,
-            super::io::dirty_bitmap::DEFAULT_BLOCK_SIZE / SECTOR_SIZE
+            crate::devices::virtio::block::virtio::io::dirty_bitmap::DEFAULT_BLOCK_SIZE
+                / SECTOR_SIZE
         );
 
         // Spot-check the on-wire offset of max_discard_sectors. Per spec it

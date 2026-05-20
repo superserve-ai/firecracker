@@ -129,6 +129,35 @@ impl Block {
             Self::VhostUser(_) => Ok(None),
         }
     }
+
+    /// Bake the overlay into base.ext4 + clear engine bitmap. No-op for non-overlay devices.
+    pub fn flatten_into_base(
+        &mut self,
+    ) -> Result<(), crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError> {
+        match self {
+            Self::Virtio(b) => b.flatten_into_base(),
+            Self::VhostUser(_) => Ok(()),
+        }
+    }
+
+    /// (base path, expected size) if this is an overlay device.
+    pub fn overlay_base_info(&self) -> Option<(&str, u64)> {
+        match self {
+            Self::Virtio(b) => b.overlay_base_info(),
+            Self::VhostUser(_) => None,
+        }
+    }
+
+    /// Test fixture: mutable access to overlay engine. Gated by `test-fixtures`.
+    #[cfg(feature = "test-fixtures")]
+    pub fn overlay_engine_mut_for_test(
+        &mut self,
+    ) -> Option<&mut crate::devices::virtio::block::virtio::io::overlay_io::OverlayFileEngine> {
+        match self {
+            Self::Virtio(b) => b.overlay_engine_mut_for_test(),
+            Self::VhostUser(_) => None,
+        }
+    }
 }
 
 impl VirtioDevice for Block {

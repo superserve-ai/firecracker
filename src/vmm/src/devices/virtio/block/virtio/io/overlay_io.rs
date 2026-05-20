@@ -42,6 +42,16 @@ pub enum OverlayIoError {
     NotConstructibleFromFile,
     /// Bitmap error: {0}
     Bitmap(DirtyBitmapError),
+    /// Flatten: open base read-write: {0}
+    FlattenBaseOpen(std::io::Error),
+    /// Flatten: read dirty block from overlay: {0}
+    FlattenOverlayRead(std::io::Error),
+    /// Flatten: write dirty block to base: {0}
+    FlattenBaseWrite(std::io::Error),
+    /// Flatten: sync base after writes: {0}
+    FlattenBaseSync(std::io::Error),
+    /// Flatten: base size mismatch: expected {expected}, actual {actual}
+    FlattenBaseSizeMismatch { expected: u64, actual: u64 },
 }
 
 #[derive(Debug)]
@@ -89,6 +99,29 @@ impl OverlayFileEngine {
     /// Get a reference to the dirty bitmap.
     pub fn bitmap(&self) -> &DirtyBitmap {
         &self.bitmap
+    }
+
+    /// Test fixture: write `content` to the overlay at `block_idx` and mark
+    /// the block dirty. Gated by `test-fixtures`.
+    #[cfg(feature = "test-fixtures")]
+    pub fn force_dirty_block(
+        &mut self,
+        block_idx: u64,
+        content: &[u8],
+    ) -> Result<(), OverlayIoError> {
+        use std::os::unix::fs::FileExt;
+        let block_size = self.bitmap.block_size();
+        assert_eq!(
+            content.len(),
+            block_size as usize,
+            "force_dirty_block: content length must equal block_size"
+        );
+        let offset = block_idx * u64::from(block_size);
+        self.overlay
+            .write_all_at(content, offset)
+            .map_err(OverlayIoError::OverlayHostWrite)?;
+        self.bitmap.set(offset, block_size);
+        Ok(())
     }
 
     /// Get a reference to the overlay file.
@@ -152,6 +185,64 @@ impl OverlayFileEngine {
         delta_path: &std::path::Path,
     ) -> Result<delta::DeltaStats, delta::DeltaError> {
         delta::write_delta(&mut self.overlay, &self.bitmap, delta_path)
+    }
+
+    /// Bake every dirty block into `base_path` in place, sync base, clear
+    /// the bitmap. MUTATES base.ext4 — only safe when no other VMM is
+    /// concurrently reading it. Used by `CreateSnapshot { flatten: true }`.
+    /// Errors loud if base size doesn't match `block_size * total_blocks`
+    /// rather than silently extending/truncating the disk image.
+    ///
+    /// No CRC validation on the overlay→base copy: it's a same-process,
+    /// page-cache-warm transfer, so integrity depends on the overlay being
+    /// trustworthy at call time (which it is in the build-then-snapshot
+    /// flow, where the overlay was just written by this engine).
+    ///
+    /// CALLER MUST ensure the owning VM is paused — concurrent guest I/O
+    /// against the overlay during this call can produce inconsistent base
+    /// content. `create_snapshot` already gates this on PatchVM(paused).
+    pub fn apply_overlay_to_base(
+        &mut self,
+        base_path: &std::path::Path,
+    ) -> Result<(), OverlayIoError> {
+        // Second FD onto the same base file (engine already holds an RO one).
+        // Both share the page cache and the VM is paused, so writes through
+        // this FD become visible via the RO FD after `sync_all` below.
+        let mut base = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(base_path)
+            .map_err(OverlayIoError::FlattenBaseOpen)?;
+
+        let block_size = self.bitmap.block_size();
+        let expected_size = u64::from(block_size) * self.bitmap.total_blocks();
+        let actual_size = base
+            .metadata()
+            .map_err(OverlayIoError::FlattenBaseOpen)?
+            .len();
+        if actual_size != expected_size {
+            return Err(OverlayIoError::FlattenBaseSizeMismatch {
+                expected: expected_size,
+                actual: actual_size,
+            });
+        }
+        // Positional I/O (pread/pwrite): no seek syscall per block, halves
+        // the syscall count for large flattens and makes the intent obvious.
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; block_size as usize];
+
+        for block_idx in self.bitmap.iter_dirty() {
+            let offset = block_idx * u64::from(block_size);
+            self.overlay
+                .read_exact_at(&mut buf, offset)
+                .map_err(OverlayIoError::FlattenOverlayRead)?;
+            base.write_all_at(&buf, offset)
+                .map_err(OverlayIoError::FlattenBaseWrite)?;
+        }
+
+        base.sync_all().map_err(OverlayIoError::FlattenBaseSync)?;
+        self.bitmap.clear();
+        Ok(())
     }
 
     /// Read from the appropriate source (base or overlay) based on the dirty bitmap.
@@ -711,5 +802,145 @@ mod tests {
         assert_eq!(&buf[0..4096], &vec![0xAA_u8; 4096][..], "block 0");
         assert_eq!(&buf[4096..8192], &vec![0xEE_u8; 4096][..], "block 1");
         assert_eq!(&buf[8192..12288], &vec![0xCC_u8; 4096][..], "block 2");
+    }
+
+    #[test]
+    fn test_apply_overlay_to_base_bakes_dirty_blocks_and_clears_bitmap() {
+        use std::io::Read;
+
+        const BLOCK: usize = DEFAULT_BLOCK_SIZE as usize;
+        const N_BLOCKS: usize = 4;
+        const SIZE: usize = BLOCK * N_BLOCKS;
+
+        // Base file filled with 0xAA. Keep TempFile alive so path stays valid.
+        let base_tmp = TempFile::new().unwrap();
+        std::fs::write(base_tmp.as_path(), vec![0xAA_u8; SIZE]).unwrap();
+
+        // Overlay file with distinct content at blocks 1 and 3.
+        let overlay_tmp = TempFile::new().unwrap();
+        let mut overlay_bytes = vec![0u8; SIZE];
+        overlay_bytes[BLOCK..2 * BLOCK].fill(0x11);
+        overlay_bytes[3 * BLOCK..4 * BLOCK].fill(0x33);
+        std::fs::write(overlay_tmp.as_path(), &overlay_bytes).unwrap();
+
+        // Bitmap claiming blocks 1 and 3 are dirty (live in overlay).
+        let mut bitmap = DirtyBitmap::new(SIZE as u64, DEFAULT_BLOCK_SIZE).unwrap();
+        bitmap.set(BLOCK as u64, DEFAULT_BLOCK_SIZE);
+        bitmap.set(3 * BLOCK as u64, DEFAULT_BLOCK_SIZE);
+
+        let base = File::open(base_tmp.as_path()).unwrap();
+        let overlay = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(overlay_tmp.as_path())
+            .unwrap();
+        let mut engine = OverlayFileEngine::from_files(
+            base,
+            overlay,
+            SIZE as u64,
+            DEFAULT_BLOCK_SIZE,
+            Some(bitmap),
+        )
+        .unwrap();
+
+        engine.apply_overlay_to_base(base_tmp.as_path()).unwrap();
+
+        // Bitmap fully cleared.
+        assert_eq!(engine.bitmap().dirty_count(), 0);
+
+        // Base on disk now holds the overlay's dirty content at blocks 1, 3
+        // and the original 0xAA elsewhere.
+        let mut baked = vec![0u8; SIZE];
+        File::open(base_tmp.as_path())
+            .unwrap()
+            .read_exact(&mut baked)
+            .unwrap();
+        assert!(baked[..BLOCK].iter().all(|&b| b == 0xAA), "block 0 clean");
+        assert!(
+            baked[BLOCK..2 * BLOCK].iter().all(|&b| b == 0x11),
+            "block 1 baked"
+        );
+        assert!(
+            baked[2 * BLOCK..3 * BLOCK].iter().all(|&b| b == 0xAA),
+            "block 2 clean"
+        );
+        assert!(
+            baked[3 * BLOCK..4 * BLOCK].iter().all(|&b| b == 0x33),
+            "block 3 baked"
+        );
+    }
+
+    #[test]
+    fn test_apply_overlay_to_base_idempotent() {
+        const BLOCK: usize = DEFAULT_BLOCK_SIZE as usize;
+        const N_BLOCKS: usize = 4;
+        const SIZE: usize = BLOCK * N_BLOCKS;
+
+        let base_tmp = TempFile::new().unwrap();
+        std::fs::write(base_tmp.as_path(), vec![0xAA_u8; SIZE]).unwrap();
+        let overlay_tmp = TempFile::new().unwrap();
+        std::fs::write(overlay_tmp.as_path(), vec![0u8; SIZE]).unwrap();
+
+        let base = File::open(base_tmp.as_path()).unwrap();
+        let overlay = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(overlay_tmp.as_path())
+            .unwrap();
+        // Fresh engine with empty bitmap (no dirty blocks).
+        let mut engine = OverlayFileEngine::from_files(
+            base,
+            overlay,
+            SIZE as u64,
+            DEFAULT_BLOCK_SIZE,
+            None,
+        )
+        .unwrap();
+
+        // First call: empty bitmap, no writes.
+        engine.apply_overlay_to_base(base_tmp.as_path()).unwrap();
+        // Second call on the now-flat engine: still a no-op, must succeed.
+        engine.apply_overlay_to_base(base_tmp.as_path()).unwrap();
+        assert_eq!(engine.bitmap().dirty_count(), 0);
+    }
+
+    #[test]
+    fn test_apply_overlay_to_base_rejects_size_mismatch() {
+        const BLOCK: usize = DEFAULT_BLOCK_SIZE as usize;
+        const N_BLOCKS: usize = 4;
+        const SIZE: usize = BLOCK * N_BLOCKS;
+
+        let base_tmp = TempFile::new().unwrap();
+        std::fs::write(base_tmp.as_path(), vec![0u8; SIZE - 1]).unwrap(); // too small by 1 byte
+
+        let overlay_tmp = TempFile::new().unwrap();
+        std::fs::write(overlay_tmp.as_path(), vec![0u8; SIZE]).unwrap();
+
+        let mut bitmap = DirtyBitmap::new(SIZE as u64, DEFAULT_BLOCK_SIZE).unwrap();
+        bitmap.set(BLOCK as u64, DEFAULT_BLOCK_SIZE);
+
+        let base = File::open(base_tmp.as_path()).unwrap();
+        let overlay = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(overlay_tmp.as_path())
+            .unwrap();
+        let mut engine = OverlayFileEngine::from_files(
+            base,
+            overlay,
+            SIZE as u64,
+            DEFAULT_BLOCK_SIZE,
+            Some(bitmap),
+        )
+        .unwrap();
+
+        let result = engine.apply_overlay_to_base(base_tmp.as_path());
+        match result {
+            Err(OverlayIoError::FlattenBaseSizeMismatch { expected, actual }) => {
+                assert_eq!(expected, SIZE as u64);
+                assert_eq!(actual, (SIZE - 1) as u64);
+            }
+            other => panic!("expected FlattenBaseSizeMismatch, got {other:?}"),
+        }
     }
 }
