@@ -786,6 +786,7 @@ fn guest_memory_from_uffd_internal(
             GuestMemoryFromUffdError::Register(r)
         }
         crate::uffd_internal::InternalUffdError::OpenSnapshot(e)
+        | crate::uffd_internal::InternalUffdError::OpenRecorder(e)
         | crate::uffd_internal::InternalUffdError::DupFd(e)
         | crate::uffd_internal::InternalUffdError::SpawnThread(e) => {
             GuestMemoryFromUffdError::InternalHandler(e)

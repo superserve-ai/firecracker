@@ -162,6 +162,8 @@ pub enum InternalUffdError {
     Register(UffdCrateError),
     /// Failed to open or mmap snapshot file: {0}
     OpenSnapshot(std::io::Error),
+    /// Failed to open access-log output file: {0}
+    OpenRecorder(std::io::Error),
     /// Failed to duplicate userfaultfd descriptor: {0}
     DupFd(std::io::Error),
     /// Failed to spawn handler thread: {0}
@@ -221,7 +223,10 @@ pub fn setup(
             .map(|p| load_prefetch_offsets(p, page_size))
             .unwrap_or_default()
     };
-    let recorder = cfg.record_to.as_ref().map(|_| Recorder::default());
+    let recorder = match cfg.record_to.as_deref() {
+        Some(path) => Some(Recorder::create(path).map_err(InternalUffdError::OpenRecorder)?),
+        None => None,
+    };
 
     // Duplicate the fd so the handler thread holds an independent owner. The kernel
     // UFFD registration stays alive until every refcount on the fd is closed.
@@ -236,7 +241,6 @@ pub fn setup(
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let (drain_tx, drain_rx) = mpsc::sync_channel::<mpsc::SyncSender<()>>(0);
-    let record_to = cfg.record_to.clone();
     let stats = Arc::new(Stats::default());
     let stats_for_thread = Arc::clone(&stats);
     let thread = thread::Builder::new()
@@ -249,7 +253,6 @@ pub fn setup(
                 snapshot,
                 prefetch_offsets,
                 recorder,
-                record_to,
                 vmm_filter,
                 stats_for_thread,
                 shutdown_rx,
@@ -326,7 +329,6 @@ fn run(
     snapshot: SnapshotMmap,
     prefetch_offsets: Vec<u64>,
     mut recorder: Option<Recorder>,
-    record_to: Option<PathBuf>,
     vmm_filter: Arc<BpfProgram>,
     stats: Arc<Stats>,
     shutdown_rx: mpsc::Receiver<()>,
@@ -352,6 +354,8 @@ fn run(
         if shutdown_rx.try_recv().is_ok() {
             // Drain anything the kernel has queued, then exit. The VM is paused before
             // snapshot save and before VM destroy, so no new faults arrive after this.
+            // The recorder (when active) writes its trace line-by-line during record(),
+            // so no shutdown-time flush is needed for it.
             drain_to_completion(
                 &uffd,
                 &mappings,
@@ -361,11 +365,6 @@ fn run(
                 recorder.as_mut(),
                 &stats,
             );
-            if let (Some(rec), Some(path)) = (recorder, record_to.as_deref()) {
-                if let Err(e) = rec.flush(path) {
-                    log::error!("uffd-internal: failed to flush access log to {path:?}: {e}");
-                }
-            }
             return;
         }
 
@@ -736,43 +735,40 @@ fn unregister_range(uffd: &Uffd, start: *mut libc::c_void, end: *mut libc::c_voi
     }
 }
 
-/// Records each unique page-fault offset in first-touch order.
+/// Records each unique page-fault offset in first-touch order by appending a line to
+/// the target file as each new offset is observed.
 ///
-/// Flushed on handler shutdown by truncating the target path and writing the trace in
-/// one pass + fsync. There is no atomic temp-then-rename: `rename` is intentionally
-/// absent from the VMM seccomp filter that gates the handler thread.
-///
-/// A torn write (firecracker dies mid-flush) is safe because the consumer is robust to
-/// truncation: [`load_prefetch_offsets`] uses `lines().map_while(Result::ok)`, which
-/// silently drops unparseable trailing bytes. The next restore therefore replays a
-/// shorter — but valid — prefix of the recorded trace, with degraded prefetch coverage
-/// and no incorrect behavior.
-#[derive(Default)]
+/// The file is opened up front and held for the recorder's lifetime; the kernel page
+/// cache absorbs the per-fault writes and the periodic dirty-pages writeback eventually
+/// reaches disk without requiring an explicit flush at shutdown. A SIGKILL'd Firecracker
+/// loses at most the last few unwritten-back entries; [`load_prefetch_offsets`] is
+/// robust to truncation, so the next restore replays a valid prefix with degraded
+/// prefetch coverage and no incorrect behavior.
+#[derive(Debug)]
 struct Recorder {
     seen: HashSet<u64>,
-    order: Vec<u64>,
+    file: std::fs::File,
 }
 
 impl Recorder {
-    /// Returns true when `offset` was newly inserted, false when it was already present.
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            seen: HashSet::new(),
+            file: std::fs::File::create(path)?,
+        })
+    }
+
+    /// Returns true when `offset` was newly inserted (and a line was appended), false
+    /// when it was already present.
     fn record(&mut self, offset: u64) -> bool {
         if self.seen.insert(offset) {
-            self.order.push(offset);
+            // Best-effort write: a failed append degrades prefetch coverage on the
+            // next restore but is not a VM-correctness concern.
+            let _ = writeln!(self.file, "{offset}");
             true
         } else {
             false
         }
-    }
-
-    fn flush(&self, path: &Path) -> std::io::Result<()> {
-        let mut buf = String::with_capacity(self.order.len() * 12);
-        for off in &self.order {
-            use std::fmt::Write as _;
-            writeln!(buf, "{off}").ok();
-        }
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(buf.as_bytes())?;
-        f.sync_all()
     }
 }
 
@@ -828,27 +824,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recorder_dedups_and_preserves_first_touch_order() {
-        let mut r = Recorder::default();
+    fn recorder_writes_one_line_per_unique_offset_in_first_touch_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut r = Recorder::create(&path).unwrap();
         assert!(r.record(4096));
         assert!(r.record(8192));
         assert!(!r.record(4096));
         assert!(r.record(12288));
         assert!(!r.record(8192));
-        assert_eq!(r.order, vec![4096, 8192, 12288]);
+        // Drop the recorder so the writes are visible (the File's buffer is flushed
+        // by Drop and the kernel exposes the writes to subsequent reads).
+        drop(r);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "4096\n8192\n12288\n");
     }
 
     #[test]
-    fn recorder_flush_writes_one_offset_per_line() {
-        let mut r = Recorder::default();
-        r.record(0);
-        r.record(4096);
-        r.record(8192);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("access.log");
-        r.flush(&path).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, "0\n4096\n8192\n");
+    fn recorder_create_fails_on_unwritable_path() {
+        Recorder::create(Path::new("/nonexistent/dir/access.log")).unwrap_err();
     }
 
     #[test]
@@ -889,21 +883,28 @@ mod tests {
             page_size: 4096,
             page_size_kib: 4096,
         }];
-        let mut rec = Recorder::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut rec = Recorder::create(&path).unwrap();
         let stats = Stats::default();
         // Fault at virt 0x1000_1000 → page-aligned to itself → in-region offset 0x1000
         // → file offset 0x2000 + 0x1000 = 0x3000.
         record_fault(Some(&mut rec), &mappings, 4096, 0x1000_1000, &stats);
-        assert_eq!(rec.order, vec![0x3000]);
+        drop(rec);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "12288\n"); // 0x3000
         assert_eq!(stats.recorded_offsets.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn record_fault_drops_addr_outside_any_region() {
-        let mut rec = Recorder::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut rec = Recorder::create(&path).unwrap();
         let stats = Stats::default();
         record_fault(Some(&mut rec), &[], 4096, 0x1000, &stats);
-        assert!(rec.order.is_empty());
+        drop(rec);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         assert_eq!(stats.recorded_offsets.load(Ordering::Relaxed), 0);
     }
 
@@ -917,7 +918,9 @@ mod tests {
             page_size: 4096,
             page_size_kib: 4096,
         }];
-        let mut rec = Recorder::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut rec = Recorder::create(&path).unwrap();
         let stats = Stats::default();
         record_fault(Some(&mut rec), &mappings, 4096, 0x1000_0000, &stats);
         record_fault(Some(&mut rec), &mappings, 4096, 0x1000_0000, &stats);
