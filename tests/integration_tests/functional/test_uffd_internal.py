@@ -75,6 +75,49 @@ def test_restore_with_uffd_internal(uvm_plain, snapshot):
     assert out == "hello-from-uffd-internal"
 
 
+def test_snapshot_after_faults_restores_cleanly(uvm_plain, microvm_factory, snapshot):
+    """End-to-end check that snapshot save observes a consistent memory view.
+
+    Restores into UffdInternal, generates a heavy on-demand fault workload so the
+    handler is actively serving when pause arrives, takes a fresh snapshot, then
+    restores the fresh snapshot into a second VM and verifies it boots. If the
+    snapshot-save drain were broken (events queued at pause time not served
+    before `dump()`), the second snapshot would have zero-filled pages where the
+    in-flight faults should have landed and this second restore would either fail
+    or hang on the first guest operation.
+    """
+    first = uvm_plain
+    first.memory_monitor = None
+    first.spawn()
+    _restore_uffd_internal(first, snapshot)
+
+    # Touch a large slice of guest memory through a path that has not been
+    # exercised since boot; each fresh page becomes a UFFD fault. `dd` on the
+    # kernel image is convenient: it sits in the rootfs, is large enough to
+    # cause many faults, and the read is sequential so faults arrive in bursts.
+    first.ssh.check_output("dd if=/usr/bin/python3 of=/dev/null bs=64K 2>/dev/null || true")
+    first.ssh.check_output("cat /etc/os-release > /dev/null")
+
+    # Snapshot the running VM (snapshot_full pauses internally; the drain runs
+    # between pause and the memory dump).
+    fresh = first.snapshot_full()
+    first.kill()
+
+    second = microvm_factory.build()
+    second.memory_monitor = None
+    second.spawn()
+    _restore_uffd_internal(second, fresh)
+
+    # If any cold-page fault was queued at pause time and not drained before
+    # the memory dump, the new mem.snap is missing data for those pages. Boxing
+    # this VM through a fork/exec exercises the same code paths as the first
+    # run, so a hole in the captured memory would surface as a timeout or a
+    # crash here, not as a silent corruption.
+    second.ssh.check_output("true")
+    out = second.ssh.check_output("echo drain-survived-roundtrip").stdout.strip()
+    assert out == "drain-survived-roundtrip"
+
+
 def test_record_and_replay_roundtrip(uvm_plain, microvm_factory, snapshot):
     """Recording mode captures fault offsets; the resulting log replays as prefetch."""
     record_name = "access.log"
