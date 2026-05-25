@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -27,6 +28,65 @@ use crate::vstate::memory::{self, GuestMemoryState, GuestRegionMmap, MemoryError
 /// Poll timeout between shutdown-channel checks. Bounds how long a handler thread takes
 /// to notice that the VM is going away.
 const POLL_TIMEOUT_MS: i32 = 100;
+
+/// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
+/// observability; not used for synchronization, hence `Ordering::Relaxed` throughout.
+#[derive(Default, Debug)]
+struct Stats {
+    faults_served: AtomicU64,
+    faults_deferred: AtomicU64,
+    faults_failed_transient: AtomicU64,
+    prefetch_served: AtomicU64,
+    prefetch_eexist: AtomicU64,
+    prefetch_eagain: AtomicU64,
+    prefetch_failed: AtomicU64,
+    recorded_offsets: AtomicU64,
+}
+
+/// Snapshot of [`Stats`] returned to external callers. Each field is a monotonic counter
+/// of events since the handler started, except `recorded_offsets`, which is the count of
+/// unique offsets currently held by the in-memory recorder (template-build mode only).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    /// Count of guest page faults the handler resolved by copying a page from the
+    /// snapshot into guest memory.
+    pub faults_served: u64,
+    /// Count of EAGAIN-deferred page-fault attempts. A single faulting address can
+    /// contribute multiple increments if its `UFFDIO_COPY` is deferred more than once.
+    pub faults_deferred: u64,
+    /// Count of page-fault servicing attempts that hit an unexpected ioctl error and
+    /// could not be completed. Each increment is paired with an `error!` log entry.
+    pub faults_failed_transient: u64,
+    /// Count of prefetcher `UFFDIO_COPY` calls that completed successfully.
+    pub prefetch_served: u64,
+    /// Count of prefetcher copies skipped because the page had already been faulted in
+    /// by an on-demand handler call (an expected race; benign).
+    pub prefetch_eexist: u64,
+    /// Count of prefetcher copies that returned EAGAIN because a REMOVE event was
+    /// queued ahead of them.
+    pub prefetch_eagain: u64,
+    /// Count of prefetcher copies that hit an unexpected error; each increment is paired
+    /// with a `warn!` log entry.
+    pub prefetch_failed: u64,
+    /// Number of unique page offsets the in-memory recorder is currently holding
+    /// (template-build mode only; zero otherwise).
+    pub recorded_offsets: u64,
+}
+
+impl Stats {
+    fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            faults_served: self.faults_served.load(Ordering::Relaxed),
+            faults_deferred: self.faults_deferred.load(Ordering::Relaxed),
+            faults_failed_transient: self.faults_failed_transient.load(Ordering::Relaxed),
+            prefetch_served: self.prefetch_served.load(Ordering::Relaxed),
+            prefetch_eexist: self.prefetch_eexist.load(Ordering::Relaxed),
+            prefetch_eagain: self.prefetch_eagain.load(Ordering::Relaxed),
+            prefetch_failed: self.prefetch_failed.load(Ordering::Relaxed),
+            recorded_offsets: self.recorded_offsets.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Configuration for an internal-UFFD-backed restore.
 #[derive(Clone, Debug)]
@@ -43,6 +103,7 @@ pub struct Config {
 pub struct Handler {
     shutdown_tx: mpsc::Sender<()>,
     drain_tx: mpsc::SyncSender<mpsc::SyncSender<()>>,
+    stats: Arc<Stats>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -67,13 +128,27 @@ impl Handler {
     /// Block until the handler thread has drained every UFFD event currently queued by the
     /// kernel. Callers must hold the VM paused so no new faults can arrive between drain
     /// and the operation that requires a stable memory view (e.g. snapshot dump).
-    ///
-    /// Returns an error if the handler thread is no longer running.
-    pub fn drain_pending(&self) -> Result<(), ()> {
+    pub fn drain_pending(&self) -> Result<(), DrainError> {
         let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(0);
-        self.drain_tx.send(ack_tx).map_err(|_| ())?;
-        ack_rx.recv().map_err(|_| ())
+        self.drain_tx
+            .send(ack_tx)
+            .map_err(|_| DrainError::HandlerExited)?;
+        ack_rx.recv().map_err(|_| DrainError::NoAck)
     }
+
+    /// Snapshot of the handler's counters at the time of the call.
+    pub fn stats(&self) -> StatsSnapshot {
+        self.stats.snapshot()
+    }
+}
+
+/// Failure modes for [`Handler::drain_pending`].
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum DrainError {
+    /// Handler thread has exited; the drain request was not delivered.
+    HandlerExited,
+    /// Drain request was delivered but the handler did not acknowledge completion (thread likely died mid-drain).
+    NoAck,
 }
 
 /// Errors returned during setup of the in-process handler.
@@ -162,6 +237,8 @@ pub fn setup(
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let (drain_tx, drain_rx) = mpsc::sync_channel::<mpsc::SyncSender<()>>(0);
     let record_to = cfg.record_to.clone();
+    let stats = Arc::new(Stats::default());
+    let stats_for_thread = Arc::clone(&stats);
     let thread = thread::Builder::new()
         .name("uffd-internal".into())
         .spawn(move || {
@@ -174,6 +251,7 @@ pub fn setup(
                 recorder,
                 record_to,
                 vmm_filter,
+                stats_for_thread,
                 shutdown_rx,
                 drain_rx,
             )
@@ -186,6 +264,7 @@ pub fn setup(
         Handler {
             shutdown_tx,
             drain_tx,
+            stats,
             thread: Some(thread),
         },
     ))
@@ -249,6 +328,7 @@ fn run(
     mut recorder: Option<Recorder>,
     record_to: Option<PathBuf>,
     vmm_filter: Arc<BpfProgram>,
+    stats: Arc<Stats>,
     shutdown_rx: mpsc::Receiver<()>,
     drain_rx: mpsc::Receiver<mpsc::SyncSender<()>>,
 ) {
@@ -279,6 +359,7 @@ fn run(
                 page_size,
                 &mut deferred,
                 recorder.as_mut(),
+                &stats,
             );
             if let (Some(rec), Some(path)) = (recorder, record_to.as_deref()) {
                 if let Err(e) = rec.flush(path) {
@@ -296,6 +377,7 @@ fn run(
                 page_size,
                 &mut deferred,
                 recorder.as_mut(),
+                &stats,
             );
             let _ = ack.send(());
         }
@@ -328,6 +410,7 @@ fn run(
             page_size,
             &mut deferred,
             recorder.as_mut(),
+            &stats,
         );
 
         if n == 0 {
@@ -338,6 +421,7 @@ fn run(
                     snapshot.addr,
                     page_size,
                     prefetch_offsets[prefetch_cursor],
+                    &stats,
                 );
                 prefetch_cursor += 1;
             }
@@ -352,8 +436,9 @@ fn run(
                     snapshot.addr,
                     page_size,
                     ev,
-                    &mut deferred,
                     recorder.as_mut(),
+                    &mut deferred,
+                    &stats,
                 ),
                 Ok(None) => break,
                 Err(UffdCrateError::SystemError(e))
@@ -377,27 +462,46 @@ fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retry_deferred(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     backing: *const u8,
     page_size: usize,
     deferred: &mut Vec<u64>,
-    _recorder: Option<&mut Recorder>,
+    mut recorder: Option<&mut Recorder>,
+    stats: &Stats,
 ) {
     if deferred.is_empty() {
         return;
     }
-    // Deferred entries were recorded on first sight; the retry path must not double-count.
     let mut still_deferred = Vec::with_capacity(deferred.len());
     for addr in deferred.drain(..) {
-        if !serve_pagefault(uffd, mappings, backing, page_size, addr) {
-            still_deferred.push(addr);
+        match serve_pagefault(uffd, mappings, backing, page_size, addr) {
+            ServeOutcome::Served => {
+                stats.faults_served.fetch_add(1, Ordering::Relaxed);
+                record_fault(recorder.as_deref_mut(), mappings, page_size, addr, stats);
+            }
+            ServeOutcome::Deferred => {
+                stats.faults_deferred.fetch_add(1, Ordering::Relaxed);
+                still_deferred.push(addr);
+            }
+            ServeOutcome::FailedTransient => {
+                stats.faults_failed_transient.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     *deferred = still_deferred;
 }
 
+/// Drain every UFFD event the kernel currently has queued, retrying any deferred
+/// entries until both the queue is empty and the deferred list has stopped shrinking.
+///
+/// **Pre-condition: the caller must pause guest vCPUs before invoking this.** Without
+/// that invariant a guest that keeps page-faulting will keep `read_event` returning new
+/// events and this loop will never terminate. The two existing call sites (shutdown and
+/// snapshot-save drain) both pair this function with an external pause.
+#[allow(clippy::too_many_arguments)]
 fn drain_to_completion(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
@@ -405,10 +509,19 @@ fn drain_to_completion(
     page_size: usize,
     deferred: &mut Vec<u64>,
     mut recorder: Option<&mut Recorder>,
+    stats: &Stats,
 ) {
     loop {
         let prev_deferred = deferred.len();
-        retry_deferred(uffd, mappings, backing, page_size, deferred, None);
+        retry_deferred(
+            uffd,
+            mappings,
+            backing,
+            page_size,
+            deferred,
+            recorder.as_deref_mut(),
+            stats,
+        );
 
         let mut got_new = false;
         while let Ok(Some(ev)) = uffd.read_event() {
@@ -418,46 +531,49 @@ fn drain_to_completion(
                 backing,
                 page_size,
                 ev,
-                deferred,
                 recorder.as_deref_mut(),
+                deferred,
+                stats,
             );
             got_new = true;
         }
 
+        // Termination: stop only when both the kernel queue is empty (no new events)
+        // and the deferred list has not shrunk (no retry progress was made). If either
+        // condition fails, continue: a successful retry may have unblocked the kernel
+        // queue, and a freshly-read REMOVE may have unblocked a deferred entry.
         if !got_new && deferred.len() >= prev_deferred {
-            // No new events arrived and we made no progress on the deferred queue;
-            // further iterations cannot help. Stop.
             return;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     backing: *const u8,
     page_size: usize,
     ev: Event,
-    deferred: &mut Vec<u64>,
     recorder: Option<&mut Recorder>,
+    deferred: &mut Vec<u64>,
+    stats: &Stats,
 ) {
     match ev {
         Event::Pagefault { addr, .. } => {
             let addr_u64 = addr as u64;
-            let page_addr = addr_u64 & !((page_size as u64) - 1);
-            if let Some(rec) = recorder {
-                if let Some(region) =
-                    mappings.iter().find(|r| {
-                        page_addr >= r.base_host_virt_addr
-                            && page_addr < r.base_host_virt_addr + r.size as u64
-                    })
-                {
-                    let offset = region.offset + (page_addr - region.base_host_virt_addr);
-                    rec.record(offset);
+            match serve_pagefault(uffd, mappings, backing, page_size, addr_u64) {
+                ServeOutcome::Served => {
+                    stats.faults_served.fetch_add(1, Ordering::Relaxed);
+                    record_fault(recorder, mappings, page_size, addr_u64, stats);
                 }
-            }
-            if !serve_pagefault(uffd, mappings, backing, page_size, addr_u64) {
-                deferred.push(addr_u64);
+                ServeOutcome::Deferred => {
+                    stats.faults_deferred.fetch_add(1, Ordering::Relaxed);
+                    deferred.push(addr_u64);
+                }
+                ServeOutcome::FailedTransient => {
+                    stats.faults_failed_transient.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         Event::Remove { start, end } => unregister_range(uffd, start, end, page_size),
@@ -467,14 +583,37 @@ fn handle_event(
     }
 }
 
-/// Replay one entry of the recorded access trace. EEXIST means the page already faulted
-/// in concurrently and is benign; ignored.
+/// Record the page-aligned file offset corresponding to `addr` if a recorder is active.
+/// Called only after `serve_pagefault` confirms the page is resident in guest memory.
+fn record_fault(
+    recorder: Option<&mut Recorder>,
+    mappings: &[GuestRegionUffdMapping],
+    page_size: usize,
+    addr: u64,
+    stats: &Stats,
+) {
+    let Some(rec) = recorder else { return };
+    let page_addr = addr & !((page_size as u64) - 1);
+    if let Some(region) = mappings.iter().find(|r| {
+        page_addr >= r.base_host_virt_addr && page_addr < r.base_host_virt_addr + r.size as u64
+    }) {
+        let offset = region.offset + (page_addr - region.base_host_virt_addr);
+        if rec.record(offset) {
+            stats.recorded_offsets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Replay one entry of the recorded access trace. Outcomes are counted on `stats` so
+/// EAGAIN bursts and unexpected errors are visible even though the prefetch path has no
+/// caller to surface them to.
 fn prefetch_one(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     backing: *const u8,
     page_size: usize,
     offset: u64,
+    stats: &Stats,
 ) {
     let region = match mappings
         .iter()
@@ -491,18 +630,52 @@ fn prefetch_one(
         as *const libc::c_void;
     // SAFETY: same constraints as in `serve_pagefault` — src within snapshot mmap, dst
     // within a region registered with this UFFD.
-    let _ = unsafe { uffd.copy(src, dst, page_size, true) };
+    let res = unsafe { uffd.copy(src, dst, page_size, true) };
+    match res {
+        Ok(_) => {
+            stats.prefetch_served.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(UffdCrateError::PartiallyCopied(bytes))
+            if bytes == 0 || bytes == (-libc::EAGAIN) as usize =>
+        {
+            // REMOVE event queued ahead; on-demand fault path will retry, prefetch
+            // does not attempt to recover.
+            stats.prefetch_eagain.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(UffdCrateError::CopyFailed(errno))
+            if std::io::Error::from(errno).raw_os_error() == Some(libc::EEXIST) =>
+        {
+            // Guest already faulted this page in; expected race with on-demand path.
+            stats.prefetch_eexist.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            stats.prefetch_failed.fetch_add(1, Ordering::Relaxed);
+            log::warn!("uffd-internal: prefetch UFFDIO_COPY failed: {e:?}");
+        }
+    }
 }
 
-/// Returns true when the fault was served, false when it should be retried later (EAGAIN
-/// from a queued REMOVE event).
+/// Outcome of a single page-fault servicing attempt. Drives whether the caller defers,
+/// records, or moves on.
+#[derive(Debug, PartialEq, Eq)]
+enum ServeOutcome {
+    /// Page is now resident in guest memory (either freshly copied or already present).
+    Served,
+    /// `UFFDIO_COPY` returned EAGAIN because a REMOVE event is queued ahead; the caller
+    /// should retry this address after draining subsequent events.
+    Deferred,
+    /// Servicing failed in an unexpected way (already logged); the page is not resident
+    /// and there is no immediate path to fix it.
+    FailedTransient,
+}
+
 fn serve_pagefault(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     backing: *const u8,
     page_size: usize,
     addr: u64,
-) -> bool {
+) -> ServeOutcome {
     let page_addr = addr & !((page_size as u64) - 1);
     let region = match mappings
         .iter()
@@ -511,7 +684,7 @@ fn serve_pagefault(
         Some(r) => r,
         None => {
             log::warn!("uffd-internal: page fault {page_addr:#x} outside known regions");
-            return true;
+            return ServeOutcome::FailedTransient;
         }
     };
     let offset = page_addr - region.base_host_virt_addr;
@@ -526,21 +699,21 @@ fn serve_pagefault(
     // lets the faulting vCPU resume after the kernel installs the page.
     let res = unsafe { uffd.copy(src, dst, page_size, true) };
     match res {
-        Ok(_) => true,
+        Ok(_) => ServeOutcome::Served,
         Err(UffdCrateError::PartiallyCopied(bytes))
             if bytes == 0 || bytes == (-libc::EAGAIN) as usize =>
         {
-            false
+            ServeOutcome::Deferred
         }
         Err(UffdCrateError::CopyFailed(errno))
             if std::io::Error::from(errno).raw_os_error() == Some(libc::EEXIST) =>
         {
             // Page already populated by another fault on the same address.
-            true
+            ServeOutcome::Served
         }
         Err(e) => {
             log::error!("uffd-internal: UFFDIO_COPY failed at {page_addr:#x}: {e:?}");
-            true
+            ServeOutcome::FailedTransient
         }
     }
 }
@@ -563,12 +736,17 @@ fn unregister_range(uffd: &Uffd, start: *mut libc::c_void, end: *mut libc::c_voi
     }
 }
 
-/// Records each unique page-fault offset in first-touch order. Flushed on handler
-/// shutdown. The flush writes directly to the target path (truncated on open) and
-/// fsyncs — no rename, because `rename` is intentionally absent from the VMM seccomp
-/// filter that gates the handler thread. The only consumer of this file is a subsequent
-/// restore, which is sequenced after the build that produced it; there is no concurrent
-/// reader that could observe a partial write.
+/// Records each unique page-fault offset in first-touch order.
+///
+/// Flushed on handler shutdown by truncating the target path and writing the trace in
+/// one pass + fsync. There is no atomic temp-then-rename: `rename` is intentionally
+/// absent from the VMM seccomp filter that gates the handler thread.
+///
+/// A torn write (firecracker dies mid-flush) is safe because the consumer is robust to
+/// truncation: [`load_prefetch_offsets`] uses `lines().map_while(Result::ok)`, which
+/// silently drops unparseable trailing bytes. The next restore therefore replays a
+/// shorter — but valid — prefix of the recorded trace, with degraded prefetch coverage
+/// and no incorrect behavior.
 #[derive(Default)]
 struct Recorder {
     seen: HashSet<u64>,
@@ -576,9 +754,13 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn record(&mut self, offset: u64) {
+    /// Returns true when `offset` was newly inserted, false when it was already present.
+    fn record(&mut self, offset: u64) -> bool {
         if self.seen.insert(offset) {
             self.order.push(offset);
+            true
+        } else {
+            false
         }
     }
 
@@ -648,11 +830,11 @@ mod tests {
     #[test]
     fn recorder_dedups_and_preserves_first_touch_order() {
         let mut r = Recorder::default();
-        r.record(4096);
-        r.record(8192);
-        r.record(4096);
-        r.record(12288);
-        r.record(8192);
+        assert!(r.record(4096));
+        assert!(r.record(8192));
+        assert!(!r.record(4096));
+        assert!(r.record(12288));
+        assert!(!r.record(8192));
         assert_eq!(r.order, vec![4096, 8192, 12288]);
     }
 
@@ -686,5 +868,60 @@ mod tests {
     fn load_prefetch_offsets_returns_empty_when_file_missing() {
         let path = Path::new("/nonexistent/path/that/does/not/exist.log");
         assert!(load_prefetch_offsets(path, 4096).is_empty());
+    }
+
+    #[test]
+    fn record_fault_skips_when_recorder_is_none() {
+        // The "no recorder" branch is the hot path on normal restores; a no-op call must
+        // not panic even when the mappings table is empty.
+        let stats = Stats::default();
+        record_fault(None, &[], 4096, 0x1000, &stats);
+        assert_eq!(stats.recorded_offsets.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_fault_writes_file_offset_for_in_range_addr() {
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000_0000,
+            size: 0x4000,
+            offset: 0x2000,
+            page_size: 4096,
+            page_size_kib: 4096,
+        }];
+        let mut rec = Recorder::default();
+        let stats = Stats::default();
+        // Fault at virt 0x1000_1000 → page-aligned to itself → in-region offset 0x1000
+        // → file offset 0x2000 + 0x1000 = 0x3000.
+        record_fault(Some(&mut rec), &mappings, 4096, 0x1000_1000, &stats);
+        assert_eq!(rec.order, vec![0x3000]);
+        assert_eq!(stats.recorded_offsets.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn record_fault_drops_addr_outside_any_region() {
+        let mut rec = Recorder::default();
+        let stats = Stats::default();
+        record_fault(Some(&mut rec), &[], 4096, 0x1000, &stats);
+        assert!(rec.order.is_empty());
+        assert_eq!(stats.recorded_offsets.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_fault_counter_only_increments_on_new_offsets() {
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000_0000,
+            size: 0x4000,
+            offset: 0,
+            page_size: 4096,
+            page_size_kib: 4096,
+        }];
+        let mut rec = Recorder::default();
+        let stats = Stats::default();
+        record_fault(Some(&mut rec), &mappings, 4096, 0x1000_0000, &stats);
+        record_fault(Some(&mut rec), &mappings, 4096, 0x1000_0000, &stats);
+        record_fault(Some(&mut rec), &mappings, 4096, 0x1000_1000, &stats);
+        assert_eq!(stats.recorded_offsets.load(Ordering::Relaxed), 2);
     }
 }

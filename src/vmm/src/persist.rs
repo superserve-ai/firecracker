@@ -203,10 +203,8 @@ pub fn create_snapshot(
     // Ensure the in-process UFFD handler has drained any kernel-queued events before the
     // memory dump runs concurrently with it.
     if let Some(handler) = &vmm.uffd_handler {
-        if handler.drain_pending().is_err() {
-            log::warn!(
-                "uffd-internal: drain before snapshot save failed; handler thread may have exited"
-            );
+        if let Err(e) = handler.drain_pending() {
+            log::warn!("uffd-internal: drain before snapshot save failed: {e}");
         }
     }
 

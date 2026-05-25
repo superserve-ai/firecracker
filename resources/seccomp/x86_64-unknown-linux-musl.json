@@ -15,7 +15,7 @@
             },
             {
                 "syscall": "poll",
-                "comment": "Used by the in-process UFFD handler to wait for page-fault events."
+                "comment": "Used by the in-process UFFD handler to wait for page-fault events. Unscoped to match the existing convention for the epoll_pwait entry above: poll-family syscalls have uniform semantics regardless of arguments, so arg filtering would be brittle without adding meaningful protection."
             },
             {
                 "syscall": "exit"
