@@ -14,6 +14,10 @@
                 "syscall": "epoll_pwait"
             },
             {
+                "syscall": "poll",
+                "comment": "Used by the in-process UFFD handler to wait for page-fault events."
+            },
+            {
                 "syscall": "exit"
             },
             {
@@ -414,6 +418,32 @@
                         "op": "eq",
                         "val": 21506,
                         "comment": "TCSETS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used by the in-process UFFD handler to serve a page fault by copying a page from the snapshot mapping into guest memory.",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3224773635,
+                        "comment": "UFFDIO_COPY"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used by the in-process UFFD handler to detach a guest memory range on a REMOVE event.",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2148611585,
+                        "comment": "UFFDIO_UNREGISTER"
                     }
                 ]
             },

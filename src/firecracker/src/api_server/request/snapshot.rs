@@ -98,6 +98,8 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             }
         }
     };
@@ -188,6 +190,8 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -219,6 +223,8 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: true,
             resume_vm: false,
@@ -250,6 +256,8 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -287,6 +295,8 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -318,6 +328,8 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
