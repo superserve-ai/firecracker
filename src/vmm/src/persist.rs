@@ -200,6 +200,14 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
+    // Ensure the in-process UFFD handler has drained any kernel-queued events before the
+    // memory dump runs concurrently with it.
+    if let Some(handler) = &vmm.uffd_handler {
+        if let Err(e) = handler.drain_pending() {
+            log::warn!("uffd-internal: drain before snapshot save failed: {e}");
+        }
+    }
+
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
@@ -588,7 +596,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
+    let (guest_memory, uffd, uffd_handler) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(
@@ -600,15 +608,39 @@ pub fn restore_from_snapshot(
                 guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
                     .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
                 None,
+                None,
             )
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            let (memory, uffd) = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (memory, uffd, None)
+        }
+        MemBackendType::UffdInternal => {
+            let vmm_filter = seccomp_filters
+                .get("vmm")
+                .cloned()
+                .ok_or(RestoreFromSnapshotGuestMemoryError::Uffd(
+                    GuestMemoryFromUffdError::InternalHandler(std::io::Error::other(
+                        "missing seccomp filter for vmm thread",
+                    )),
+                ))?;
+            guest_memory_from_uffd_internal(
+                mem_backend_path,
+                params.mem_backend.access_log_path.as_deref(),
+                params.mem_backend.record_to.as_deref(),
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+                vmm_filter,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
+        }
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -616,6 +648,7 @@ pub fn restore_from_snapshot(
         microvm_state,
         guest_memory,
         uffd,
+        uffd_handler,
         seccomp_filters,
         vm_resources,
     )
@@ -684,6 +717,8 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// Failed to set up in-process UFFD handler: {0}
+    InternalHandler(std::io::Error),
 }
 
 fn guest_memory_from_uffd(
@@ -718,6 +753,46 @@ fn guest_memory_from_uffd(
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, Some(uffd)))
+}
+
+fn guest_memory_from_uffd_internal(
+    snapshot_path: &Path,
+    access_log_path: Option<&Path>,
+    record_to: Option<&Path>,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+    vmm_filter: std::sync::Arc<crate::seccomp::BpfProgram>,
+) -> Result<
+    (
+        Vec<GuestRegionMmap>,
+        Option<Uffd>,
+        Option<crate::uffd_internal::Handler>,
+    ),
+    GuestMemoryFromUffdError,
+> {
+    let cfg = crate::uffd_internal::config_from_paths(snapshot_path, access_log_path, record_to);
+    let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
+        cfg,
+        mem_state,
+        track_dirty_pages,
+        huge_pages,
+        vmm_filter,
+    )
+    .map_err(|e| match e {
+        crate::uffd_internal::InternalUffdError::Memory(m) => GuestMemoryFromUffdError::Restore(m),
+        crate::uffd_internal::InternalUffdError::Create(c) => GuestMemoryFromUffdError::Create(c),
+        crate::uffd_internal::InternalUffdError::Register(r) => {
+            GuestMemoryFromUffdError::Register(r)
+        }
+        crate::uffd_internal::InternalUffdError::OpenSnapshot(e)
+        | crate::uffd_internal::InternalUffdError::OpenRecorder(e)
+        | crate::uffd_internal::InternalUffdError::DupFd(e)
+        | crate::uffd_internal::InternalUffdError::SpawnThread(e) => {
+            GuestMemoryFromUffdError::InternalHandler(e)
+        }
+    })?;
+    Ok((guest_memory, Some(uffd), Some(handler)))
 }
 
 fn create_guest_memory(

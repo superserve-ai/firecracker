@@ -24,13 +24,18 @@ pub enum SnapshotType {
 /// resuming from a snapshot:
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
-///    Firecracker to handle its guest memory page faults.
+///    Firecracker to handle its guest memory page faults,
+/// 3) An in-process UFFD handler that lives inside firecracker — UFFD lifecycle equals VM
+///    lifecycle, no external coordination required.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory will be served through UFFD by a handler thread inside firecracker.
+    /// `backend_path` points to the snapshot memory file (mem.snap).
+    UffdInternal,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -125,10 +130,23 @@ pub struct LoadSnapshotConfig {
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemBackendConfig {
-    /// Path to the backend used to handle the guest memory.
+    /// Path to the backend used to handle the guest memory. For `Uffd` this is the UDS
+    /// where the external handler is listening; for `File` and `UffdInternal` this is
+    /// the path to the snapshot memory file.
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Path to a recorded page-access trace to replay as prefetch. Only meaningful for
+    /// `UffdInternal`; ignored otherwise. Absent or unreadable → fall back to sequential
+    /// prefetch.
+    #[serde(default)]
+    pub access_log_path: Option<PathBuf>,
+    /// If set, the internal UFFD handler will write each served page offset to this path
+    /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
+    /// otherwise. When present, prefetch is disabled so the captured trace reflects the
+    /// guest's natural access pattern.
+    #[serde(default)]
+    pub record_to: Option<PathBuf>,
 }
 
 /// The microVM state options.

@@ -94,6 +94,8 @@ pub mod mmds;
 pub mod pci;
 /// Save/restore utilities.
 pub mod persist;
+/// In-process userfaultfd integration for snapshot restore.
+pub mod uffd_internal;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// microVM RPC API adapters.
@@ -323,6 +325,9 @@ pub struct Vmm {
     // Save UFFD in order to keep it open in the Firecracker process, as well.
     #[allow(unused)]
     uffd: Option<Uffd>,
+    // Owns the in-process UFFD handler thread; joined on drop. Set when the VM was
+    // restored with `MemBackendType::UffdInternal`, `None` otherwise.
+    uffd_handler: Option<crate::uffd_internal::Handler>,
     /// Handles to the vcpu threads with vcpu_fds inside them.
     pub vcpus_handles: Vec<VcpuHandle>,
     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.

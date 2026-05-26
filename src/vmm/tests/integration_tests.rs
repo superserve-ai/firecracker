@@ -295,6 +295,8 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -439,6 +441,8 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -543,6 +547,8 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                access_log_path: None,
+                record_to: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -861,6 +867,8 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         mem_backend: MemBackendConfig {
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
+            access_log_path: None,
+            record_to: None,
         },
         track_dirty_pages: false,
         resume_vm: false,
