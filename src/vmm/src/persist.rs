@@ -794,6 +794,9 @@ fn guest_memory_from_uffd_internal(
         | crate::uffd_internal::InternalUffdError::SpawnThread(e) => {
             GuestMemoryFromUffdError::InternalHandler(e)
         }
+        crate::uffd_internal::InternalUffdError::LayeredInvalid(s) => {
+            GuestMemoryFromUffdError::InternalHandler(std::io::Error::other(s))
+        }
     })?;
     Ok((guest_memory, Some(uffd), Some(handler)))
 }

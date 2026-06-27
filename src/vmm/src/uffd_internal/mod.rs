@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -172,6 +173,8 @@ pub enum InternalUffdError {
     DupFd(std::io::Error),
     /// Failed to spawn handler thread: {0}
     SpawnThread(std::io::Error),
+    /// Invalid layered restore: {0}
+    LayeredInvalid(String),
 }
 
 /// Allocate anonymous guest memory, create + register a userfaultfd, and start a handler
@@ -215,12 +218,42 @@ pub fn setup(
         offset += region.size() as u64;
     }
 
+    let total_mem = offset; // sum of region sizes = total guest RAM
     let overlay = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
     // Layered restore: mmap the base (template) and scan the overlay's extents so a
-    // page absent from the overlay falls through to the base.
+    // page absent from the overlay falls through to the base. Validate sizes up front
+    // so a malformed/short file fails the restore loudly instead of risking an
+    // out-of-bounds page source (or a handler-thread panic) at fault time.
     let (base, present) = match cfg.base_path.as_deref() {
         Some(base_path) => {
+            if (overlay.size as u64) < total_mem {
+                return Err(InternalUffdError::LayeredInvalid(format!(
+                    "overlay {:?} is {} bytes, smaller than guest RAM {}",
+                    cfg.snapshot_path, overlay.size, total_mem
+                )));
+            }
+            // Presence is derived from the overlay's hole/data layout, which is only
+            // page-granular when the filesystem's allocation unit is <= the page size
+            // (true on ext4 with 4K blocks). On a larger-granularity FS (e.g. ZFS
+            // recordsize), SEEK_DATA would over-report clean pages as present and serve
+            // zeros for them — refuse rather than silently corrupt guest memory.
+            let blksize = std::fs::metadata(&cfg.snapshot_path)
+                .map_err(InternalUffdError::OpenSnapshot)?
+                .blksize();
+            if blksize > page_size as u64 {
+                return Err(InternalUffdError::LayeredInvalid(format!(
+                    "overlay {:?} is on a filesystem with block size {blksize} > page size {page_size}; \
+                     layered restore needs page-granular holes",
+                    cfg.snapshot_path
+                )));
+            }
             let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
+            if (base.size as u64) < total_mem {
+                return Err(InternalUffdError::LayeredInvalid(format!(
+                    "base {base_path:?} is {} bytes, smaller than guest RAM {total_mem}",
+                    base.size
+                )));
+            }
             let present = scan_present_pages(&cfg.snapshot_path, page_size)
                 .map_err(InternalUffdError::OpenSnapshot)?;
             (Some(base), Some(present))
@@ -358,7 +391,11 @@ impl PresenceBitmap {
         self.bits[i >> 6] |= 1u64 << (i & 63);
     }
     fn is_set(&self, i: usize) -> bool {
-        self.bits[i >> 6] & (1u64 << (i & 63)) != 0
+        // Out-of-range ⇒ not present (fall through to base). `setup` already
+        // guarantees the overlay covers all guest pages, so this is defense in
+        // depth against a panic on the handler thread (which would hang the VM).
+        let word = i >> 6;
+        word < self.bits.len() && self.bits[word] & (1u64 << (i & 63)) != 0
     }
 }
 
