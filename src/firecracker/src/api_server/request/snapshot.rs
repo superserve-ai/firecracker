@@ -98,6 +98,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                base_path: None,
                 access_log_path: None,
                 record_to: None,
             }
@@ -188,6 +189,7 @@ mod tests {
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 access_log_path: None,
@@ -221,6 +223,7 @@ mod tests {
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 access_log_path: None,
@@ -254,6 +257,7 @@ mod tests {
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 access_log_path: None,
@@ -293,6 +297,7 @@ mod tests {
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 access_log_path: None,
@@ -326,6 +331,7 @@ mod tests {
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 access_log_path: None,

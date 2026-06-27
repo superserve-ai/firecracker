@@ -632,6 +632,7 @@ pub fn restore_from_snapshot(
                 ))?;
             guest_memory_from_uffd_internal(
                 mem_backend_path,
+                params.mem_backend.base_path.as_deref(),
                 params.mem_backend.access_log_path.as_deref(),
                 params.mem_backend.record_to.as_deref(),
                 mem_state,
@@ -757,6 +758,7 @@ fn guest_memory_from_uffd(
 
 fn guest_memory_from_uffd_internal(
     snapshot_path: &Path,
+    base_path: Option<&Path>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
     mem_state: &GuestMemoryState,
@@ -771,7 +773,8 @@ fn guest_memory_from_uffd_internal(
     ),
     GuestMemoryFromUffdError,
 > {
-    let cfg = crate::uffd_internal::config_from_paths(snapshot_path, access_log_path, record_to);
+    let cfg =
+        crate::uffd_internal::config_from_paths(snapshot_path, base_path, access_log_path, record_to);
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
         mem_state,

@@ -132,10 +132,16 @@ pub struct LoadSnapshotConfig {
 pub struct MemBackendConfig {
     /// Path to the backend used to handle the guest memory. For `Uffd` this is the UDS
     /// where the external handler is listening; for `File` and `UffdInternal` this is
-    /// the path to the snapshot memory file.
+    /// the path to the snapshot memory file. In layered `UffdInternal` restore this is
+    /// the overlay (diff) file; pages absent from it are served from `base_path`.
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Base (template) memory file for a layered `UffdInternal` restore. When set, a page
+    /// is served from `backend_path` if present there, else from this base. Only
+    /// meaningful for `UffdInternal`; ignored otherwise.
+    #[serde(default)]
+    pub base_path: Option<PathBuf>,
     /// Path to a recorded page-access trace to replay as prefetch. Only meaningful for
     /// `UffdInternal`; ignored otherwise. Absent or unreadable → fall back to sequential
     /// prefetch.

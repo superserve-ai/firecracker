@@ -91,8 +91,12 @@ impl Stats {
 /// Configuration for an internal-UFFD-backed restore.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Snapshot memory file backing guest RAM.
+    /// Snapshot memory file backing guest RAM. In layered mode this is the overlay
+    /// (diff) file; pages absent from it are served from `base_path`.
     pub snapshot_path: PathBuf,
+    /// Base (template) memory file. When set, the restore is layered: a page is
+    /// served from `snapshot_path` if present there, else from this base.
+    pub base_path: Option<PathBuf>,
     /// Recorded page-access trace replayed as prefetch when present.
     pub access_log_path: Option<PathBuf>,
     /// When set, the handler records each served page offset and suppresses prefetch.
@@ -211,7 +215,23 @@ pub fn setup(
         offset += region.size() as u64;
     }
 
-    let snapshot = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
+    let overlay = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
+    // Layered restore: mmap the base (template) and scan the overlay's extents so a
+    // page absent from the overlay falls through to the base.
+    let (base, present) = match cfg.base_path.as_deref() {
+        Some(base_path) => {
+            let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
+            let present = scan_present_pages(&cfg.snapshot_path, page_size)
+                .map_err(InternalUffdError::OpenSnapshot)?;
+            (Some(base), Some(present))
+        }
+        None => (None, None),
+    };
+    let backing = Backing {
+        overlay,
+        base,
+        present,
+    };
 
     // Recording disables prefetch so the captured trace reflects guest-driven access
     // order instead of pages pulled in by the prefetcher.
@@ -250,7 +270,7 @@ pub fn setup(
                 handler_uffd,
                 mappings,
                 page_size,
-                snapshot,
+                backing,
                 prefetch_offsets,
                 recorder,
                 vmm_filter,
@@ -321,12 +341,93 @@ fn mmap_snapshot(path: &Path) -> std::io::Result<SnapshotMmap> {
     })
 }
 
+/// One bit per guest page: set ⇒ the page is present in the overlay (diff) file,
+/// clear ⇒ it must be served from the base. Built once at setup from the overlay's
+/// allocated extents (see `scan_present_pages`).
+struct PresenceBitmap {
+    bits: Vec<u64>,
+}
+
+impl PresenceBitmap {
+    fn with_pages(n: usize) -> Self {
+        Self {
+            bits: vec![0u64; n.div_ceil(64)],
+        }
+    }
+    fn set(&mut self, i: usize) {
+        self.bits[i >> 6] |= 1u64 << (i & 63);
+    }
+    fn is_set(&self, i: usize) -> bool {
+        self.bits[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+}
+
+/// Scan `path`'s allocated extents via `SEEK_DATA`/`SEEK_HOLE` and mark every page
+/// that overlaps real data. `dump_dirty` writes dirtied pages as real extents and
+/// leaves clean pages as holes (no zero-skip), so a present extent == an overlay
+/// page and a hole == "fall through to base".
+fn scan_present_pages(path: &Path, page_size: usize) -> std::io::Result<PresenceBitmap> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let npages = (size as usize).div_ceil(page_size);
+    let mut pm = PresenceBitmap::with_pages(npages);
+    let fd = file.as_raw_fd();
+    let mut off: libc::off_t = 0;
+    while (off as u64) < size {
+        // SAFETY: fd is a valid open file; SEEK_DATA returns the next data offset
+        // at or after `off`, or -1/ENXIO once no data remains.
+        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
+        if data < 0 {
+            break; // ENXIO: no more data
+        }
+        // SAFETY: same fd; SEEK_HOLE returns the next hole at or after `data`,
+        // or EOF if the extent runs to the end of the file.
+        let mut hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            hole = size as libc::off_t;
+        }
+        let start_pg = data as usize / page_size;
+        let end_pg = (hole as usize).div_ceil(page_size).min(npages);
+        for p in start_pg..end_pg {
+            pm.set(p);
+        }
+        off = hole;
+    }
+    Ok(pm)
+}
+
+/// The memory backing a layered (or single-file) restore. `overlay` is the file
+/// named by `Config::snapshot_path`; in layered mode `base` + `present` resolve
+/// pages absent from the overlay to the template.
+struct Backing {
+    overlay: SnapshotMmap,
+    base: Option<SnapshotMmap>,
+    present: Option<PresenceBitmap>,
+}
+
+impl Backing {
+    /// Source pointer for the page at `file_offset`: the overlay if the page is
+    /// present there (or there is no base), else the base. The two layers are the
+    /// same logical size, so `file_offset` is in bounds for whichever is chosen.
+    fn src_ptr(&self, file_offset: u64, page_size: usize) -> *const u8 {
+        if let (Some(base), Some(present)) = (&self.base, &self.present) {
+            let page_idx = (file_offset / page_size as u64) as usize;
+            if !present.is_set(page_idx) {
+                // SAFETY: file_offset < total guest mem size <= base mmap size.
+                return unsafe { base.addr.add(file_offset as usize) };
+            }
+        }
+        // SAFETY: file_offset < total guest mem size <= overlay mmap size.
+        unsafe { self.overlay.addr.add(file_offset as usize) }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     page_size: usize,
-    snapshot: SnapshotMmap,
+    backing: Backing,
     prefetch_offsets: Vec<u64>,
     mut recorder: Option<Recorder>,
     vmm_filter: Arc<BpfProgram>,
@@ -359,7 +460,7 @@ fn run(
             drain_to_completion(
                 &uffd,
                 &mappings,
-                snapshot.addr,
+                &backing,
                 page_size,
                 &mut deferred,
                 recorder.as_mut(),
@@ -372,7 +473,7 @@ fn run(
             drain_to_completion(
                 &uffd,
                 &mappings,
-                snapshot.addr,
+                &backing,
                 page_size,
                 &mut deferred,
                 recorder.as_mut(),
@@ -405,7 +506,7 @@ fn run(
         retry_deferred(
             &uffd,
             &mappings,
-            snapshot.addr,
+            &backing,
             page_size,
             &mut deferred,
             recorder.as_mut(),
@@ -417,7 +518,7 @@ fn run(
                 prefetch_one(
                     &uffd,
                     &mappings,
-                    snapshot.addr,
+                    &backing,
                     page_size,
                     prefetch_offsets[prefetch_cursor],
                     &stats,
@@ -432,7 +533,7 @@ fn run(
                 Ok(Some(ev)) => handle_event(
                     &uffd,
                     &mappings,
-                    snapshot.addr,
+                    &backing,
                     page_size,
                     ev,
                     recorder.as_mut(),
@@ -465,7 +566,7 @@ fn run(
 fn retry_deferred(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     deferred: &mut Vec<u64>,
     mut recorder: Option<&mut Recorder>,
@@ -504,7 +605,7 @@ fn retry_deferred(
 fn drain_to_completion(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     deferred: &mut Vec<u64>,
     mut recorder: Option<&mut Recorder>,
@@ -551,7 +652,7 @@ fn drain_to_completion(
 fn handle_event(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     ev: Event,
     recorder: Option<&mut Recorder>,
@@ -609,7 +710,7 @@ fn record_fault(
 fn prefetch_one(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     offset: u64,
     stats: &Stats,
@@ -623,9 +724,9 @@ fn prefetch_one(
     };
     let page_offset_in_region = (offset - region.offset) & !((page_size as u64) - 1);
     let dst = (region.base_host_virt_addr + page_offset_in_region) as *mut libc::c_void;
-    // SAFETY: `region.offset + page_offset_in_region` is bounded above by the region's
-    // file extent, which is at most the snapshot file's length used to build the mmap.
-    let src = unsafe { backing.add((region.offset + page_offset_in_region) as usize) }
+    // Layered: resolve the page to the overlay or base. `region.offset +
+    // page_offset_in_region` is bounded by the region's file extent.
+    let src = backing.src_ptr(region.offset + page_offset_in_region, page_size)
         as *const libc::c_void;
     // SAFETY: same constraints as in `serve_pagefault` — src within snapshot mmap, dst
     // within a region registered with this UFFD.
@@ -671,7 +772,7 @@ enum ServeOutcome {
 fn serve_pagefault(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     addr: u64,
 ) -> ServeOutcome {
@@ -687,10 +788,9 @@ fn serve_pagefault(
         }
     };
     let offset = page_addr - region.base_host_virt_addr;
-    // SAFETY: `region.offset + offset` is bounded above by `region.size`, which `setup`
-    // computed from the snapshot's region length; the snapshot mmap is at least that big.
-    let src = unsafe { backing.add(region.offset as usize + offset as usize) }
-        as *const libc::c_void;
+    // Layered: resolve the page to the overlay or base. `region.offset + offset` is
+    // bounded above by `region.size`, so it is in bounds for either mmap.
+    let src = backing.src_ptr(region.offset + offset, page_size) as *const libc::c_void;
     let dst = page_addr as *mut libc::c_void;
 
     // SAFETY: `src` is within the snapshot mmap; `dst` is within a region registered with
@@ -809,11 +909,13 @@ fn load_prefetch_offsets(path: &Path, page_size: usize) -> Vec<u64> {
 /// Build a [`Config`] from raw path references.
 pub fn config_from_paths(
     snapshot_path: &Path,
+    base_path: Option<&Path>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
+        base_path: base_path.map(Path::to_path_buf),
         access_log_path: access_log_path.map(Path::to_path_buf),
         record_to: record_to.map(Path::to_path_buf),
     }
@@ -822,6 +924,43 @@ pub fn config_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_bitmap_set_and_query() {
+        let mut pm = PresenceBitmap::with_pages(130);
+        for i in 0..130 {
+            assert!(!pm.is_set(i));
+        }
+        pm.set(0);
+        pm.set(65);
+        pm.set(129);
+        assert!(pm.is_set(0) && pm.is_set(65) && pm.is_set(129));
+        assert!(!pm.is_set(1) && !pm.is_set(64) && !pm.is_set(128));
+    }
+
+    #[test]
+    fn scan_present_pages_marks_data_pages_not_holes() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len((4 * ps) as u64).unwrap(); // 4 pages, all holes
+        // Real (non-zero) data into pages 0 and 2; leave 1 and 3 as holes — exactly
+        // how dump_dirty lays out a diff (dirty = extent, clean = hole).
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&vec![1u8; ps]).unwrap();
+        f.seek(SeekFrom::Start((2 * ps) as u64)).unwrap();
+        f.write_all(&vec![2u8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let pm = scan_present_pages(&path, ps).unwrap();
+        assert!(pm.is_set(0), "page 0 has data");
+        assert!(!pm.is_set(1), "page 1 is a hole → must fall through to base");
+        assert!(pm.is_set(2), "page 2 has data");
+        assert!(!pm.is_set(3), "page 3 is a hole → must fall through to base");
+    }
 
     #[test]
     fn recorder_writes_one_line_per_unique_offset_in_first_touch_order() {

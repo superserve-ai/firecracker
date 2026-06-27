@@ -1439,7 +1439,15 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults (Uffd), or
-          3) Path to the snapshot memory file backing guest RAM (UffdInternal).
+          3) Path to the snapshot memory file backing guest RAM (UffdInternal). In a
+          layered UffdInternal restore this is the overlay (diff) file; pages absent
+          from it are served from base_path.
+      base_path:
+        type: string
+        description: Optional base (template) memory file for a layered UffdInternal
+          restore. When set, a page is served from backend_path if present there,
+          else from this base. Only meaningful when backend_type is UffdInternal;
+          ignored otherwise.
       access_log_path:
         type: string
         description: Optional path to a recorded page-access trace replayed as
