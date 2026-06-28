@@ -635,6 +635,7 @@ pub fn restore_from_snapshot(
                 params.mem_backend.base_path.as_deref(),
                 params.mem_backend.access_log_path.as_deref(),
                 params.mem_backend.record_to.as_deref(),
+                params.mem_backend.abort_on_handler_death,
                 mem_state,
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages,
@@ -763,6 +764,7 @@ fn guest_memory_from_uffd_internal(
     base_path: Option<&Path>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
+    abort_on_handler_death: bool,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
@@ -775,8 +777,13 @@ fn guest_memory_from_uffd_internal(
     ),
     GuestMemoryFromUffdError,
 > {
-    let cfg =
-        crate::uffd_internal::config_from_paths(snapshot_path, base_path, access_log_path, record_to);
+    let cfg = crate::uffd_internal::config_from_paths(
+        snapshot_path,
+        base_path,
+        access_log_path,
+        record_to,
+        abort_on_handler_death,
+    );
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
         mem_state,

@@ -142,6 +142,11 @@ pub struct MemBackendConfig {
     /// meaningful for `UffdInternal`; ignored otherwise.
     #[serde(default)]
     pub base_path: Option<PathBuf>,
+    /// When true, an unexpected `UffdInternal` handler death aborts Firecracker instead
+    /// of leaving the guest to freeze on its next page fault. Only meaningful for
+    /// `UffdInternal`; ignored otherwise. Defaults to false (opt-in).
+    #[serde(default)]
+    pub abort_on_handler_death: bool,
     /// Path to a recorded page-access trace to replay as prefetch. Only meaningful for
     /// `UffdInternal`; ignored otherwise. Absent or unreadable → fall back to sequential
     /// prefetch.

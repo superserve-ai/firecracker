@@ -102,6 +102,10 @@ pub struct Config {
     pub access_log_path: Option<PathBuf>,
     /// When set, the handler records each served page offset and suppresses prefetch.
     pub record_to: Option<PathBuf>,
+    /// When true, an unexpected handler exit (error or panic, not a clean shutdown)
+    /// aborts the Firecracker process instead of leaving the guest to hang on its next
+    /// page fault — so a supervisor sees a dead VM rather than a frozen one.
+    pub abort_on_handler_death: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -192,6 +196,7 @@ pub fn setup(
 ) -> Result<(Vec<GuestRegionMmap>, Uffd, Handler), InternalUffdError> {
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
     let page_size = huge_pages.page_size();
+    let abort_on_handler_death = cfg.abort_on_handler_death;
 
     let mut builder = UffdBuilder::new();
     builder.require_features(FeatureFlags::EVENT_REMOVE);
@@ -311,18 +316,37 @@ pub fn setup(
     let thread = thread::Builder::new()
         .name("uffd-internal".into())
         .spawn(move || {
-            run(
-                handler_uffd,
-                mappings,
-                page_size,
-                backing,
-                prefetch_offsets,
-                recorder,
-                vmm_filter,
-                stats_for_thread,
-                shutdown_rx,
-                drain_rx,
-            )
+            // catch_unwind so a handler panic also counts as an unexpected exit.
+            // AssertUnwindSafe is sound: the captured state is never reused after this.
+            let clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    handler_uffd,
+                    mappings,
+                    page_size,
+                    backing,
+                    prefetch_offsets,
+                    recorder,
+                    vmm_filter,
+                    stats_for_thread,
+                    shutdown_rx,
+                    drain_rx,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                log::error!("uffd-internal: handler thread panicked");
+                HandlerExit::Unexpected
+            });
+            if clean == HandlerExit::Unexpected {
+                // Handler gone while the guest may still fault. Log always; abort only
+                // when gated on, so the VM dies visibly instead of hanging silently.
+                log::error!("uffd-internal: handler exited unexpectedly");
+                if abort_on_handler_death {
+                    log::error!(
+                        "uffd-internal: aborting Firecracker so the dead VM is surfaced, not frozen"
+                    );
+                    std::process::exit(UFFD_HANDLER_DEATH_EXIT_CODE);
+                }
+            }
         })
         .map_err(InternalUffdError::SpawnThread)?;
 
@@ -477,6 +501,20 @@ impl Backing {
     }
 }
 
+/// Exit code used when an unexpected handler death aborts Firecracker (gated by
+/// `Config::abort_on_handler_death`). Distinct so the cause is clear in the logs.
+const UFFD_HANDLER_DEATH_EXIT_CODE: i32 = 70;
+
+/// How the handler loop ended. `Clean` is an intentional teardown (the orchestrator
+/// signalled shutdown, or Firecracker unmapped the regions as the VM goes away).
+/// `Unexpected` is any error path — the handler can no longer serve faults while the
+/// guest may still need them.
+#[derive(Debug, PartialEq, Eq)]
+enum HandlerExit {
+    Clean,
+    Unexpected,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     uffd: Uffd,
@@ -489,11 +527,11 @@ fn run(
     stats: Arc<Stats>,
     shutdown_rx: mpsc::Receiver<()>,
     drain_rx: mpsc::Receiver<mpsc::SyncSender<()>>,
-) {
+) -> HandlerExit {
     // Apply the same seccomp filter as the VMM thread before serving any events.
     if let Err(e) = apply_filter(vmm_filter.as_slice()) {
         log::error!("uffd-internal: failed to apply seccomp filter, exiting: {e:?}");
-        return;
+        return HandlerExit::Unexpected;
     }
 
     // Pagefault addresses that returned EAGAIN because a REMOVE event was queued ahead
@@ -521,7 +559,7 @@ fn run(
                 recorder.as_mut(),
                 &stats,
             );
-            return;
+            return HandlerExit::Clean;
         }
 
         if let Ok(ack) = drain_rx.try_recv() {
@@ -555,7 +593,7 @@ fn run(
                 continue;
             }
             log::error!("uffd-internal: poll failed: {err}");
-            return;
+            return HandlerExit::Unexpected;
         }
 
         retry_deferred(
@@ -606,11 +644,11 @@ fn run(
                 {
                     // EINVAL on read means firecracker has already unmapped the registered
                     // memory regions; the VM is going away. Exit cleanly.
-                    return;
+                    return HandlerExit::Clean;
                 }
                 Err(e) => {
                     log::error!("uffd-internal: read_event failed: {e:?}");
-                    return;
+                    return HandlerExit::Unexpected;
                 }
             }
         }
@@ -967,12 +1005,14 @@ pub fn config_from_paths(
     base_path: Option<&Path>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
+    abort_on_handler_death: bool,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
         base_path: base_path.map(Path::to_path_buf),
         access_log_path: access_log_path.map(Path::to_path_buf),
         record_to: record_to.map(Path::to_path_buf),
+        abort_on_handler_death,
     }
 }
 
