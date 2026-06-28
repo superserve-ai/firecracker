@@ -232,11 +232,23 @@ pub fn setup(
                     cfg.snapshot_path, overlay.size, total_mem
                 )));
             }
-            // Presence is derived from the overlay's hole/data layout, which is only
-            // page-granular when the filesystem's allocation unit is <= the page size
-            // (true on ext4 with 4K blocks). On a larger-granularity FS (e.g. ZFS
-            // recordsize), SEEK_DATA would over-report clean pages as present and serve
-            // zeros for them — refuse rather than silently corrupt guest memory.
+            // Presence is page-granular only if the overlay was dumped at this
+            // page_size. `dump_dirty` writes dirtied pages at the host page size, so a
+            // huge-page guest (page_size > host) leaves a partially-dirty huge page as
+            // host-page data+hole extents while scan marks the whole huge page present —
+            // serving its clean host-page sub-ranges as overlay zeros. Refuse rather
+            // than silently corrupt; layered restore requires host-page granularity.
+            let host_page_size = crate::arch::host_page_size();
+            if page_size > host_page_size {
+                return Err(InternalUffdError::LayeredInvalid(format!(
+                    "layered restore needs host-page granularity, but page size is {page_size} \
+                     (host page size {host_page_size}); huge-page overlays are unsupported"
+                )));
+            }
+            // Presence is also only page-granular when the filesystem's allocation unit
+            // is <= the page size (true on ext4 with 4K blocks). On a larger-granularity
+            // FS (e.g. ZFS recordsize), SEEK_DATA would over-report clean pages as
+            // present and serve zeros for them — refuse rather than silently corrupt.
             let blksize = std::fs::metadata(&cfg.snapshot_path)
                 .map_err(InternalUffdError::OpenSnapshot)?
                 .blksize();
@@ -415,7 +427,13 @@ fn scan_present_pages(path: &Path, page_size: usize) -> std::io::Result<Presence
         // at or after `off`, or -1/ENXIO once no data remains.
         let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
         if data < 0 {
-            break; // ENXIO: no more data
+            let err = std::io::Error::last_os_error();
+            // ENXIO is the documented "no more data" signal; any other errno is a real
+            // failure that must not be mistaken for a fully-scanned (sparse) overlay.
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(err);
         }
         // SAFETY: same fd; SEEK_HOLE returns the next hole at or after `data`,
         // or EOF if the extent runs to the end of the file.
