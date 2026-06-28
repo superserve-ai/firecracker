@@ -1018,6 +1018,68 @@ mod tests {
     }
 
     #[test]
+    fn layered_src_ptr_serves_overlay_when_present_else_base() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let npages = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Base: a complete image, every page filled with 0xBB.
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; npages * ps]).unwrap();
+
+        // Overlay: full-size sparse file with only page 1 written (0xAA); the rest are
+        // holes — exactly the on-disk shape of a layered diff over the base above.
+        let ov_path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&ov_path).unwrap();
+        f.set_len((npages * ps) as u64).unwrap();
+        f.seek(SeekFrom::Start(ps as u64)).unwrap();
+        f.write_all(&vec![0xAAu8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let present = scan_present_pages(&ov_path, ps).unwrap();
+        let backing = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(present),
+        };
+
+        // The resolution that, if wrong, silently corrupts guest memory: a present page
+        // must come from the overlay; a hole must fall through to the base (serving it
+        // from the overlay would read it as a zero hole, not the base's real bytes).
+        let read = |pg: usize| -> u8 {
+            let p = backing.src_ptr((pg * ps) as u64, ps);
+            // SAFETY: `p` points at a mapped, readable page of `ps` bytes.
+            unsafe { *p }
+        };
+        assert_eq!(read(0), 0xBB, "hole page 0 must come from base");
+        assert_eq!(read(1), 0xAA, "present page 1 must come from overlay");
+        assert_eq!(read(2), 0xBB, "hole page 2 must come from base");
+        assert_eq!(read(3), 0xBB, "hole page 3 must come from base");
+    }
+
+    #[test]
+    fn monolithic_src_ptr_always_serves_overlay() {
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.snap");
+        std::fs::write(&path, vec![0x5Au8; 2 * ps]).unwrap();
+        // No base/present ⇒ single-file (monolithic) restore: every page from overlay.
+        // This is the backward-compat path — the layered loader is its superset.
+        let backing = Backing {
+            overlay: mmap_snapshot(&path).unwrap(),
+            base: None,
+            present: None,
+        };
+        for pg in 0..2 {
+            let p = backing.src_ptr((pg * ps) as u64, ps);
+            // SAFETY: `p` points at a mapped, readable page of `ps` bytes.
+            assert_eq!(unsafe { *p }, 0x5A);
+        }
+    }
+
+    #[test]
     fn recorder_writes_one_line_per_unique_offset_in_first_touch_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("access.log");

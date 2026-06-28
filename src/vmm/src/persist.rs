@@ -720,6 +720,8 @@ pub enum GuestMemoryFromUffdError {
     Send(#[from] vmm_sys_util::errno::Error),
     /// Failed to set up in-process UFFD handler: {0}
     InternalHandler(std::io::Error),
+    /// Layered restore overlay/base pairing is invalid (permanent — do not retry): {0}
+    LayeredInvalid(String),
 }
 
 fn guest_memory_from_uffd(
@@ -795,7 +797,10 @@ fn guest_memory_from_uffd_internal(
             GuestMemoryFromUffdError::InternalHandler(e)
         }
         crate::uffd_internal::InternalUffdError::LayeredInvalid(s) => {
-            GuestMemoryFromUffdError::InternalHandler(std::io::Error::other(s))
+            // Keep this distinct from InternalHandler (transient I/O): a bad
+            // overlay/base pairing never restores, so the caller must fall back to a
+            // Full restore rather than retry the layered path.
+            GuestMemoryFromUffdError::LayeredInvalid(s)
         }
     })?;
     Ok((guest_memory, Some(uffd), Some(handler)))
