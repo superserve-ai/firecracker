@@ -179,6 +179,8 @@ pub enum InternalUffdError {
     SpawnThread(std::io::Error),
     /// Invalid layered restore: {0}
     LayeredInvalid(String),
+    /// Failed to inspect filesystem for layered restore: {0}
+    LayeredSetup(std::io::Error),
 }
 
 /// Allocate anonymous guest memory, create + register a userfaultfd, and start a handler
@@ -231,46 +233,18 @@ pub fn setup(
     // out-of-bounds page source (or a handler-thread panic) at fault time.
     let (base, present) = match cfg.base_path.as_deref() {
         Some(base_path) => {
-            if (overlay.size as u64) < total_mem {
-                return Err(InternalUffdError::LayeredInvalid(format!(
-                    "overlay {:?} is {} bytes, smaller than guest RAM {}",
-                    cfg.snapshot_path, overlay.size, total_mem
-                )));
-            }
-            // Presence is page-granular only if the overlay was dumped at this
-            // page_size. `dump_dirty` writes dirtied pages at the host page size, so a
-            // huge-page guest (page_size > host) leaves a partially-dirty huge page as
-            // host-page data+hole extents while scan marks the whole huge page present —
-            // serving its clean host-page sub-ranges as overlay zeros. Refuse rather
-            // than silently corrupt; layered restore requires host-page granularity.
-            let host_page_size = crate::arch::host_page_size();
-            if page_size > host_page_size {
-                return Err(InternalUffdError::LayeredInvalid(format!(
-                    "layered restore needs host-page granularity, but page size is {page_size} \
-                     (host page size {host_page_size}); huge-page overlays are unsupported"
-                )));
-            }
-            // Presence is also only page-granular when the filesystem's allocation unit
-            // is <= the page size (true on ext4 with 4K blocks). On a larger-granularity
-            // FS (e.g. ZFS recordsize), SEEK_DATA would over-report clean pages as
-            // present and serve zeros for them — refuse rather than silently corrupt.
-            let blksize = std::fs::metadata(&cfg.snapshot_path)
-                .map_err(InternalUffdError::OpenSnapshot)?
-                .blksize();
-            if blksize > page_size as u64 {
-                return Err(InternalUffdError::LayeredInvalid(format!(
-                    "overlay {:?} is on a filesystem with block size {blksize} > page size {page_size}; \
-                     layered restore needs page-granular holes",
-                    cfg.snapshot_path
-                )));
-            }
             let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
-            if (base.size as u64) < total_mem {
-                return Err(InternalUffdError::LayeredInvalid(format!(
-                    "base {base_path:?} is {} bytes, smaller than guest RAM {total_mem}",
-                    base.size
-                )));
-            }
+            let blksize = std::fs::metadata(&cfg.snapshot_path)
+                .map_err(InternalUffdError::LayeredSetup)?
+                .blksize();
+            validate_layered(
+                overlay.size,
+                base.size,
+                total_mem,
+                page_size,
+                crate::arch::host_page_size(),
+                blksize,
+            )?;
             let present = scan_present_pages(&cfg.snapshot_path, page_size)
                 .map_err(InternalUffdError::OpenSnapshot)?;
             (Some(base), Some(present))
@@ -281,6 +255,7 @@ pub fn setup(
         overlay,
         base,
         present,
+        page_size,
     };
 
     // Recording disables prefetch so the captured trace reflects guest-driven access
@@ -435,6 +410,52 @@ impl PresenceBitmap {
     }
 }
 
+/// Validates the size and filesystem-granularity preconditions for a layered restore.
+/// Both layers must cover all guest RAM; the page size must not exceed the host page
+/// size (the overlay is dumped at host-page granularity); and the filesystem's
+/// allocation unit must be <= the page size so hole/data extents are page-granular.
+/// Each violation would otherwise silently serve wrong or zero pages, so it's a hard
+/// error. Pure (takes sizes, not files) so the reject paths are unit-testable.
+fn validate_layered(
+    overlay_size: usize,
+    base_size: usize,
+    total_mem: u64,
+    page_size: usize,
+    host_page_size: usize,
+    blksize: u64,
+) -> Result<(), InternalUffdError> {
+    if (overlay_size as u64) < total_mem {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "overlay is {overlay_size} bytes, smaller than guest RAM {total_mem}"
+        )));
+    }
+    if (base_size as u64) < total_mem {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "base is {base_size} bytes, smaller than guest RAM {total_mem}"
+        )));
+    }
+    // dump_dirty writes dirtied pages at the host page size, so a huge-page guest
+    // (page_size > host) would leave a partially-dirty huge page as host-page data+hole
+    // extents while the scan marks the whole huge page present — serving its clean
+    // sub-ranges as overlay zeros. Require host-page granularity.
+    if page_size > host_page_size {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "layered restore needs host-page granularity, but page size is {page_size} \
+             (host page size {host_page_size}); huge-page overlays are unsupported"
+        )));
+    }
+    // Presence is page-granular only when the filesystem's allocation unit is <= the
+    // page size (true on ext4 with 4K blocks). On a larger-granularity FS (e.g. ZFS
+    // recordsize), SEEK_DATA over-reports clean pages as present and serves zeros.
+    if blksize > page_size as u64 {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "overlay filesystem block size {blksize} > page size {page_size}; \
+             layered restore needs page-granular holes"
+        )));
+    }
+    Ok(())
+}
+
 /// Scan `path`'s allocated extents via `SEEK_DATA`/`SEEK_HOLE` and mark every page
 /// that overlaps real data. `dump_dirty` writes dirtied pages as real extents and
 /// leaves clean pages as holes (no zero-skip), so a present extent == an overlay
@@ -482,15 +503,25 @@ struct Backing {
     overlay: SnapshotMmap,
     base: Option<SnapshotMmap>,
     present: Option<PresenceBitmap>,
+    // Page size is fixed for the restore's lifetime; held here so src_ptr needn't be
+    // passed it on every fault.
+    page_size: usize,
 }
 
 impl Backing {
     /// Source pointer for the page at `file_offset`: the overlay if the page is
     /// present there (or there is no base), else the base. The two layers are the
     /// same logical size, so `file_offset` is in bounds for whichever is chosen.
-    fn src_ptr(&self, file_offset: u64, page_size: usize) -> *const u8 {
+    fn src_ptr(&self, file_offset: u64) -> *const u8 {
+        // setup() validates both mmaps cover all guest RAM and callers pass an in-region
+        // offset; assert it so any future misuse outside setup is caught in debug builds.
+        debug_assert!(
+            (file_offset as usize) < self.overlay.size,
+            "overlay offset out of bounds"
+        );
         if let (Some(base), Some(present)) = (&self.base, &self.present) {
-            let page_idx = (file_offset / page_size as u64) as usize;
+            debug_assert!((file_offset as usize) < base.size, "base offset out of bounds");
+            let page_idx = (file_offset / self.page_size as u64) as usize;
             if !present.is_set(page_idx) {
                 // SAFETY: file_offset < total guest mem size <= base mmap size.
                 return unsafe { base.addr.add(file_offset as usize) };
@@ -502,7 +533,8 @@ impl Backing {
 }
 
 /// Exit code used when an unexpected handler death aborts Firecracker (gated by
-/// `Config::abort_on_handler_death`). Distinct so the cause is clear in the logs.
+/// `Config::abort_on_handler_death`). 70 = EX_SOFTWARE (sysexits.h, "internal software
+/// error") — chosen so the cause is recognizable in logs/process monitoring.
 const UFFD_HANDLER_DEATH_EXIT_CODE: i32 = 70;
 
 /// How the handler loop ended. `Clean` is an intentional teardown (the orchestrator
@@ -819,8 +851,7 @@ fn prefetch_one(
     let dst = (region.base_host_virt_addr + page_offset_in_region) as *mut libc::c_void;
     // Layered: resolve the page to the overlay or base. `region.offset +
     // page_offset_in_region` is bounded by the region's file extent.
-    let src = backing.src_ptr(region.offset + page_offset_in_region, page_size)
-        as *const libc::c_void;
+    let src = backing.src_ptr(region.offset + page_offset_in_region) as *const libc::c_void;
     // SAFETY: same constraints as in `serve_pagefault` — src within snapshot mmap, dst
     // within a region registered with this UFFD.
     let res = unsafe { uffd.copy(src, dst, page_size, true) };
@@ -883,7 +914,7 @@ fn serve_pagefault(
     let offset = page_addr - region.base_host_virt_addr;
     // Layered: resolve the page to the overlay or base. `region.offset + offset` is
     // bounded above by `region.size`, so it is in bounds for either mmap.
-    let src = backing.src_ptr(region.offset + offset, page_size) as *const libc::c_void;
+    let src = backing.src_ptr(region.offset + offset) as *const libc::c_void;
     let dst = page_addr as *mut libc::c_void;
 
     // SAFETY: `src` is within the snapshot mmap; `dst` is within a region registered with
@@ -1083,13 +1114,14 @@ mod tests {
             overlay: mmap_snapshot(&ov_path).unwrap(),
             base: Some(mmap_snapshot(&base_path).unwrap()),
             present: Some(present),
+            page_size: ps,
         };
 
         // The resolution that, if wrong, silently corrupts guest memory: a present page
         // must come from the overlay; a hole must fall through to the base (serving it
         // from the overlay would read it as a zero hole, not the base's real bytes).
         let read = |pg: usize| -> u8 {
-            let p = backing.src_ptr((pg * ps) as u64, ps);
+            let p = backing.src_ptr((pg * ps) as u64);
             // SAFETY: `p` points at a mapped, readable page of `ps` bytes.
             unsafe { *p }
         };
@@ -1111,12 +1143,110 @@ mod tests {
             overlay: mmap_snapshot(&path).unwrap(),
             base: None,
             present: None,
+            page_size: ps,
         };
         for pg in 0..2 {
-            let p = backing.src_ptr((pg * ps) as u64, ps);
+            let p = backing.src_ptr((pg * ps) as u64);
             // SAFETY: `p` points at a mapped, readable page of `ps` bytes.
             assert_eq!(unsafe { *p }, 0x5A);
         }
+    }
+
+    #[test]
+    fn validate_layered_rejects_bad_preconditions() {
+        let ps = 4096usize;
+        let total = (4 * ps) as u64; // 4 pages of guest RAM
+        let bad = |r: Result<(), InternalUffdError>| matches!(r, Err(InternalUffdError::LayeredInvalid(_)));
+
+        // Happy path: both layers cover RAM, host-page granularity, small blocks.
+        assert!(validate_layered(4 * ps, 4 * ps, total, ps, ps, ps as u64).is_ok());
+
+        // Overlay too small.
+        assert!(bad(validate_layered(2 * ps, 4 * ps, total, ps, ps, ps as u64)));
+        // Base too small.
+        assert!(bad(validate_layered(4 * ps, 2 * ps, total, ps, ps, ps as u64)));
+        // Huge-page guest (page_size > host page size) — would serve clean sub-pages as zeros.
+        assert!(bad(validate_layered(4 * ps, 4 * ps, total, 2 * 1024 * 1024, ps, ps as u64)));
+        // Filesystem block size larger than the page — holes wouldn't be page-granular.
+        assert!(bad(validate_layered(4 * ps, 4 * ps, total, ps, ps, (ps * 16) as u64)));
+    }
+
+    #[test]
+    fn serve_pagefault_copies_overlay_when_present_else_base() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let npages = 4usize;
+        let total = npages * ps;
+
+        // A user-mode-only uffd needs no privileges for self-registered anon memory, but
+        // some kernels gate even that (vm.unprivileged_userfaultfd=0). Skip if unavailable
+        // rather than fail spuriously — this still exercises the real copy path where it can.
+        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping serve_pagefault test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+
+        // "Guest memory": an anon region registered MISSING so the first touch faults.
+        // SAFETY: standard anonymous mmap of `total` bytes; checked against MAP_FAILED.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+        uffd.register(mem, total).expect("register region");
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; total]).unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&ov_path).unwrap();
+        f.set_len(total as u64).unwrap();
+        f.seek(SeekFrom::Start(ps as u64)).unwrap(); // page 1 only
+        f.write_all(&vec![0xAAu8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let backing = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(scan_present_pages(&ov_path, ps).unwrap()),
+            page_size: ps,
+        };
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: mem as u64,
+            size: total,
+            offset: 0,
+            page_size: ps,
+            page_size_kib: ps,
+        }];
+
+        // Serve each page through the real UFFDIO_COPY path, then read the now-installed
+        // guest page back: present page from the overlay (0xAA), holes from base (0xBB).
+        for pg in 0..npages {
+            let addr = mem as u64 + (pg * ps) as u64;
+            assert_eq!(
+                serve_pagefault(&uffd, &mappings, &backing, ps, addr),
+                ServeOutcome::Served,
+                "serve page {pg}"
+            );
+            // SAFETY: the page at `addr` was just installed by UFFDIO_COPY.
+            let got = unsafe { *(addr as *const u8) };
+            let want = if pg == 1 { 0xAA } else { 0xBB };
+            assert_eq!(got, want, "page {pg}");
+        }
+
+        // SAFETY: unmap the region we mapped above.
+        unsafe { libc::munmap(mem, total) };
     }
 
     #[test]
