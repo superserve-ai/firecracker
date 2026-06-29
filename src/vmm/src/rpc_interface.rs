@@ -1283,6 +1283,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_backend: MemBackendConfig {
                     base_path: None,
+                    lower_overlay_paths: Vec::new(),
                     backend_type: MemBackendType::File,
                     abort_on_handler_death: false,
                     backend_path: PathBuf::new(),

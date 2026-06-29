@@ -633,6 +633,7 @@ pub fn restore_from_snapshot(
             guest_memory_from_uffd_internal(
                 mem_backend_path,
                 params.mem_backend.base_path.as_deref(),
+                params.mem_backend.lower_overlay_paths.clone(),
                 params.mem_backend.access_log_path.as_deref(),
                 params.mem_backend.record_to.as_deref(),
                 params.mem_backend.abort_on_handler_death,
@@ -762,6 +763,7 @@ fn guest_memory_from_uffd(
 fn guest_memory_from_uffd_internal(
     snapshot_path: &Path,
     base_path: Option<&Path>,
+    lower_overlay_paths: Vec<std::path::PathBuf>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
     abort_on_handler_death: bool,
@@ -780,6 +782,7 @@ fn guest_memory_from_uffd_internal(
     let cfg = crate::uffd_internal::config_from_paths(
         snapshot_path,
         base_path,
+        lower_overlay_paths,
         access_log_path,
         record_to,
         abort_on_handler_death,

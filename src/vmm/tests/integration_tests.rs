@@ -294,6 +294,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -442,6 +443,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -550,6 +552,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -872,6 +875,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_backend: MemBackendConfig {
             base_path: None,
+            lower_overlay_paths: Vec::new(),
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
             abort_on_handler_death: false,

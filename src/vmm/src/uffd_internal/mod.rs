@@ -92,12 +92,18 @@ impl Stats {
 /// Configuration for an internal-UFFD-backed restore.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Snapshot memory file backing guest RAM. In layered mode this is the overlay
-    /// (diff) file; pages absent from it are served from `base_path`.
+    /// Snapshot memory file backing guest RAM. In layered mode this is the newest
+    /// overlay (diff) file; pages absent from it (and from any `lower_overlay_paths`)
+    /// are served from `base_path`.
     pub snapshot_path: PathBuf,
-    /// Base (template) memory file. When set, the restore is layered: a page is
-    /// served from `snapshot_path` if present there, else from this base.
+    /// Base (template) memory file. When set, the restore is layered: a page is served
+    /// from the newest overlay that owns it (`snapshot_path`, then `lower_overlay_paths`
+    /// newest-first), else from this base.
     pub base_path: Option<PathBuf>,
+    /// Intermediate overlay (diff) files between the base and `snapshot_path`, ordered
+    /// oldest → newest. Empty for a single-overlay or monolithic restore. Only meaningful
+    /// with a `base_path` — the chain is `base → lower_overlay_paths… → snapshot_path`.
+    pub lower_overlay_paths: Vec<PathBuf>,
     /// Recorded page-access trace replayed as prefetch when present.
     pub access_log_path: Option<PathBuf>,
     /// When set, the handler records each served page offset and suppresses prefetch.
@@ -226,37 +232,10 @@ pub fn setup(
     }
 
     let total_mem = offset; // sum of region sizes = total guest RAM
-    let overlay = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
-    // Layered restore: mmap the base (template) and scan the overlay's extents so a
-    // page absent from the overlay falls through to the base. Validate sizes up front
-    // so a malformed/short file fails the restore loudly instead of risking an
+    // Build + validate the layer chain (monolithic, single-overlay, or base+diffs) up
+    // front, so a malformed/short file fails the restore loudly instead of risking an
     // out-of-bounds page source (or a handler-thread panic) at fault time.
-    let (base, present) = match cfg.base_path.as_deref() {
-        Some(base_path) => {
-            let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
-            let blksize = std::fs::metadata(&cfg.snapshot_path)
-                .map_err(InternalUffdError::LayeredSetup)?
-                .blksize();
-            validate_layered(
-                overlay.size,
-                base.size,
-                total_mem,
-                page_size,
-                crate::arch::host_page_size(),
-                blksize,
-            )?;
-            let present = scan_present_pages(&cfg.snapshot_path, page_size)
-                .map_err(InternalUffdError::LayeredSetup)?;
-            (Some(base), Some(present))
-        }
-        None => (None, None),
-    };
-    let backing = Backing {
-        overlay,
-        base,
-        present,
-        page_size,
-    };
+    let backing = build_backing(&cfg, total_mem, page_size)?;
 
     // Recording disables prefetch so the captured trace reflects guest-driven access
     // order instead of pages pulled in by the prefetcher.
@@ -410,18 +389,36 @@ impl PresenceBitmap {
     }
 }
 
-/// Validates the size and filesystem-granularity preconditions for a layered restore.
-/// Both layers must cover all guest RAM; the page size must not exceed the host page
-/// size (the overlay is dumped at host-page granularity); and the filesystem's
-/// allocation unit must be <= the page size so hole/data extents are page-granular.
-/// Each violation would otherwise silently serve wrong or zero pages, so it's a hard
-/// error. Pure (takes sizes, not files) so the reject paths are unit-testable.
-fn validate_layered(
-    overlay_size: usize,
-    base_size: usize,
-    total_mem: u64,
+/// Restore-wide precondition for any layered restore: the guest page size must not exceed
+/// the host page size. `dump_dirty` writes dirtied pages at the host page size, so a
+/// huge-page guest (page_size > host) would leave a partially-dirty huge page as host-page
+/// data+hole extents while the scan marks the whole huge page present — serving its clean
+/// sub-ranges as overlay zeros. Checked once per restore (it is a property of the guest
+/// config, not of any one overlay file). Pure so the reject path is unit-testable.
+fn validate_guest_page_size(
     page_size: usize,
     host_page_size: usize,
+) -> Result<(), InternalUffdError> {
+    if page_size > host_page_size {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "layered restore needs host-page granularity, but page size is {page_size} \
+             (host page size {host_page_size}); huge-page overlays are unsupported"
+        )));
+    }
+    Ok(())
+}
+
+/// Per-overlay precondition, enforced for **every** overlay in the chain: the overlay must
+/// cover all guest RAM, and its filesystem's allocation unit must be <= the page size so
+/// SEEK_DATA/SEEK_HOLE data/hole extents are page-granular. On a larger-granularity FS
+/// (e.g. ZFS recordsize), SEEK_DATA over-reports clean pages as present and serves zeros;
+/// an over-reporting scan on any single layer would shadow a page owned by another layer.
+/// Each violation would silently serve wrong or zero pages, so it's a hard error. Pure
+/// (takes the size, not the file) so the reject paths are unit-testable.
+fn validate_overlay(
+    overlay_size: usize,
+    total_mem: u64,
+    page_size: usize,
     blksize: u64,
 ) -> Result<(), InternalUffdError> {
     if (overlay_size as u64) < total_mem {
@@ -429,24 +426,6 @@ fn validate_layered(
             "overlay is {overlay_size} bytes, smaller than guest RAM {total_mem}"
         )));
     }
-    if (base_size as u64) < total_mem {
-        return Err(InternalUffdError::LayeredInvalid(format!(
-            "base is {base_size} bytes, smaller than guest RAM {total_mem}"
-        )));
-    }
-    // dump_dirty writes dirtied pages at the host page size, so a huge-page guest
-    // (page_size > host) would leave a partially-dirty huge page as host-page data+hole
-    // extents while the scan marks the whole huge page present — serving its clean
-    // sub-ranges as overlay zeros. Require host-page granularity.
-    if page_size > host_page_size {
-        return Err(InternalUffdError::LayeredInvalid(format!(
-            "layered restore needs host-page granularity, but page size is {page_size} \
-             (host page size {host_page_size}); huge-page overlays are unsupported"
-        )));
-    }
-    // Presence is page-granular only when the filesystem's allocation unit is <= the
-    // page size (true on ext4 with 4K blocks). On a larger-granularity FS (e.g. ZFS
-    // recordsize), SEEK_DATA over-reports clean pages as present and serves zeros.
     if blksize > page_size as u64 {
         return Err(InternalUffdError::LayeredInvalid(format!(
             "overlay filesystem block size {blksize} > page size {page_size}; \
@@ -496,40 +475,148 @@ fn scan_present_pages(path: &Path, page_size: usize) -> std::io::Result<Presence
     Ok(pm)
 }
 
-/// The memory backing a layered (or single-file) restore. `overlay` is the file
-/// named by `Config::snapshot_path`; in layered mode `base` + `present` resolve
-/// pages absent from the overlay to the template.
-struct Backing {
-    overlay: SnapshotMmap,
-    base: Option<SnapshotMmap>,
+/// One layer of a restore's memory image. `present` selects which pages this layer
+/// owns: `Some(bitmap)` ⇒ a diff overlay that owns only the pages its presence bitmap
+/// marks; `None` ⇒ a full image (the base template, or a monolithic snapshot) that owns
+/// every page. Layers are held base-first (oldest) → newest in [`Backing`].
+struct Layer {
+    mmap: SnapshotMmap,
     present: Option<PresenceBitmap>,
+}
+
+impl Layer {
+    /// Whether this layer owns the page at `page_idx`. A full image (`present == None`)
+    /// owns every page; a diff overlay owns only the pages its presence bitmap marks.
+    fn owns(&self, page_idx: usize) -> bool {
+        match &self.present {
+            Some(p) => p.is_set(page_idx),
+            None => true,
+        }
+    }
+}
+
+/// The memory backing a restore: an ordered chain of one or more layers, base-first
+/// (oldest) → newest. The bottom layer is always a full image (`present == None`), so
+/// page resolution always terminates. A monolithic restore is a single full-image layer;
+/// a layered restore is `base → diff₁ → … → diffₙ`, the base full and each diff a
+/// presence-gated overlay. The single-overlay case (one base + one diff) is just a chain
+/// of length two — the layered loader is a strict superset of the monolithic path.
+struct Backing {
+    /// Base-first (oldest) → newest. Invariant (guaranteed by `build_backing`): non-empty,
+    /// and `layers[0].present == None` (a full image), so every page resolves.
+    layers: Vec<Layer>,
     // Page size is fixed for the restore's lifetime; held here so src_ptr needn't be
     // passed it on every fault.
     page_size: usize,
 }
 
 impl Backing {
-    /// Source pointer for the page at `file_offset`: the overlay if the page is
-    /// present there (or there is no base), else the base. The two layers are the
-    /// same logical size, so `file_offset` is in bounds for whichever is chosen.
+    /// Source pointer for the page at `file_offset`: the newest layer that owns the page.
+    /// All layers are the same logical size (validated at setup), so `file_offset` is in
+    /// bounds for whichever is chosen; the base-first bottom layer owns every page, so the
+    /// walk always resolves.
     fn src_ptr(&self, file_offset: u64) -> *const u8 {
-        // setup() validates both mmaps cover all guest RAM and callers pass an in-region
-        // offset; assert it so any future misuse outside setup is caught in debug builds.
-        debug_assert!(
-            (file_offset as usize) < self.overlay.size,
-            "overlay offset out of bounds"
-        );
-        if let (Some(base), Some(present)) = (&self.base, &self.present) {
-            debug_assert!((file_offset as usize) < base.size, "base offset out of bounds");
-            let page_idx = (file_offset / self.page_size as u64) as usize;
-            if !present.is_set(page_idx) {
-                // SAFETY: file_offset < total guest mem size <= base mmap size.
-                return unsafe { base.addr.add(file_offset as usize) };
+        let page_idx = (file_offset / self.page_size as u64) as usize;
+        // Walk newest → oldest; the first layer that owns the page wins. The bottom (base)
+        // layer owns all pages, so the loop always finds an owner.
+        for layer in self.layers.iter().rev() {
+            if layer.owns(page_idx) {
+                debug_assert!(
+                    (file_offset as usize) < layer.mmap.size,
+                    "layer offset out of bounds"
+                );
+                // SAFETY: file_offset < total guest mem size <= this layer's mmap size
+                // (setup validates every layer covers all guest RAM).
+                return unsafe { layer.mmap.addr.add(file_offset as usize) };
             }
         }
-        // SAFETY: file_offset < total guest mem size <= overlay mmap size.
-        unsafe { self.overlay.addr.add(file_offset as usize) }
+        // Unreachable while the base-full-image invariant holds. Serve from the bottom
+        // layer rather than panic on the handler thread (a panic would hang the VM) if a
+        // future change ever violates it.
+        debug_assert!(
+            false,
+            "no layer owns page {page_idx}; base-full-image invariant violated"
+        );
+        // SAFETY: layers is non-empty (build_backing guarantees) and layers[0] covers all
+        // guest RAM.
+        unsafe { self.layers[0].mmap.addr.add(file_offset as usize) }
     }
+}
+
+/// Build the layered (or monolithic) [`Backing`] for a restore, validating every layer up
+/// front so a malformed/short file fails the restore loudly instead of risking an
+/// out-of-bounds page source (or a handler-thread panic) at fault time.
+///
+/// - **Monolithic** (`base_path` unset): a single full-image layer = `snapshot_path`. Any
+///   `lower_overlay_paths` is rejected — a chain needs a base to fall through to.
+/// - **Layered** (`base_path` set): `base → lower_overlay_paths… → snapshot_path`, the base
+///   a full image and every overlay a presence-gated diff. The guest page size is checked
+///   once; each overlay is size/granularity-validated and extent-scanned independently,
+///   since an over-reporting scan on any one layer would shadow a page owned by another.
+fn build_backing(
+    cfg: &Config,
+    total_mem: u64,
+    page_size: usize,
+) -> Result<Backing, InternalUffdError> {
+    let Some(base_path) = cfg.base_path.as_deref() else {
+        // Monolithic restore: one full-image layer, no presence bitmap. lower_overlay_paths
+        // is meaningless without a base to fall through to — reject rather than silently
+        // ignore, so a miswired chain fails loudly.
+        if !cfg.lower_overlay_paths.is_empty() {
+            return Err(InternalUffdError::LayeredInvalid(
+                "lower_overlay_paths set without a base_path; a layer chain needs a base".into(),
+            ));
+        }
+        let mmap = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
+        return Ok(Backing {
+            layers: vec![Layer { mmap, present: None }],
+            page_size,
+        });
+    };
+
+    // Layered restore. The base is the bottom full image; every overlay above it is a diff.
+    validate_guest_page_size(page_size, crate::arch::host_page_size())?;
+    let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
+    if (base.size as u64) < total_mem {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "base is {} bytes, smaller than guest RAM {total_mem}",
+            base.size
+        )));
+    }
+
+    let mut layers = Vec::with_capacity(cfg.lower_overlay_paths.len() + 2);
+    layers.push(Layer {
+        mmap: base,
+        present: None,
+    });
+
+    // Overlays oldest → newest: the intermediate lower overlays, then snapshot_path (the
+    // newest). Each is size/granularity-validated and extent-scanned the same way.
+    let overlay_paths = cfg
+        .lower_overlay_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(cfg.snapshot_path.as_path()));
+    for overlay_path in overlay_paths {
+        let mmap = mmap_snapshot(overlay_path).map_err(InternalUffdError::OpenSnapshot)?;
+        let blksize = std::fs::metadata(overlay_path)
+            .map_err(InternalUffdError::LayeredSetup)?
+            .blksize();
+        validate_overlay(mmap.size, total_mem, page_size, blksize)?;
+        let present =
+            scan_present_pages(overlay_path, page_size).map_err(InternalUffdError::LayeredSetup)?;
+        layers.push(Layer {
+            mmap,
+            present: Some(present),
+        });
+    }
+
+    log::info!(
+        "uffd-internal: layered restore, {} layer(s) (base + {} overlay(s))",
+        layers.len(),
+        layers.len() - 1
+    );
+    Ok(Backing { layers, page_size })
 }
 
 /// Exit code used when an unexpected handler death aborts Firecracker (gated by
@@ -1034,6 +1121,7 @@ fn load_prefetch_offsets(path: &Path, page_size: usize) -> Vec<u64> {
 pub fn config_from_paths(
     snapshot_path: &Path,
     base_path: Option<&Path>,
+    lower_overlay_paths: Vec<PathBuf>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
     abort_on_handler_death: bool,
@@ -1041,6 +1129,7 @@ pub fn config_from_paths(
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
         base_path: base_path.map(Path::to_path_buf),
+        lower_overlay_paths,
         access_log_path: access_log_path.map(Path::to_path_buf),
         record_to: record_to.map(Path::to_path_buf),
         abort_on_handler_death,
@@ -1111,9 +1200,16 @@ mod tests {
 
         let present = scan_present_pages(&ov_path, ps).unwrap();
         let backing = Backing {
-            overlay: mmap_snapshot(&ov_path).unwrap(),
-            base: Some(mmap_snapshot(&base_path).unwrap()),
-            present: Some(present),
+            layers: vec![
+                Layer {
+                    mmap: mmap_snapshot(&base_path).unwrap(),
+                    present: None,
+                },
+                Layer {
+                    mmap: mmap_snapshot(&ov_path).unwrap(),
+                    present: Some(present),
+                },
+            ],
             page_size: ps,
         };
 
@@ -1140,9 +1236,10 @@ mod tests {
         // No base/present ⇒ single-file (monolithic) restore: every page from overlay.
         // This is the backward-compat path — the layered loader is its superset.
         let backing = Backing {
-            overlay: mmap_snapshot(&path).unwrap(),
-            base: None,
-            present: None,
+            layers: vec![Layer {
+                mmap: mmap_snapshot(&path).unwrap(),
+                present: None,
+            }],
             page_size: ps,
         };
         for pg in 0..2 {
@@ -1153,22 +1250,139 @@ mod tests {
     }
 
     #[test]
-    fn validate_layered_rejects_bad_preconditions() {
+    fn validate_guest_page_size_rejects_huge_pages() {
+        let ps = 4096usize;
+        // Host-page granularity is fine.
+        assert!(validate_guest_page_size(ps, ps).is_ok());
+        // A huge-page guest (page_size > host) would serve the clean sub-pages of a
+        // partially dirty huge page as overlay zeros — hard error.
+        assert!(matches!(
+            validate_guest_page_size(2 * 1024 * 1024, ps),
+            Err(InternalUffdError::LayeredInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_overlay_rejects_bad_preconditions() {
         let ps = 4096usize;
         let total = (4 * ps) as u64; // 4 pages of guest RAM
-        let bad = |r: Result<(), InternalUffdError>| matches!(r, Err(InternalUffdError::LayeredInvalid(_)));
+        let bad =
+            |r: Result<(), InternalUffdError>| matches!(r, Err(InternalUffdError::LayeredInvalid(_)));
 
-        // Happy path: both layers cover RAM, host-page granularity, small blocks.
-        assert!(validate_layered(4 * ps, 4 * ps, total, ps, ps, ps as u64).is_ok());
-
-        // Overlay too small.
-        assert!(bad(validate_layered(2 * ps, 4 * ps, total, ps, ps, ps as u64)));
-        // Base too small.
-        assert!(bad(validate_layered(4 * ps, 2 * ps, total, ps, ps, ps as u64)));
-        // Huge-page guest (page_size > host page size) — would serve clean sub-pages as zeros.
-        assert!(bad(validate_layered(4 * ps, 4 * ps, total, 2 * 1024 * 1024, ps, ps as u64)));
+        // Happy path: overlay covers RAM with page-granular blocks.
+        assert!(validate_overlay(4 * ps, total, ps, ps as u64).is_ok());
+        // Overlay too small to cover guest RAM.
+        assert!(bad(validate_overlay(2 * ps, total, ps, ps as u64)));
         // Filesystem block size larger than the page — holes wouldn't be page-granular.
-        assert!(bad(validate_layered(4 * ps, 4 * ps, total, ps, ps, (ps * 16) as u64)));
+        assert!(bad(validate_overlay(4 * ps, total, ps, (ps * 16) as u64)));
+    }
+
+    /// Build a full-size sparse overlay with `data_pages` written (non-zero) and the rest
+    /// left as holes — the on-disk shape `dump_dirty` produces for a diff.
+    fn write_sparse_overlay(path: &Path, npages: usize, page_size: usize, data_pages: &[(usize, u8)]) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::File::create(path).unwrap();
+        f.set_len((npages * page_size) as u64).unwrap();
+        for &(pg, byte) in data_pages {
+            f.seek(SeekFrom::Start((pg * page_size) as u64)).unwrap();
+            f.write_all(&vec![byte; page_size]).unwrap();
+        }
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn backing_resolves_newest_layer_first_then_falls_through_to_base() {
+        let ps = 4096usize;
+        let npages = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+
+        // base: full image, every page 0xBB.
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; npages * ps]).unwrap();
+        // diff1 (older): pages 1 and 2 written 0x11.
+        let d1 = dir.path().join("mem.diff.1");
+        write_sparse_overlay(&d1, npages, ps, &[(1, 0x11), (2, 0x11)]);
+        // diff2 (newest): page 2 written 0x22.
+        let d2 = dir.path().join("mem.diff.2");
+        write_sparse_overlay(&d2, npages, ps, &[(2, 0x22)]);
+
+        let backing = Backing {
+            layers: vec![
+                Layer {
+                    mmap: mmap_snapshot(&base_path).unwrap(),
+                    present: None,
+                },
+                Layer {
+                    mmap: mmap_snapshot(&d1).unwrap(),
+                    present: Some(scan_present_pages(&d1, ps).unwrap()),
+                },
+                Layer {
+                    mmap: mmap_snapshot(&d2).unwrap(),
+                    present: Some(scan_present_pages(&d2, ps).unwrap()),
+                },
+            ],
+            page_size: ps,
+        };
+        // SAFETY: src_ptr returns a pointer into a mapped, readable page of `ps` bytes.
+        let read = |pg: usize| -> u8 { unsafe { *backing.src_ptr((pg * ps) as u64) } };
+        assert_eq!(read(0), 0xBB, "page 0: no overlay owns it → base");
+        assert_eq!(read(1), 0x11, "page 1: only diff1 owns it → diff1");
+        assert_eq!(read(2), 0x22, "page 2: both diffs own it → newest (diff2) wins");
+        assert_eq!(read(3), 0xBB, "page 3: no overlay owns it → base");
+    }
+
+    #[test]
+    fn build_backing_rejects_lower_overlays_without_base() {
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("mem.snap");
+        std::fs::write(&snap, vec![0u8; 2 * ps]).unwrap();
+        let lower = dir.path().join("mem.diff.1");
+        std::fs::write(&lower, vec![0u8; 2 * ps]).unwrap();
+        let cfg = Config {
+            snapshot_path: snap,
+            base_path: None,
+            lower_overlay_paths: vec![lower],
+            access_log_path: None,
+            record_to: None,
+            abort_on_handler_death: false,
+        };
+        // A chain needs a base to fall through to; lower overlays without one is a config
+        // error, not a silent ignore.
+        assert!(matches!(
+            build_backing(&cfg, (2 * ps) as u64, ps),
+            Err(InternalUffdError::LayeredInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn build_backing_builds_and_resolves_base_diff_chain() {
+        let ps = 4096usize;
+        let npages = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; npages * ps]).unwrap();
+        let d1 = dir.path().join("mem.diff.1");
+        write_sparse_overlay(&d1, npages, ps, &[(1, 0x11)]);
+        let snap = dir.path().join("mem.diff.2");
+        write_sparse_overlay(&snap, npages, ps, &[(2, 0x22)]);
+
+        let cfg = Config {
+            snapshot_path: snap,
+            base_path: Some(base_path),
+            lower_overlay_paths: vec![d1],
+            access_log_path: None,
+            record_to: None,
+            abort_on_handler_death: false,
+        };
+        let backing = build_backing(&cfg, (npages * ps) as u64, ps).unwrap();
+        assert_eq!(backing.layers.len(), 3, "base + 2 overlays");
+        // SAFETY: src_ptr returns a pointer into a mapped, readable page of `ps` bytes.
+        let read = |pg: usize| -> u8 { unsafe { *backing.src_ptr((pg * ps) as u64) } };
+        assert_eq!(read(0), 0xBB);
+        assert_eq!(read(1), 0x11);
+        assert_eq!(read(2), 0x22);
+        assert_eq!(read(3), 0xBB);
     }
 
     #[test]
@@ -1216,9 +1430,16 @@ mod tests {
         drop(f);
 
         let backing = Backing {
-            overlay: mmap_snapshot(&ov_path).unwrap(),
-            base: Some(mmap_snapshot(&base_path).unwrap()),
-            present: Some(scan_present_pages(&ov_path, ps).unwrap()),
+            layers: vec![
+                Layer {
+                    mmap: mmap_snapshot(&base_path).unwrap(),
+                    present: None,
+                },
+                Layer {
+                    mmap: mmap_snapshot(&ov_path).unwrap(),
+                    present: Some(scan_present_pages(&ov_path, ps).unwrap()),
+                },
+            ],
             page_size: ps,
         };
         #[allow(deprecated)]

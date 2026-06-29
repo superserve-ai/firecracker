@@ -142,6 +142,12 @@ pub struct MemBackendConfig {
     /// meaningful for `UffdInternal`; ignored otherwise.
     #[serde(default)]
     pub base_path: Option<PathBuf>,
+    /// Intermediate overlay (diff) files between `base_path` and `backend_path`, ordered
+    /// oldest → newest, for a multi-layer `UffdInternal` restore. Empty for a single-overlay
+    /// or monolithic restore. Only meaningful for `UffdInternal` with `base_path` set;
+    /// ignored otherwise.
+    #[serde(default)]
+    pub lower_overlay_paths: Vec<PathBuf>,
     /// When true, an unexpected `UffdInternal` handler death aborts Firecracker instead
     /// of leaving the guest to freeze on its next page fault. Only meaningful for
     /// `UffdInternal`; ignored otherwise. Defaults to false (opt-in).

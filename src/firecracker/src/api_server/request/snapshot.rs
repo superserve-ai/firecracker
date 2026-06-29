@@ -100,6 +100,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 access_log_path: None,
                 record_to: None,
             }
@@ -191,6 +192,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -226,6 +228,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -261,6 +264,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 abort_on_handler_death: false,
@@ -302,6 +306,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 abort_on_handler_death: false,
@@ -337,6 +342,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
