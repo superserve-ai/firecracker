@@ -92,17 +92,14 @@ impl Stats {
 /// Configuration for an internal-UFFD-backed restore.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Snapshot memory file backing guest RAM. In layered mode this is the newest
-    /// overlay (diff) file; pages absent from it (and from any `lower_overlay_paths`)
-    /// are served from `base_path`.
+    /// Snapshot memory file backing guest RAM; in layered mode the newest overlay.
     pub snapshot_path: PathBuf,
-    /// Base (template) memory file. When set, the restore is layered: a page is served
-    /// from the newest overlay that owns it (`snapshot_path`, then `lower_overlay_paths`
-    /// newest-first), else from this base.
+    /// Base (template) memory file. Set ⇒ layered restore (see `lower_overlay_paths`).
     pub base_path: Option<PathBuf>,
-    /// Intermediate overlay (diff) files between the base and `snapshot_path`, ordered
-    /// oldest → newest. Empty for a single-overlay or monolithic restore. Only meaningful
-    /// with a `base_path` — the chain is `base → lower_overlay_paths… → snapshot_path`.
+    /// Intermediate overlay (diff) files, ordered oldest → newest; empty for a
+    /// single-overlay or monolithic restore. Only meaningful with `base_path` — the chain
+    /// is `base → lower_overlay_paths… → snapshot_path`, resolved newest-overlay-wins,
+    /// falling through to the base.
     pub lower_overlay_paths: Vec<PathBuf>,
     /// Recorded page-access trace replayed as prefetch when present.
     pub access_log_path: Option<PathBuf>,
@@ -495,12 +492,10 @@ impl Layer {
     }
 }
 
-/// The memory backing a restore: an ordered chain of one or more layers, base-first
-/// (oldest) → newest. The bottom layer is always a full image (`present == None`), so
-/// page resolution always terminates. A monolithic restore is a single full-image layer;
-/// a layered restore is `base → diff₁ → … → diffₙ`, the base full and each diff a
-/// presence-gated overlay. The single-overlay case (one base + one diff) is just a chain
-/// of length two — the layered loader is a strict superset of the monolithic path.
+/// The memory backing a restore: an ordered chain of layers, base-first (oldest) →
+/// newest. The bottom layer is always a full image (`present == None`), so resolution
+/// always terminates. Monolithic = one full-image layer; layered = `base → diffₙ…`. So
+/// the layered loader is a strict superset of the monolithic path. (See `build_backing`.)
 struct Backing {
     /// Base-first (oldest) → newest. Invariant (guaranteed by `build_backing`): non-empty,
     /// and `layers[0].present == None` (a full image), so every page resolves.
@@ -543,16 +538,12 @@ impl Backing {
     }
 }
 
-/// Build the layered (or monolithic) [`Backing`] for a restore, validating every layer up
-/// front so a malformed/short file fails the restore loudly instead of risking an
-/// out-of-bounds page source (or a handler-thread panic) at fault time.
-///
-/// - **Monolithic** (`base_path` unset): a single full-image layer = `snapshot_path`. Any
-///   `lower_overlay_paths` is rejected — a chain needs a base to fall through to.
-/// - **Layered** (`base_path` set): `base → lower_overlay_paths… → snapshot_path`, the base
-///   a full image and every overlay a presence-gated diff. The guest page size is checked
-///   once; each overlay is size/granularity-validated and extent-scanned independently,
-///   since an over-reporting scan on any one layer would shadow a page owned by another.
+/// Build the layered (or monolithic) [`Backing`], validating every layer up front so a
+/// malformed/short file fails loudly rather than risking an out-of-bounds source (or
+/// handler-thread panic) at fault time. No `base_path` ⇒ monolithic (one full image;
+/// `lower_overlay_paths` must be empty — a chain needs a base). With a base, each overlay
+/// is size/granularity-validated and extent-scanned **independently**, since an
+/// over-reporting scan on any one layer would shadow a page owned by another.
 fn build_backing(
     cfg: &Config,
     total_mem: u64,
