@@ -278,6 +278,7 @@ mod tests {
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
                 flatten: false,
+                async_snapshot: false,
             })),
             start_time_us,
         );
@@ -293,6 +294,7 @@ mod tests {
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
                 flatten: false,
+                async_snapshot: false,
             })),
             start_time_us,
         );

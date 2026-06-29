@@ -61,6 +61,12 @@ pub struct CreateSnapshotParams {
     /// Requires `block_delta_dir`.
     #[serde(default)]
     pub flatten: bool,
+    /// If true (and `snapshot_type` is `Diff`), write the memory diff on a background
+    /// thread and return at the snapshot point; confirm durability with
+    /// `PUT /snapshot/complete`. The vCPUs must stay paused until then. Ignored for
+    /// `Full` snapshots.
+    #[serde(default)]
+    pub async_snapshot: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

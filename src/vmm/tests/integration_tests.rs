@@ -233,6 +233,7 @@ fn verify_create_snapshot(
         mem_file_path: memory_file.as_path().to_path_buf(),
         block_delta_dir: None,
         flatten: false,
+        async_snapshot: false,
     };
 
     controller
@@ -402,6 +403,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         mem_file_path: memory_file.as_path().to_path_buf(),
         block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
         flatten: true,
+        async_snapshot: false,
     };
     controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -510,6 +512,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             mem_file_path: memory_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
+            async_snapshot: false,
         }))
         .expect("flatten snapshot");
 
@@ -597,6 +600,7 @@ fn flatten_snapshot_expect_overlay_err(
             mem_file_path: mem_path,
             block_delta_dir: Some(delta_dir),
             flatten: true,
+            async_snapshot: false,
         }))
         .expect_err("expected overlay error from flatten");
     match err {
@@ -760,6 +764,7 @@ fn test_flatten_skips_non_overlay_device() {
             mem_file_path: mem_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
+            async_snapshot: false,
         }))
         .expect("flatten must succeed even with a non-overlay drive in the mix");
 
@@ -790,6 +795,7 @@ fn test_create_snapshot_flatten_requires_delta_dir() {
         mem_file_path: std::path::PathBuf::from("/this/should/never/be/written.mem"),
         block_delta_dir: None,
         flatten: true,
+        async_snapshot: false,
     };
     let err = controller
         .handle_request(VmmAction::CreateSnapshot(params))

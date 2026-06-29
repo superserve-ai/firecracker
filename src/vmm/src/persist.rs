@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -166,6 +168,8 @@ pub enum CreateSnapshotError {
     FlattenOverlays(
         crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
     ),
+    /// Async background memory write failed: {0}
+    AsyncBackgroundWrite(crate::snapshot::background_writer::BackgroundWriteError),
 }
 
 /// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
@@ -208,10 +212,41 @@ pub fn create_snapshot(
         }
     }
 
+    // Async diff path: hand the write + fsync to a background thread and return at
+    // the snapshot point; the caller awaits durability via `PUT /snapshot/complete`.
+    if params.async_snapshot && params.snapshot_type == SnapshotType::Diff {
+        // Queue memory isn't dirty-tracked at runtime, so mark it BEFORE the dirty
+        // set is frozen — otherwise this diff would miss the queue pages. (The sync
+        // path below marks after the dump, seeding the next diff.)
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+
+        let writer = vmm.vm.begin_async_diff_snapshot(&params.mem_file_path)?;
+        vmm.active_snapshot = Some(writer);
+
+        write_block_deltas(vmm, params)?;
+        return Ok(());
+    }
+
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
-    // Write delta files for overlay block devices if a delta directory is specified.
+    write_block_deltas(vmm, params)?;
+
+    // We need to mark queues as dirty again for all activated devices. The reason we
+    // do it here is that we don't mark pages as dirty during runtime
+    // for queue objects.
+    vmm.device_manager
+        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+
+    Ok(())
+}
+
+/// Write delta files for overlay block devices if a delta directory is specified.
+fn write_block_deltas(
+    vmm: &mut Vmm,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
     if let Some(ref delta_dir) = params.block_delta_dir {
         vmm.device_manager
             .write_block_deltas(delta_dir)
@@ -222,13 +257,6 @@ pub fn create_snapshot(
                 )
             })?;
     }
-
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
-
     Ok(())
 }
 

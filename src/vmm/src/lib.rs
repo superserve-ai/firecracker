@@ -334,9 +334,28 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    // Background writer of an in-progress async snapshot; set by an async create,
+    // cleared by `complete_snapshot`. `None` for synchronous snapshots.
+    active_snapshot: Option<crate::snapshot::background_writer::BackgroundMemoryWriter>,
 }
 
 impl Vmm {
+    /// Wait for an in-progress async snapshot's background write + fsync to finish,
+    /// so the diff is durable on return. No-op if none is active; errors if the write
+    /// failed or timed out. Does not reset dirty tracking — the caller owns the next
+    /// diff's baseline.
+    pub fn complete_snapshot(&mut self) -> Result<(), crate::persist::CreateSnapshotError> {
+        let mut writer = match self.active_snapshot.take() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        writer
+            .wait_timeout(std::time::Duration::from_secs(30))
+            .map_err(crate::persist::CreateSnapshotError::AsyncBackgroundWrite)?;
+        log::info!("async memory snapshot complete (durable)");
+        Ok(())
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()
