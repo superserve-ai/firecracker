@@ -1282,7 +1282,9 @@ mod tests {
             LoadSnapshotParams {
                 snapshot_path: PathBuf::new(),
                 mem_backend: MemBackendConfig {
+                    base_path: None,
                     backend_type: MemBackendType::File,
+                    abort_on_handler_death: false,
                     backend_path: PathBuf::new(),
                     access_log_path: None,
                     record_to: None,

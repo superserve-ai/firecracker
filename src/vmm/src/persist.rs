@@ -632,8 +632,10 @@ pub fn restore_from_snapshot(
                 ))?;
             guest_memory_from_uffd_internal(
                 mem_backend_path,
+                params.mem_backend.base_path.as_deref(),
                 params.mem_backend.access_log_path.as_deref(),
                 params.mem_backend.record_to.as_deref(),
+                params.mem_backend.abort_on_handler_death,
                 mem_state,
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages,
@@ -719,6 +721,8 @@ pub enum GuestMemoryFromUffdError {
     Send(#[from] vmm_sys_util::errno::Error),
     /// Failed to set up in-process UFFD handler: {0}
     InternalHandler(std::io::Error),
+    /// Layered restore overlay/base pairing is invalid (permanent — do not retry): {0}
+    LayeredInvalid(String),
 }
 
 fn guest_memory_from_uffd(
@@ -757,8 +761,10 @@ fn guest_memory_from_uffd(
 
 fn guest_memory_from_uffd_internal(
     snapshot_path: &Path,
+    base_path: Option<&Path>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
+    abort_on_handler_death: bool,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
@@ -771,7 +777,13 @@ fn guest_memory_from_uffd_internal(
     ),
     GuestMemoryFromUffdError,
 > {
-    let cfg = crate::uffd_internal::config_from_paths(snapshot_path, access_log_path, record_to);
+    let cfg = crate::uffd_internal::config_from_paths(
+        snapshot_path,
+        base_path,
+        access_log_path,
+        record_to,
+        abort_on_handler_death,
+    );
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
         mem_state,
@@ -788,8 +800,15 @@ fn guest_memory_from_uffd_internal(
         crate::uffd_internal::InternalUffdError::OpenSnapshot(e)
         | crate::uffd_internal::InternalUffdError::OpenRecorder(e)
         | crate::uffd_internal::InternalUffdError::DupFd(e)
-        | crate::uffd_internal::InternalUffdError::SpawnThread(e) => {
+        | crate::uffd_internal::InternalUffdError::SpawnThread(e)
+        | crate::uffd_internal::InternalUffdError::LayeredSetup(e) => {
             GuestMemoryFromUffdError::InternalHandler(e)
+        }
+        crate::uffd_internal::InternalUffdError::LayeredInvalid(s) => {
+            // Keep this distinct from InternalHandler (transient I/O): a bad
+            // overlay/base pairing never restores, so the caller must fall back to a
+            // Full restore rather than retry the layered path.
+            GuestMemoryFromUffdError::LayeredInvalid(s)
         }
     })?;
     Ok((guest_memory, Some(uffd), Some(handler)))

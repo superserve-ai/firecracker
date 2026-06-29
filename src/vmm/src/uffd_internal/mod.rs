@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -91,12 +92,20 @@ impl Stats {
 /// Configuration for an internal-UFFD-backed restore.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Snapshot memory file backing guest RAM.
+    /// Snapshot memory file backing guest RAM. In layered mode this is the overlay
+    /// (diff) file; pages absent from it are served from `base_path`.
     pub snapshot_path: PathBuf,
+    /// Base (template) memory file. When set, the restore is layered: a page is
+    /// served from `snapshot_path` if present there, else from this base.
+    pub base_path: Option<PathBuf>,
     /// Recorded page-access trace replayed as prefetch when present.
     pub access_log_path: Option<PathBuf>,
     /// When set, the handler records each served page offset and suppresses prefetch.
     pub record_to: Option<PathBuf>,
+    /// When true, an unexpected handler exit (error or panic, not a clean shutdown)
+    /// aborts the Firecracker process instead of leaving the guest to hang on its next
+    /// page fault — so a supervisor sees a dead VM rather than a frozen one.
+    pub abort_on_handler_death: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -168,6 +177,10 @@ pub enum InternalUffdError {
     DupFd(std::io::Error),
     /// Failed to spawn handler thread: {0}
     SpawnThread(std::io::Error),
+    /// Invalid layered restore: {0}
+    LayeredInvalid(String),
+    /// Failed to inspect filesystem for layered restore: {0}
+    LayeredSetup(std::io::Error),
 }
 
 /// Allocate anonymous guest memory, create + register a userfaultfd, and start a handler
@@ -185,6 +198,7 @@ pub fn setup(
 ) -> Result<(Vec<GuestRegionMmap>, Uffd, Handler), InternalUffdError> {
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
     let page_size = huge_pages.page_size();
+    let abort_on_handler_death = cfg.abort_on_handler_death;
 
     let mut builder = UffdBuilder::new();
     builder.require_features(FeatureFlags::EVENT_REMOVE);
@@ -211,7 +225,38 @@ pub fn setup(
         offset += region.size() as u64;
     }
 
-    let snapshot = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
+    let total_mem = offset; // sum of region sizes = total guest RAM
+    let overlay = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
+    // Layered restore: mmap the base (template) and scan the overlay's extents so a
+    // page absent from the overlay falls through to the base. Validate sizes up front
+    // so a malformed/short file fails the restore loudly instead of risking an
+    // out-of-bounds page source (or a handler-thread panic) at fault time.
+    let (base, present) = match cfg.base_path.as_deref() {
+        Some(base_path) => {
+            let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
+            let blksize = std::fs::metadata(&cfg.snapshot_path)
+                .map_err(InternalUffdError::LayeredSetup)?
+                .blksize();
+            validate_layered(
+                overlay.size,
+                base.size,
+                total_mem,
+                page_size,
+                crate::arch::host_page_size(),
+                blksize,
+            )?;
+            let present = scan_present_pages(&cfg.snapshot_path, page_size)
+                .map_err(InternalUffdError::LayeredSetup)?;
+            (Some(base), Some(present))
+        }
+        None => (None, None),
+    };
+    let backing = Backing {
+        overlay,
+        base,
+        present,
+        page_size,
+    };
 
     // Recording disables prefetch so the captured trace reflects guest-driven access
     // order instead of pages pulled in by the prefetcher.
@@ -246,18 +291,37 @@ pub fn setup(
     let thread = thread::Builder::new()
         .name("uffd-internal".into())
         .spawn(move || {
-            run(
-                handler_uffd,
-                mappings,
-                page_size,
-                snapshot,
-                prefetch_offsets,
-                recorder,
-                vmm_filter,
-                stats_for_thread,
-                shutdown_rx,
-                drain_rx,
-            )
+            // catch_unwind so a handler panic also counts as an unexpected exit.
+            // AssertUnwindSafe is sound: the captured state is never reused after this.
+            let clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    handler_uffd,
+                    mappings,
+                    page_size,
+                    backing,
+                    prefetch_offsets,
+                    recorder,
+                    vmm_filter,
+                    stats_for_thread,
+                    shutdown_rx,
+                    drain_rx,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                log::error!("uffd-internal: handler thread panicked");
+                HandlerExit::Unexpected
+            });
+            if clean == HandlerExit::Unexpected {
+                // Handler gone while the guest may still fault. Log always; abort only
+                // when gated on, so the VM dies visibly instead of hanging silently.
+                log::error!("uffd-internal: handler exited unexpectedly");
+                if abort_on_handler_death {
+                    log::error!(
+                        "uffd-internal: aborting Firecracker so the dead VM is surfaced, not frozen"
+                    );
+                    std::process::exit(UFFD_HANDLER_DEATH_EXIT_CODE);
+                }
+            }
         })
         .map_err(InternalUffdError::SpawnThread)?;
 
@@ -321,23 +385,185 @@ fn mmap_snapshot(path: &Path) -> std::io::Result<SnapshotMmap> {
     })
 }
 
+/// One bit per guest page: set ⇒ the page is present in the overlay (diff) file,
+/// clear ⇒ it must be served from the base. Built once at setup from the overlay's
+/// allocated extents (see `scan_present_pages`).
+struct PresenceBitmap {
+    bits: Vec<u64>,
+}
+
+impl PresenceBitmap {
+    fn with_pages(n: usize) -> Self {
+        Self {
+            bits: vec![0u64; n.div_ceil(64)],
+        }
+    }
+    fn set(&mut self, i: usize) {
+        self.bits[i >> 6] |= 1u64 << (i & 63);
+    }
+    fn is_set(&self, i: usize) -> bool {
+        // Out-of-range ⇒ not present (fall through to base). `setup` already
+        // guarantees the overlay covers all guest pages, so this is defense in
+        // depth against a panic on the handler thread (which would hang the VM).
+        let word = i >> 6;
+        word < self.bits.len() && self.bits[word] & (1u64 << (i & 63)) != 0
+    }
+}
+
+/// Validates the size and filesystem-granularity preconditions for a layered restore.
+/// Both layers must cover all guest RAM; the page size must not exceed the host page
+/// size (the overlay is dumped at host-page granularity); and the filesystem's
+/// allocation unit must be <= the page size so hole/data extents are page-granular.
+/// Each violation would otherwise silently serve wrong or zero pages, so it's a hard
+/// error. Pure (takes sizes, not files) so the reject paths are unit-testable.
+fn validate_layered(
+    overlay_size: usize,
+    base_size: usize,
+    total_mem: u64,
+    page_size: usize,
+    host_page_size: usize,
+    blksize: u64,
+) -> Result<(), InternalUffdError> {
+    if (overlay_size as u64) < total_mem {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "overlay is {overlay_size} bytes, smaller than guest RAM {total_mem}"
+        )));
+    }
+    if (base_size as u64) < total_mem {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "base is {base_size} bytes, smaller than guest RAM {total_mem}"
+        )));
+    }
+    // dump_dirty writes dirtied pages at the host page size, so a huge-page guest
+    // (page_size > host) would leave a partially-dirty huge page as host-page data+hole
+    // extents while the scan marks the whole huge page present — serving its clean
+    // sub-ranges as overlay zeros. Require host-page granularity.
+    if page_size > host_page_size {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "layered restore needs host-page granularity, but page size is {page_size} \
+             (host page size {host_page_size}); huge-page overlays are unsupported"
+        )));
+    }
+    // Presence is page-granular only when the filesystem's allocation unit is <= the
+    // page size (true on ext4 with 4K blocks). On a larger-granularity FS (e.g. ZFS
+    // recordsize), SEEK_DATA over-reports clean pages as present and serves zeros.
+    if blksize > page_size as u64 {
+        return Err(InternalUffdError::LayeredInvalid(format!(
+            "overlay filesystem block size {blksize} > page size {page_size}; \
+             layered restore needs page-granular holes"
+        )));
+    }
+    Ok(())
+}
+
+/// Scan `path`'s allocated extents via `SEEK_DATA`/`SEEK_HOLE` and mark every page
+/// that overlaps real data. `dump_dirty` writes dirtied pages as real extents and
+/// leaves clean pages as holes (no zero-skip), so a present extent == an overlay
+/// page and a hole == "fall through to base".
+fn scan_present_pages(path: &Path, page_size: usize) -> std::io::Result<PresenceBitmap> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let npages = (size as usize).div_ceil(page_size);
+    let mut pm = PresenceBitmap::with_pages(npages);
+    let fd = file.as_raw_fd();
+    let mut off: libc::off_t = 0;
+    while (off as u64) < size {
+        // SAFETY: fd is a valid open file; SEEK_DATA returns the next data offset
+        // at or after `off`, or -1/ENXIO once no data remains.
+        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
+        if data < 0 {
+            let err = std::io::Error::last_os_error();
+            // ENXIO is the documented "no more data" signal; any other errno is a real
+            // failure that must not be mistaken for a fully-scanned (sparse) overlay.
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(err);
+        }
+        // SAFETY: same fd; SEEK_HOLE returns the next hole at or after `data`,
+        // or EOF if the extent runs to the end of the file.
+        let mut hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            hole = size as libc::off_t;
+        }
+        let start_pg = data as usize / page_size;
+        let end_pg = (hole as usize).div_ceil(page_size).min(npages);
+        for p in start_pg..end_pg {
+            pm.set(p);
+        }
+        off = hole;
+    }
+    Ok(pm)
+}
+
+/// The memory backing a layered (or single-file) restore. `overlay` is the file
+/// named by `Config::snapshot_path`; in layered mode `base` + `present` resolve
+/// pages absent from the overlay to the template.
+struct Backing {
+    overlay: SnapshotMmap,
+    base: Option<SnapshotMmap>,
+    present: Option<PresenceBitmap>,
+    // Page size is fixed for the restore's lifetime; held here so src_ptr needn't be
+    // passed it on every fault.
+    page_size: usize,
+}
+
+impl Backing {
+    /// Source pointer for the page at `file_offset`: the overlay if the page is
+    /// present there (or there is no base), else the base. The two layers are the
+    /// same logical size, so `file_offset` is in bounds for whichever is chosen.
+    fn src_ptr(&self, file_offset: u64) -> *const u8 {
+        // setup() validates both mmaps cover all guest RAM and callers pass an in-region
+        // offset; assert it so any future misuse outside setup is caught in debug builds.
+        debug_assert!(
+            (file_offset as usize) < self.overlay.size,
+            "overlay offset out of bounds"
+        );
+        if let (Some(base), Some(present)) = (&self.base, &self.present) {
+            debug_assert!((file_offset as usize) < base.size, "base offset out of bounds");
+            let page_idx = (file_offset / self.page_size as u64) as usize;
+            if !present.is_set(page_idx) {
+                // SAFETY: file_offset < total guest mem size <= base mmap size.
+                return unsafe { base.addr.add(file_offset as usize) };
+            }
+        }
+        // SAFETY: file_offset < total guest mem size <= overlay mmap size.
+        unsafe { self.overlay.addr.add(file_offset as usize) }
+    }
+}
+
+/// Exit code used when an unexpected handler death aborts Firecracker (gated by
+/// `Config::abort_on_handler_death`). 70 = EX_SOFTWARE (sysexits.h, "internal software
+/// error") — chosen so the cause is recognizable in logs/process monitoring.
+const UFFD_HANDLER_DEATH_EXIT_CODE: i32 = 70;
+
+/// How the handler loop ended. `Clean` is an intentional teardown (the orchestrator
+/// signalled shutdown, or Firecracker unmapped the regions as the VM goes away).
+/// `Unexpected` is any error path — the handler can no longer serve faults while the
+/// guest may still need them.
+#[derive(Debug, PartialEq, Eq)]
+enum HandlerExit {
+    Clean,
+    Unexpected,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     page_size: usize,
-    snapshot: SnapshotMmap,
+    backing: Backing,
     prefetch_offsets: Vec<u64>,
     mut recorder: Option<Recorder>,
     vmm_filter: Arc<BpfProgram>,
     stats: Arc<Stats>,
     shutdown_rx: mpsc::Receiver<()>,
     drain_rx: mpsc::Receiver<mpsc::SyncSender<()>>,
-) {
+) -> HandlerExit {
     // Apply the same seccomp filter as the VMM thread before serving any events.
     if let Err(e) = apply_filter(vmm_filter.as_slice()) {
         log::error!("uffd-internal: failed to apply seccomp filter, exiting: {e:?}");
-        return;
+        return HandlerExit::Unexpected;
     }
 
     // Pagefault addresses that returned EAGAIN because a REMOVE event was queued ahead
@@ -359,20 +585,20 @@ fn run(
             drain_to_completion(
                 &uffd,
                 &mappings,
-                snapshot.addr,
+                &backing,
                 page_size,
                 &mut deferred,
                 recorder.as_mut(),
                 &stats,
             );
-            return;
+            return HandlerExit::Clean;
         }
 
         if let Ok(ack) = drain_rx.try_recv() {
             drain_to_completion(
                 &uffd,
                 &mappings,
-                snapshot.addr,
+                &backing,
                 page_size,
                 &mut deferred,
                 recorder.as_mut(),
@@ -399,13 +625,13 @@ fn run(
                 continue;
             }
             log::error!("uffd-internal: poll failed: {err}");
-            return;
+            return HandlerExit::Unexpected;
         }
 
         retry_deferred(
             &uffd,
             &mappings,
-            snapshot.addr,
+            &backing,
             page_size,
             &mut deferred,
             recorder.as_mut(),
@@ -417,7 +643,7 @@ fn run(
                 prefetch_one(
                     &uffd,
                     &mappings,
-                    snapshot.addr,
+                    &backing,
                     page_size,
                     prefetch_offsets[prefetch_cursor],
                     &stats,
@@ -432,7 +658,7 @@ fn run(
                 Ok(Some(ev)) => handle_event(
                     &uffd,
                     &mappings,
-                    snapshot.addr,
+                    &backing,
                     page_size,
                     ev,
                     recorder.as_mut(),
@@ -450,11 +676,11 @@ fn run(
                 {
                     // EINVAL on read means firecracker has already unmapped the registered
                     // memory regions; the VM is going away. Exit cleanly.
-                    return;
+                    return HandlerExit::Clean;
                 }
                 Err(e) => {
                     log::error!("uffd-internal: read_event failed: {e:?}");
-                    return;
+                    return HandlerExit::Unexpected;
                 }
             }
         }
@@ -465,7 +691,7 @@ fn run(
 fn retry_deferred(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     deferred: &mut Vec<u64>,
     mut recorder: Option<&mut Recorder>,
@@ -504,7 +730,7 @@ fn retry_deferred(
 fn drain_to_completion(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     deferred: &mut Vec<u64>,
     mut recorder: Option<&mut Recorder>,
@@ -551,7 +777,7 @@ fn drain_to_completion(
 fn handle_event(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     ev: Event,
     recorder: Option<&mut Recorder>,
@@ -609,7 +835,7 @@ fn record_fault(
 fn prefetch_one(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     offset: u64,
     stats: &Stats,
@@ -623,10 +849,9 @@ fn prefetch_one(
     };
     let page_offset_in_region = (offset - region.offset) & !((page_size as u64) - 1);
     let dst = (region.base_host_virt_addr + page_offset_in_region) as *mut libc::c_void;
-    // SAFETY: `region.offset + page_offset_in_region` is bounded above by the region's
-    // file extent, which is at most the snapshot file's length used to build the mmap.
-    let src = unsafe { backing.add((region.offset + page_offset_in_region) as usize) }
-        as *const libc::c_void;
+    // Layered: resolve the page to the overlay or base. `region.offset +
+    // page_offset_in_region` is bounded by the region's file extent.
+    let src = backing.src_ptr(region.offset + page_offset_in_region) as *const libc::c_void;
     // SAFETY: same constraints as in `serve_pagefault` — src within snapshot mmap, dst
     // within a region registered with this UFFD.
     let res = unsafe { uffd.copy(src, dst, page_size, true) };
@@ -671,7 +896,7 @@ enum ServeOutcome {
 fn serve_pagefault(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    backing: *const u8,
+    backing: &Backing,
     page_size: usize,
     addr: u64,
 ) -> ServeOutcome {
@@ -687,10 +912,9 @@ fn serve_pagefault(
         }
     };
     let offset = page_addr - region.base_host_virt_addr;
-    // SAFETY: `region.offset + offset` is bounded above by `region.size`, which `setup`
-    // computed from the snapshot's region length; the snapshot mmap is at least that big.
-    let src = unsafe { backing.add(region.offset as usize + offset as usize) }
-        as *const libc::c_void;
+    // Layered: resolve the page to the overlay or base. `region.offset + offset` is
+    // bounded above by `region.size`, so it is in bounds for either mmap.
+    let src = backing.src_ptr(region.offset + offset) as *const libc::c_void;
     let dst = page_addr as *mut libc::c_void;
 
     // SAFETY: `src` is within the snapshot mmap; `dst` is within a region registered with
@@ -809,19 +1033,221 @@ fn load_prefetch_offsets(path: &Path, page_size: usize) -> Vec<u64> {
 /// Build a [`Config`] from raw path references.
 pub fn config_from_paths(
     snapshot_path: &Path,
+    base_path: Option<&Path>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
+    abort_on_handler_death: bool,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
+        base_path: base_path.map(Path::to_path_buf),
         access_log_path: access_log_path.map(Path::to_path_buf),
         record_to: record_to.map(Path::to_path_buf),
+        abort_on_handler_death,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_bitmap_set_and_query() {
+        let mut pm = PresenceBitmap::with_pages(130);
+        for i in 0..130 {
+            assert!(!pm.is_set(i));
+        }
+        pm.set(0);
+        pm.set(65);
+        pm.set(129);
+        assert!(pm.is_set(0) && pm.is_set(65) && pm.is_set(129));
+        assert!(!pm.is_set(1) && !pm.is_set(64) && !pm.is_set(128));
+    }
+
+    #[test]
+    fn scan_present_pages_marks_data_pages_not_holes() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len((4 * ps) as u64).unwrap(); // 4 pages, all holes
+        // Real (non-zero) data into pages 0 and 2; leave 1 and 3 as holes — exactly
+        // how dump_dirty lays out a diff (dirty = extent, clean = hole).
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&vec![1u8; ps]).unwrap();
+        f.seek(SeekFrom::Start((2 * ps) as u64)).unwrap();
+        f.write_all(&vec![2u8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let pm = scan_present_pages(&path, ps).unwrap();
+        assert!(pm.is_set(0), "page 0 has data");
+        assert!(!pm.is_set(1), "page 1 is a hole → must fall through to base");
+        assert!(pm.is_set(2), "page 2 has data");
+        assert!(!pm.is_set(3), "page 3 is a hole → must fall through to base");
+    }
+
+    #[test]
+    fn layered_src_ptr_serves_overlay_when_present_else_base() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let npages = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Base: a complete image, every page filled with 0xBB.
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; npages * ps]).unwrap();
+
+        // Overlay: full-size sparse file with only page 1 written (0xAA); the rest are
+        // holes — exactly the on-disk shape of a layered diff over the base above.
+        let ov_path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&ov_path).unwrap();
+        f.set_len((npages * ps) as u64).unwrap();
+        f.seek(SeekFrom::Start(ps as u64)).unwrap();
+        f.write_all(&vec![0xAAu8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let present = scan_present_pages(&ov_path, ps).unwrap();
+        let backing = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(present),
+            page_size: ps,
+        };
+
+        // The resolution that, if wrong, silently corrupts guest memory: a present page
+        // must come from the overlay; a hole must fall through to the base (serving it
+        // from the overlay would read it as a zero hole, not the base's real bytes).
+        let read = |pg: usize| -> u8 {
+            let p = backing.src_ptr((pg * ps) as u64);
+            // SAFETY: `p` points at a mapped, readable page of `ps` bytes.
+            unsafe { *p }
+        };
+        assert_eq!(read(0), 0xBB, "hole page 0 must come from base");
+        assert_eq!(read(1), 0xAA, "present page 1 must come from overlay");
+        assert_eq!(read(2), 0xBB, "hole page 2 must come from base");
+        assert_eq!(read(3), 0xBB, "hole page 3 must come from base");
+    }
+
+    #[test]
+    fn monolithic_src_ptr_always_serves_overlay() {
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.snap");
+        std::fs::write(&path, vec![0x5Au8; 2 * ps]).unwrap();
+        // No base/present ⇒ single-file (monolithic) restore: every page from overlay.
+        // This is the backward-compat path — the layered loader is its superset.
+        let backing = Backing {
+            overlay: mmap_snapshot(&path).unwrap(),
+            base: None,
+            present: None,
+            page_size: ps,
+        };
+        for pg in 0..2 {
+            let p = backing.src_ptr((pg * ps) as u64);
+            // SAFETY: `p` points at a mapped, readable page of `ps` bytes.
+            assert_eq!(unsafe { *p }, 0x5A);
+        }
+    }
+
+    #[test]
+    fn validate_layered_rejects_bad_preconditions() {
+        let ps = 4096usize;
+        let total = (4 * ps) as u64; // 4 pages of guest RAM
+        let bad = |r: Result<(), InternalUffdError>| matches!(r, Err(InternalUffdError::LayeredInvalid(_)));
+
+        // Happy path: both layers cover RAM, host-page granularity, small blocks.
+        assert!(validate_layered(4 * ps, 4 * ps, total, ps, ps, ps as u64).is_ok());
+
+        // Overlay too small.
+        assert!(bad(validate_layered(2 * ps, 4 * ps, total, ps, ps, ps as u64)));
+        // Base too small.
+        assert!(bad(validate_layered(4 * ps, 2 * ps, total, ps, ps, ps as u64)));
+        // Huge-page guest (page_size > host page size) — would serve clean sub-pages as zeros.
+        assert!(bad(validate_layered(4 * ps, 4 * ps, total, 2 * 1024 * 1024, ps, ps as u64)));
+        // Filesystem block size larger than the page — holes wouldn't be page-granular.
+        assert!(bad(validate_layered(4 * ps, 4 * ps, total, ps, ps, (ps * 16) as u64)));
+    }
+
+    #[test]
+    fn serve_pagefault_copies_overlay_when_present_else_base() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let npages = 4usize;
+        let total = npages * ps;
+
+        // A user-mode-only uffd needs no privileges for self-registered anon memory, but
+        // some kernels gate even that (vm.unprivileged_userfaultfd=0). Skip if unavailable
+        // rather than fail spuriously — this still exercises the real copy path where it can.
+        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping serve_pagefault test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+
+        // "Guest memory": an anon region registered MISSING so the first touch faults.
+        // SAFETY: standard anonymous mmap of `total` bytes; checked against MAP_FAILED.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+        uffd.register(mem, total).expect("register region");
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; total]).unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&ov_path).unwrap();
+        f.set_len(total as u64).unwrap();
+        f.seek(SeekFrom::Start(ps as u64)).unwrap(); // page 1 only
+        f.write_all(&vec![0xAAu8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let backing = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(scan_present_pages(&ov_path, ps).unwrap()),
+            page_size: ps,
+        };
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: mem as u64,
+            size: total,
+            offset: 0,
+            page_size: ps,
+            page_size_kib: ps,
+        }];
+
+        // Serve each page through the real UFFDIO_COPY path, then read the now-installed
+        // guest page back: present page from the overlay (0xAA), holes from base (0xBB).
+        for pg in 0..npages {
+            let addr = mem as u64 + (pg * ps) as u64;
+            assert_eq!(
+                serve_pagefault(&uffd, &mappings, &backing, ps, addr),
+                ServeOutcome::Served,
+                "serve page {pg}"
+            );
+            // SAFETY: the page at `addr` was just installed by UFFDIO_COPY.
+            let got = unsafe { *(addr as *const u8) };
+            let want = if pg == 1 { 0xAA } else { 0xBB };
+            assert_eq!(got, want, "page {pg}");
+        }
+
+        // SAFETY: unmap the region we mapped above.
+        unsafe { libc::munmap(mem, total) };
+    }
 
     #[test]
     fn recorder_writes_one_line_per_unique_offset_in_first_touch_order() {

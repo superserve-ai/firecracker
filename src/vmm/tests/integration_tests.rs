@@ -293,8 +293,10 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                abort_on_handler_death: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -439,8 +441,10 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                abort_on_handler_death: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -545,8 +549,10 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
+                base_path: None,
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                abort_on_handler_death: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -865,8 +871,10 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
     let req = VmmAction::LoadSnapshot(LoadSnapshotParams {
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_backend: MemBackendConfig {
+            base_path: None,
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
+            abort_on_handler_death: false,
             access_log_path: None,
             record_to: None,
         },
