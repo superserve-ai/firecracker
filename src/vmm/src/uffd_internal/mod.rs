@@ -246,7 +246,7 @@ pub fn setup(
                 blksize,
             )?;
             let present = scan_present_pages(&cfg.snapshot_path, page_size)
-                .map_err(InternalUffdError::OpenSnapshot)?;
+                .map_err(InternalUffdError::LayeredSetup)?;
             (Some(base), Some(present))
         }
         None => (None, None),
