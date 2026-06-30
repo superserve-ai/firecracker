@@ -1384,6 +1384,51 @@ mod tests {
         assert_eq!(read(3), 0xBB);
     }
 
+    // The memfd-bridge fast-resume (shared_mem): a paused Firecracker's frozen guest RAM
+    // memfd is handed to a new Firecracker as the newest overlay, reached by its
+    // /proc/<pid>/fd path. This proves the existing path-based layered loader accepts a
+    // real memfd unchanged — SEEK_DATA/SEEK_HOLE presence works on tmpfs (written pages =
+    // data, never-written = holes → fall through), and the memfd wins over a disk diff.
+    #[test]
+    fn build_backing_resolves_memfd_overlay_by_proc_fd_path() {
+        use std::os::unix::fs::FileExt;
+        let ps = 4096usize;
+        let npages = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Disk chain: base (full 0xBB) → diff d1 (page 1 = 0x11).
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; npages * ps]).unwrap();
+        let d1 = dir.path().join("mem.diff.1");
+        write_sparse_overlay(&d1, npages, ps, &[(1, 0x11)]);
+
+        // Newest overlay = a memfd holding the frozen RAM: page 1 = 0xEE (must shadow d1),
+        // page 2 = 0x22; pages 0 and 3 left as holes (never faulted → fall through to base).
+        let mfd = memfd::MemfdOptions::default().create("guest_mem").unwrap();
+        let f = mfd.as_file();
+        f.set_len((npages * ps) as u64).unwrap();
+        f.write_all_at(&vec![0xEEu8; ps], (1 * ps) as u64).unwrap();
+        f.write_all_at(&vec![0x22u8; ps], (2 * ps) as u64).unwrap();
+        let memfd_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", mfd.as_raw_fd()));
+
+        let cfg = Config {
+            snapshot_path: memfd_path,
+            base_path: Some(base_path),
+            lower_overlay_paths: vec![d1],
+            access_log_path: None,
+            record_to: None,
+            abort_on_handler_death: false,
+        };
+        let backing = build_backing(&cfg, (npages * ps) as u64, ps).unwrap();
+        assert_eq!(backing.layers.len(), 3, "base + disk diff + memfd");
+        // SAFETY: src_ptr returns a pointer into a mapped, readable page of `ps` bytes.
+        let read = |pg: usize| -> u8 { unsafe { *backing.src_ptr((pg * ps) as u64) } };
+        assert_eq!(read(0), 0xBB, "page 0: memfd hole, no diff → base");
+        assert_eq!(read(1), 0xEE, "page 1: memfd owns it → memfd shadows the disk diff");
+        assert_eq!(read(2), 0x22, "page 2: only memfd owns it → memfd");
+        assert_eq!(read(3), 0xBB, "page 3: memfd hole, no diff → base");
+    }
+
     #[test]
     fn serve_pagefault_copies_overlay_when_present_else_base() {
         use std::io::{Seek, SeekFrom, Write};
