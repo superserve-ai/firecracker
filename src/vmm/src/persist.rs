@@ -613,6 +613,9 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(microvm_state.vm_info.huge_pages),
+            // None ⇒ preserve vm_resources' shared_mem (set from the load request for a
+            // restore); the snapshot's vm_info doesn't carry it.
+            shared_mem: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -668,6 +671,7 @@ pub fn restore_from_snapshot(
                 mem_state,
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages,
+                vm_resources.machine_config.shared_mem,
                 vmm_filter,
             )
             .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
@@ -798,6 +802,7 @@ fn guest_memory_from_uffd_internal(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    shared_mem: bool,
     vmm_filter: std::sync::Arc<crate::seccomp::BpfProgram>,
 ) -> Result<
     (
@@ -820,6 +825,7 @@ fn guest_memory_from_uffd_internal(
         mem_state,
         track_dirty_pages,
         huge_pages,
+        shared_mem,
         vmm_filter,
     )
     .map_err(|e| match e {

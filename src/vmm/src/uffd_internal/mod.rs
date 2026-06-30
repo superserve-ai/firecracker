@@ -197,9 +197,17 @@ pub fn setup(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    shared_mem: bool,
     vmm_filter: Arc<BpfProgram>,
 ) -> Result<(Vec<GuestRegionMmap>, Uffd, Handler), InternalUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    // memfd-backed (MAP_SHARED) when shared_mem is set (see MachineConfig::shared_mem),
+    // else anonymous (MAP_PRIVATE) — the cheaper default.
+    let guest_memory = if shared_mem {
+        let regions: Vec<_> = mem_state.regions().collect();
+        memory::memfd_backed(&regions, track_dirty_pages, huge_pages)?
+    } else {
+        memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?
+    };
     let page_size = huge_pages.page_size();
     let abort_on_handler_death = cfg.abort_on_handler_death;
 

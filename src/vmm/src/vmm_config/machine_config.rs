@@ -113,6 +113,12 @@ pub struct MachineConfig {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: HugePageConfig,
+    /// Back guest memory with a memfd (MAP_SHARED) instead of anonymous memory
+    /// (MAP_PRIVATE), so the guest RAM can be read by another process — e.g. a new
+    /// Firecracker serving a fast resume from the paused VM's frozen RAM while its
+    /// diff is still flushing. Default false.
+    #[serde(default)]
+    pub shared_mem: bool,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +161,7 @@ impl Default for MachineConfig {
             cpu_template: None,
             track_dirty_pages: false,
             huge_pages: HugePageConfig::None,
+            shared_mem: false,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         }
@@ -188,6 +195,9 @@ pub struct MachineConfigUpdate {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: Option<HugePageConfig>,
+    /// Back guest memory with a memfd (MAP_SHARED) instead of anonymous memory.
+    #[serde(default)]
+    pub shared_mem: Option<bool>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default)]
@@ -212,6 +222,7 @@ impl From<MachineConfig> for MachineConfigUpdate {
             cpu_template: cfg.static_template(),
             track_dirty_pages: Some(cfg.track_dirty_pages),
             huge_pages: Some(cfg.huge_pages),
+            shared_mem: Some(cfg.shared_mem),
             #[cfg(feature = "gdb")]
             gdb_socket_path: cfg.gdb_socket_path,
         }
@@ -279,6 +290,7 @@ impl MachineConfig {
             cpu_template,
             track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
             huge_pages: page_config,
+            shared_mem: update.shared_mem.unwrap_or(self.shared_mem),
             #[cfg(feature = "gdb")]
             gdb_socket_path: update.gdb_socket_path.clone(),
         })
