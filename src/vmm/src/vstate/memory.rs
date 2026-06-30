@@ -656,7 +656,7 @@ where
     /// Byte offsets (in the flattened mem-file layout) of the pages `dump_dirty`
     /// would write for `dirty_bitmap` — the same KVM-log ∪ Firecracker-bitmap
     /// selection, in ascending order, but without the page data. For the memfd
-    /// bridge: vmd copies exactly these pages from the held guest-memory memfd, so
+    /// bridge: the orchestrator copies exactly these pages from the held guest-memory memfd, so
     /// Firecracker need not dump them itself. Does not reset any dirty bitmap.
     fn dirty_page_offsets(&self, dirty_bitmap: &DirtyBitmap) -> Result<Vec<u64>, MemoryError>;
 
