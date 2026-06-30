@@ -170,6 +170,8 @@ pub enum CreateSnapshotError {
     ),
     /// Async background memory write failed: {0}
     AsyncBackgroundWrite(crate::snapshot::background_writer::BackgroundWriteError),
+    /// memfd bridge (dirty_offsets_path) requires a Diff snapshot
+    BridgeRequiresDiff,
 }
 
 /// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
@@ -212,6 +214,26 @@ pub fn create_snapshot(
         }
     }
 
+    // Memfd bridge: write only the microVM state plus a dirty-offsets sidecar (no memory
+    // dump). The orchestrator holds the guest-memory memfd and copies exactly those pages
+    // from it after Firecracker exits, freeing the VM unit for an immediate resume. Needs a
+    // dirty set, so Diff only.
+    if let Some(ref offsets_path) = params.dirty_offsets_path {
+        use crate::vstate::memory::GuestMemoryExtension;
+        if params.snapshot_type != SnapshotType::Diff {
+            return Err(CreateSnapshotError::BridgeRequiresDiff);
+        }
+        // Queue memory isn't dirty-tracked at runtime — mark it before reading the set
+        // (same as the async path) so the bridge diff includes the queue pages.
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+        let dirty_bitmap = vmm.vm.get_dirty_bitmap()?;
+        let offsets = vmm.vm.guest_memory().dirty_page_offsets(&dirty_bitmap)?;
+        write_dirty_offsets(offsets_path, &offsets)?;
+        write_block_deltas(vmm, params)?;
+        return Ok(());
+    }
+
     // Async diff path: hand the write + fsync to a background thread and return at
     // the snapshot point; the caller awaits durability via `PUT /snapshot/complete`.
     if params.async_snapshot && params.snapshot_type == SnapshotType::Diff {
@@ -239,6 +261,28 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
 
+    Ok(())
+}
+
+/// Write the dirty pages' byte offsets (little-endian u64, ascending) to `path` and fsync,
+/// for the memfd bridge. The orchestrator reads this list and copies exactly these pages
+/// from the held guest-memory memfd into the diff layer.
+fn write_dirty_offsets(path: &Path, offsets: &[u64]) -> Result<(), CreateSnapshotError> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(offsets.len() * 8);
+    for &off in offsets {
+        buf.extend_from_slice(&off.to_le_bytes());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| CreateSnapshotError::SnapshotBackingFile("open_dirty_offsets", e))?;
+    file.write_all(&buf)
+        .map_err(|e| CreateSnapshotError::SnapshotBackingFile("write_dirty_offsets", e))?;
+    file.sync_all()
+        .map_err(|e| CreateSnapshotError::SnapshotBackingFile("sync_dirty_offsets", e))?;
     Ok(())
 }
 

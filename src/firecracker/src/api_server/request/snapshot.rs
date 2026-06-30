@@ -156,6 +156,7 @@ mod tests {
             block_delta_dir: None,
             flatten: false,
             async_snapshot: false,
+            dirty_offsets_path: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -173,6 +174,7 @@ mod tests {
             block_delta_dir: None,
             flatten: false,
             async_snapshot: false,
+            dirty_offsets_path: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),

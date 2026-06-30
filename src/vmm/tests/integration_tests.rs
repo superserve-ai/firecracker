@@ -234,6 +234,7 @@ fn verify_create_snapshot(
         block_delta_dir: None,
         flatten: false,
         async_snapshot: false,
+        dirty_offsets_path: None,
     };
 
     controller
@@ -405,6 +406,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
         flatten: true,
         async_snapshot: false,
+        dirty_offsets_path: None,
     };
     controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -515,6 +517,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
             async_snapshot: false,
+            dirty_offsets_path: None,
         }))
         .expect("flatten snapshot");
 
@@ -604,6 +607,7 @@ fn flatten_snapshot_expect_overlay_err(
             block_delta_dir: Some(delta_dir),
             flatten: true,
             async_snapshot: false,
+            dirty_offsets_path: None,
         }))
         .expect_err("expected overlay error from flatten");
     match err {
@@ -768,6 +772,7 @@ fn test_flatten_skips_non_overlay_device() {
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
             async_snapshot: false,
+            dirty_offsets_path: None,
         }))
         .expect("flatten must succeed even with a non-overlay drive in the mix");
 
@@ -799,6 +804,7 @@ fn test_create_snapshot_flatten_requires_delta_dir() {
         block_delta_dir: None,
         flatten: true,
         async_snapshot: false,
+        dirty_offsets_path: None,
     };
     let err = controller
         .handle_request(VmmAction::CreateSnapshot(params))

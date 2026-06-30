@@ -67,6 +67,13 @@ pub struct CreateSnapshotParams {
     /// `Full` snapshots.
     #[serde(default)]
     pub async_snapshot: bool,
+    /// Memfd bridge (requires `snapshot_type` is `Diff`): write the microVM state plus a
+    /// sidecar at this path listing the dirty pages' byte offsets (little-endian u64,
+    /// ascending), and skip the memory dump entirely. The orchestrator holds the guest
+    /// memory memfd and copies exactly those pages from it after Firecracker exits, so the
+    /// VM unit frees up immediately for a fast resume. The vCPUs must stay paused.
+    #[serde(default)]
+    pub dirty_offsets_path: Option<PathBuf>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
