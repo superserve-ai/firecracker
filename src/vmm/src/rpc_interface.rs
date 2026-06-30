@@ -1306,6 +1306,7 @@ mod tests {
                 resume_vm: false,
                 network_overrides: vec![],
                 block_delta_dir: None,
+                shared_mem: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

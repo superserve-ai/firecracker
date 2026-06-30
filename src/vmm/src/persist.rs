@@ -613,9 +613,8 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(microvm_state.vm_info.huge_pages),
-            // None ⇒ preserve vm_resources' shared_mem (set from the load request for a
-            // restore); the snapshot's vm_info doesn't carry it.
-            shared_mem: None,
+            // From the load request; the snapshot's vm_info doesn't carry it.
+            shared_mem: Some(params.shared_mem),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })

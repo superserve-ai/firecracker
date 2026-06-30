@@ -98,6 +98,9 @@ pub struct LoadSnapshotParams {
     /// Each overlay device will look for `{drive_id}.delta` in this directory
     /// and apply it to a fresh overlay, enabling fast VM cloning.
     pub block_delta_dir: Option<PathBuf>,
+    /// Back the restored guest memory with a memfd (MAP_SHARED) instead of an
+    /// anonymous mapping. See `MachineConfig::shared_mem`.
+    pub shared_mem: bool,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -130,6 +133,10 @@ pub struct LoadSnapshotConfig {
     /// Optional directory containing block device delta files for cloning.
     #[serde(default)]
     pub block_delta_dir: Option<PathBuf>,
+    /// Back the restored guest memory with a memfd (MAP_SHARED). See
+    /// `MachineConfig::shared_mem`.
+    #[serde(default)]
+    pub shared_mem: bool,
 }
 
 /// Stores the configuration used for managing snapshot memory.
