@@ -97,3 +97,43 @@ impl BackgroundMemoryWriter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn drop_joins_unawaited_writer() {
+        // A writer dropped without wait_timeout must still join its thread, so no detached
+        // thread keeps writing the snapshot file. Prove it via a flag the dump sets late:
+        // if it's set once drop() returns, drop blocked until the thread completed.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thread = Arc::clone(&done);
+        let writer = BackgroundMemoryWriter::start(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            done_thread.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        drop(writer);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "Drop did not join the still-running writer thread"
+        );
+    }
+}
+
+impl Drop for BackgroundMemoryWriter {
+    fn drop(&mut self) {
+        // Join a still-running writer so a dropped or overwritten handle can never leave a
+        // detached thread writing the snapshot file — which would race a later writer on the
+        // same file and silently lose durability. `wait_timeout` already took the handle on a
+        // completed/failed write, so this only fires when the handle was dropped without being
+        // awaited. The writer owns an Arc clone of guest memory, so the join is sound even as
+        // the owning Vmm tears down (the mmaps outlive it via that refcount).
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}

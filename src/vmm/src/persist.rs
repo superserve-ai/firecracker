@@ -172,6 +172,8 @@ pub enum CreateSnapshotError {
     AsyncBackgroundWrite(crate::snapshot::background_writer::BackgroundWriteError),
     /// memfd bridge (dirty_offsets_path) requires a Diff snapshot
     BridgeRequiresDiff,
+    /// an async snapshot is already in progress; complete it before starting another
+    SnapshotInProgress,
 }
 
 /// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
@@ -188,6 +190,12 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // At most one in-flight async snapshot: a second one (or a sync/bridge snapshot) while a
+    // background writer is still dumping would have two threads writing memory files with only
+    // the later one's durability awaited. Reject until the active one is completed.
+    if vmm.active_snapshot.is_some() {
+        return Err(CreateSnapshotError::SnapshotInProgress);
+    }
     if params.flatten && params.block_delta_dir.is_none() {
         return Err(CreateSnapshotError::FlattenRequiresDeltaDir);
     }

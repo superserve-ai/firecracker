@@ -255,6 +255,8 @@ pub enum VmmError {
     VcpuExit,
     /// Failed to resume the vCPUs.
     VcpuResume,
+    /// Cannot resume while an async snapshot is in progress; complete it first.
+    SnapshotInProgress,
     /// Failed to message the vCPUs.
     VcpuMessage,
     /// Cannot spawn Vcpu thread: {0}
@@ -345,13 +347,18 @@ impl Vmm {
     /// failed or timed out. Does not reset dirty tracking — the caller owns the next
     /// diff's baseline.
     pub fn complete_snapshot(&mut self) -> Result<(), crate::persist::CreateSnapshotError> {
-        let mut writer = match self.active_snapshot.take() {
+        let writer = match self.active_snapshot.as_mut() {
             Some(w) => w,
             None => return Ok(()),
         };
+        // Borrow (don't take) the handle: on a timeout/error this returns with the handle
+        // still in place, so a retry re-awaits the same write. Releasing it only after a
+        // confirmed-durable wait prevents a retry from finding `None` and falsely reporting
+        // completion for a write that's still in flight or already failed.
         writer
             .wait_timeout(std::time::Duration::from_secs(30))
             .map_err(crate::persist::CreateSnapshotError::AsyncBackgroundWrite)?;
+        self.active_snapshot = None;
         log::info!("async memory snapshot complete (durable)");
         Ok(())
     }
@@ -539,6 +546,13 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        // The async writer reads the live guest mmaps assuming the vCPUs stay paused; resuming
+        // mid-write would race it into a torn diff with no error surfaced. Refuse until the
+        // snapshot is completed. (Drop joins any still-running writer via its own Drop impl, so
+        // process teardown is covered too.)
+        if self.active_snapshot.is_some() {
+            return Err(VmmError::SnapshotInProgress);
+        }
         self.device_manager.kick_virtio_devices();
 
         // Send the events.
