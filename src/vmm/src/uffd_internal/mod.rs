@@ -567,6 +567,16 @@ fn build_backing(
             ));
         }
         let mmap = mmap_snapshot(&cfg.snapshot_path).map_err(InternalUffdError::OpenSnapshot)?;
+        // The full image must cover all guest RAM, or src_ptr would compute an offset past
+        // the mapping (a truncated snapshot ⇒ OOB read / SIGBUS on the handler thread). This
+        // is what makes the src_ptr "every layer covers guest RAM" invariant hold for the
+        // monolithic path too — not only for base + overlays below.
+        if (mmap.size as u64) < total_mem {
+            return Err(InternalUffdError::LayeredInvalid(format!(
+                "snapshot is {} bytes, smaller than guest RAM {total_mem}",
+                mmap.size
+            )));
+        }
         return Ok(Backing {
             layers: vec![Layer { mmap, present: None }],
             page_size,
@@ -1350,6 +1360,28 @@ mod tests {
         // error, not a silent ignore.
         assert!(matches!(
             build_backing(&cfg, (2 * ps) as u64, ps),
+            Err(InternalUffdError::LayeredInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn build_backing_rejects_too_small_monolithic() {
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("mem.snap");
+        std::fs::write(&snap, vec![0u8; ps]).unwrap(); // 1 page on disk
+        let cfg = Config {
+            snapshot_path: snap,
+            base_path: None,
+            lower_overlay_paths: vec![],
+            access_log_path: None,
+            record_to: None,
+            abort_on_handler_death: false,
+        };
+        // Guest RAM is 4 pages but the snapshot covers 1 — must reject up front rather than
+        // let src_ptr compute an out-of-bounds offset (SIGBUS) at fault time.
+        assert!(matches!(
+            build_backing(&cfg, (4 * ps) as u64, ps),
             Err(InternalUffdError::LayeredInvalid(_))
         ));
     }
