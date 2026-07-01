@@ -30,6 +30,7 @@ pub(crate) fn parse_put_snapshot(
     match request_type_from_path {
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
+            "complete" => Ok(ParsedRequest::new_sync(VmmAction::CompleteSnapshot)),
             "load" => parse_put_snapshot_load(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
@@ -100,6 +101,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 access_log_path: None,
                 record_to: None,
             }
@@ -115,6 +117,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         block_delta_dir: snapshot_config.block_delta_dir,
+        shared_mem: snapshot_config.shared_mem,
     };
 
     // Construct the `ParsedRequest` object.
@@ -152,6 +155,8 @@ mod tests {
             mem_file_path: PathBuf::from("bar"),
             block_delta_dir: None,
             flatten: false,
+            async_snapshot: false,
+            dirty_offsets_path: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -168,6 +173,8 @@ mod tests {
             mem_file_path: PathBuf::from("bar"),
             block_delta_dir: None,
             flatten: false,
+            async_snapshot: false,
+            dirty_offsets_path: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -191,6 +198,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -201,6 +209,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             block_delta_dir: None,
+            shared_mem: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -226,6 +235,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -236,6 +246,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             block_delta_dir: None,
+            shared_mem: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -261,6 +272,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 abort_on_handler_death: false,
@@ -271,6 +283,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
+            shared_mem: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -302,6 +315,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
                 abort_on_handler_death: false,
@@ -315,6 +329,7 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             block_delta_dir: None,
+            shared_mem: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -337,6 +352,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -347,6 +363,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
+            shared_mem: false,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(

@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -166,6 +168,12 @@ pub enum CreateSnapshotError {
     FlattenOverlays(
         crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
     ),
+    /// Async background memory write failed: {0}
+    AsyncBackgroundWrite(crate::snapshot::background_writer::BackgroundWriteError),
+    /// memfd bridge (dirty_offsets_path) requires a Diff snapshot
+    BridgeRequiresDiff,
+    /// an async snapshot is already in progress; complete it before starting another
+    SnapshotInProgress,
 }
 
 /// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
@@ -182,6 +190,12 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // At most one in-flight async snapshot: a second one (or a sync/bridge snapshot) while a
+    // background writer is still dumping would have two threads writing memory files with only
+    // the later one's durability awaited. Reject until the active one is completed.
+    if vmm.active_snapshot.is_some() {
+        return Err(CreateSnapshotError::SnapshotInProgress);
+    }
     if params.flatten && params.block_delta_dir.is_none() {
         return Err(CreateSnapshotError::FlattenRequiresDeltaDir);
     }
@@ -208,10 +222,83 @@ pub fn create_snapshot(
         }
     }
 
+    // Memfd bridge: write only the microVM state plus a dirty-offsets sidecar (no memory
+    // dump). The orchestrator holds the guest-memory memfd and copies exactly those pages
+    // from it after Firecracker exits, freeing the VM unit for an immediate resume. Needs a
+    // dirty set, so Diff only.
+    if let Some(ref offsets_path) = params.dirty_offsets_path {
+        use crate::vstate::memory::GuestMemoryExtension;
+        if params.snapshot_type != SnapshotType::Diff {
+            return Err(CreateSnapshotError::BridgeRequiresDiff);
+        }
+        // Queue memory isn't dirty-tracked at runtime — mark it before reading the set
+        // (same as the async path) so the bridge diff includes the queue pages.
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+        let dirty_bitmap = vmm.vm.get_dirty_bitmap()?;
+        let offsets = vmm.vm.guest_memory().dirty_page_offsets(&dirty_bitmap)?;
+        write_dirty_offsets(offsets_path, &offsets)?;
+        write_block_deltas(vmm, params)?;
+        return Ok(());
+    }
+
+    // Async diff path: hand the write + fsync to a background thread and return at
+    // the snapshot point; the caller awaits durability via `PUT /snapshot/complete`.
+    if params.async_snapshot && params.snapshot_type == SnapshotType::Diff {
+        // Queue memory isn't dirty-tracked at runtime, so mark it BEFORE the dirty
+        // set is frozen — otherwise this diff would miss the queue pages. (The sync
+        // path below marks after the dump, seeding the next diff.)
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+
+        let writer = vmm.vm.begin_async_diff_snapshot(&params.mem_file_path)?;
+        vmm.active_snapshot = Some(writer);
+
+        write_block_deltas(vmm, params)?;
+        return Ok(());
+    }
+
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
-    // Write delta files for overlay block devices if a delta directory is specified.
+    write_block_deltas(vmm, params)?;
+
+    // We need to mark queues as dirty again for all activated devices. The reason we
+    // do it here is that we don't mark pages as dirty during runtime
+    // for queue objects.
+    vmm.device_manager
+        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+
+    Ok(())
+}
+
+/// Write the dirty pages' byte offsets (little-endian u64, ascending) to `path` and fsync,
+/// for the memfd bridge. The orchestrator reads this list and copies exactly these pages
+/// from the held guest-memory memfd into the diff layer.
+fn write_dirty_offsets(path: &Path, offsets: &[u64]) -> Result<(), CreateSnapshotError> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(offsets.len() * 8);
+    for &off in offsets {
+        buf.extend_from_slice(&off.to_le_bytes());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| CreateSnapshotError::SnapshotBackingFile("open_dirty_offsets", e))?;
+    file.write_all(&buf)
+        .map_err(|e| CreateSnapshotError::SnapshotBackingFile("write_dirty_offsets", e))?;
+    file.sync_all()
+        .map_err(|e| CreateSnapshotError::SnapshotBackingFile("sync_dirty_offsets", e))?;
+    Ok(())
+}
+
+/// Write delta files for overlay block devices if a delta directory is specified.
+fn write_block_deltas(
+    vmm: &mut Vmm,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
     if let Some(ref delta_dir) = params.block_delta_dir {
         vmm.device_manager
             .write_block_deltas(delta_dir)
@@ -222,13 +309,6 @@ pub fn create_snapshot(
                 )
             })?;
     }
-
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
-
     Ok(())
 }
 
@@ -585,6 +665,8 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(microvm_state.vm_info.huge_pages),
+            // From the load request; the snapshot's vm_info doesn't carry it.
+            shared_mem: Some(params.shared_mem),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -633,12 +715,14 @@ pub fn restore_from_snapshot(
             guest_memory_from_uffd_internal(
                 mem_backend_path,
                 params.mem_backend.base_path.as_deref(),
+                params.mem_backend.lower_overlay_paths.clone(),
                 params.mem_backend.access_log_path.as_deref(),
                 params.mem_backend.record_to.as_deref(),
                 params.mem_backend.abort_on_handler_death,
                 mem_state,
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages,
+                vm_resources.machine_config.shared_mem,
                 vmm_filter,
             )
             .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
@@ -762,12 +846,14 @@ fn guest_memory_from_uffd(
 fn guest_memory_from_uffd_internal(
     snapshot_path: &Path,
     base_path: Option<&Path>,
+    lower_overlay_paths: Vec<std::path::PathBuf>,
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
     abort_on_handler_death: bool,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    shared_mem: bool,
     vmm_filter: std::sync::Arc<crate::seccomp::BpfProgram>,
 ) -> Result<
     (
@@ -780,6 +866,7 @@ fn guest_memory_from_uffd_internal(
     let cfg = crate::uffd_internal::config_from_paths(
         snapshot_path,
         base_path,
+        lower_overlay_paths,
         access_log_path,
         record_to,
         abort_on_handler_death,
@@ -789,6 +876,7 @@ fn guest_memory_from_uffd_internal(
         mem_state,
         track_dirty_pages,
         huge_pages,
+        shared_mem,
         vmm_filter,
     )
     .map_err(|e| match e {

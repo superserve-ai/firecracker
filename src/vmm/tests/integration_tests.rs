@@ -233,6 +233,8 @@ fn verify_create_snapshot(
         mem_file_path: memory_file.as_path().to_path_buf(),
         block_delta_dir: None,
         flatten: false,
+        async_snapshot: false,
+        dirty_offsets_path: None,
     };
 
     controller
@@ -294,6 +296,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -304,6 +307,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
+            shared_mem: false,
         }))
         .unwrap();
 
@@ -401,6 +405,8 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         mem_file_path: memory_file.as_path().to_path_buf(),
         block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
         flatten: true,
+        async_snapshot: false,
+        dirty_offsets_path: None,
     };
     controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -442,6 +448,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -452,6 +459,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
+            shared_mem: false,
         }))
         .expect("restore from flattened snapshot must succeed");
 
@@ -508,6 +516,8 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             mem_file_path: memory_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
+            async_snapshot: false,
+            dirty_offsets_path: None,
         }))
         .expect("flatten snapshot");
 
@@ -550,6 +560,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 base_path: None,
+                lower_overlay_paths: Vec::new(),
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
                 abort_on_handler_death: false,
@@ -560,6 +571,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
+            shared_mem: false,
         }))
         .expect("restore from flat snapshot");
     let restored_vmm = preboot.built_vmm.take().unwrap();
@@ -594,6 +606,8 @@ fn flatten_snapshot_expect_overlay_err(
             mem_file_path: mem_path,
             block_delta_dir: Some(delta_dir),
             flatten: true,
+            async_snapshot: false,
+            dirty_offsets_path: None,
         }))
         .expect_err("expected overlay error from flatten");
     match err {
@@ -757,6 +771,8 @@ fn test_flatten_skips_non_overlay_device() {
             mem_file_path: mem_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
+            async_snapshot: false,
+            dirty_offsets_path: None,
         }))
         .expect("flatten must succeed even with a non-overlay drive in the mix");
 
@@ -787,6 +803,8 @@ fn test_create_snapshot_flatten_requires_delta_dir() {
         mem_file_path: std::path::PathBuf::from("/this/should/never/be/written.mem"),
         block_delta_dir: None,
         flatten: true,
+        async_snapshot: false,
+        dirty_offsets_path: None,
     };
     let err = controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -872,6 +890,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_backend: MemBackendConfig {
             base_path: None,
+            lower_overlay_paths: Vec::new(),
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
             abort_on_handler_death: false,
@@ -882,6 +901,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
         block_delta_dir: None,
+        shared_mem: false,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(

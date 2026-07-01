@@ -1,0 +1,237 @@
+// Copyright 2026 Superserve AI. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Background memory-snapshot writer.
+//!
+//! Runs a diff snapshot's dirty-page dump on a dedicated thread so the create call
+//! can return at the snapshot point while the write + fsync happen off the critical
+//! path. A generic harness: the caller supplies the dump closure and is responsible
+//! for keeping the source memory stable while it runs.
+
+use std::io::{Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use vm_memory::bitmap::BitmapSlice;
+use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
+
+/// The write is running.
+pub const STATUS_WRITING: u8 = 1;
+/// The write finished successfully.
+pub const STATUS_COMPLETE: u8 = 2;
+/// The write failed.
+pub const STATUS_ERROR: u8 = 3;
+
+/// Errors from the background snapshot writer.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum BackgroundWriteError {
+    /// failed to spawn the background snapshot writer: {0}
+    SpawnThread(String),
+    /// background memory write failed: {0}
+    Write(String),
+    /// background snapshot writer thread panicked
+    ThreadPanicked,
+    /// background snapshot writer stalled (no progress within the stall timeout)
+    Timeout,
+}
+
+/// Wraps a snapshot output writer and counts bytes written into `progress`, so the background
+/// writer can tell a slow-but-advancing dump from a wedged one. Transparent otherwise: delegates
+/// `write_volatile` (counting the result) and `Seek` to the inner writer.
+pub(crate) struct ProgressWriter<W> {
+    inner: W,
+    progress: Arc<AtomicU64>,
+}
+
+impl<W> ProgressWriter<W> {
+    pub(crate) fn new(inner: W, progress: Arc<AtomicU64>) -> Self {
+        Self { inner, progress }
+    }
+
+    /// Recover the wrapped writer (e.g. to fsync the File once the dump is done).
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: WriteVolatile> WriteVolatile for ProgressWriter<W> {
+    fn write_volatile<B: BitmapSlice>(
+        &mut self,
+        buf: &VolatileSlice<B>,
+    ) -> Result<usize, VolatileMemoryError> {
+        let n = self.inner.write_volatile(buf)?;
+        self.progress.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl<W: Seek> Seek for ProgressWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// Handle to a background thread writing a diff snapshot's dirty pages.
+#[derive(Debug)]
+pub struct BackgroundMemoryWriter {
+    handle: Option<JoinHandle<Result<(), BackgroundWriteError>>>,
+    status: Arc<AtomicU8>,
+    /// Bytes written so far by the dump (advanced via a `ProgressWriter`). `wait_timeout`
+    /// watches this for forward progress instead of a fixed wall-clock budget.
+    progress: Arc<AtomicU64>,
+}
+
+impl BackgroundMemoryWriter {
+    /// Spawn a writer thread running `dump`. `dump` must own everything it needs
+    /// (a cloned, Arc-backed guest-memory handle, the frozen dirty bitmap, and the
+    /// already-sized output file) and perform the write + fsync itself. `progress` is
+    /// the byte counter the dump advances (via `ProgressWriter`), shared with
+    /// `wait_timeout` for stall detection.
+    pub fn start<F>(dump: F, progress: Arc<AtomicU64>) -> Result<Self, BackgroundWriteError>
+    where
+        F: FnOnce() -> Result<(), BackgroundWriteError> + Send + 'static,
+    {
+        let status = Arc::new(AtomicU8::new(STATUS_WRITING));
+        let status_thread = Arc::clone(&status);
+        let handle = std::thread::Builder::new()
+            .name("fc_snapshot_writer".to_string())
+            .spawn(move || {
+                let result = dump();
+                status_thread.store(
+                    if result.is_ok() { STATUS_COMPLETE } else { STATUS_ERROR },
+                    Ordering::Release,
+                );
+                result
+            })
+            .map_err(|e| BackgroundWriteError::SpawnThread(e.to_string()))?;
+        Ok(Self {
+            handle: Some(handle),
+            status,
+            progress,
+        })
+    }
+
+    /// Current write status (one of the `STATUS_*` constants).
+    pub fn status(&self) -> u8 {
+        self.status.load(Ordering::Acquire)
+    }
+
+    /// Block until the writer finishes, or until the dump makes no forward progress for
+    /// `stall_timeout`. Size-independent: a legitimately long dump keeps advancing the byte counter
+    /// and never trips, while a wedged write (hung disk) trips regardless of guest-RAM size. On a
+    /// stall the thread is left running (it can't be safely killed mid-write); Timeout is a failure.
+    pub fn wait_timeout(&mut self, stall_timeout: Duration) -> Result<(), BackgroundWriteError> {
+        let mut last_progress = self.progress.load(Ordering::Relaxed);
+        let mut last_advance = Instant::now();
+        loop {
+            match self.status.load(Ordering::Acquire) {
+                STATUS_COMPLETE | STATUS_ERROR => {
+                    return match self.handle.take() {
+                        Some(h) => h.join().map_err(|_| BackgroundWriteError::ThreadPanicked)?,
+                        None => Err(BackgroundWriteError::ThreadPanicked),
+                    };
+                }
+                _ => {}
+            }
+            if self.handle.is_none() {
+                return Err(BackgroundWriteError::ThreadPanicked);
+            }
+            let cur = self.progress.load(Ordering::Relaxed);
+            if cur != last_progress {
+                last_progress = cur;
+                last_advance = Instant::now();
+            } else if last_advance.elapsed() >= stall_timeout {
+                return Err(BackgroundWriteError::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn zero_progress() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(0))
+    }
+
+    #[test]
+    fn drop_joins_unawaited_writer() {
+        // A writer dropped without wait_timeout must still join its thread, so no detached
+        // thread keeps writing the snapshot file. Prove it via a flag the dump sets late:
+        // if it's set once drop() returns, drop blocked until the thread completed.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thread = Arc::clone(&done);
+        let writer = BackgroundMemoryWriter::start(
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                done_thread.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            zero_progress(),
+        )
+        .unwrap();
+        drop(writer);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "Drop did not join the still-running writer thread"
+        );
+    }
+
+    #[test]
+    fn wait_does_not_trip_while_progress_advances() {
+        // A dump that keeps advancing the byte counter must complete even though the total run far
+        // exceeds the stall timeout — proving the wait is size-independent, not a fixed deadline.
+        let progress = zero_progress();
+        let p = Arc::clone(&progress);
+        let mut w = BackgroundMemoryWriter::start(
+            move || {
+                for _ in 0..10 {
+                    std::thread::sleep(Duration::from_millis(15));
+                    p.fetch_add(4096, Ordering::Relaxed);
+                }
+                Ok(())
+            },
+            progress,
+        )
+        .unwrap();
+        // stall_timeout 40ms > per-step 15ms, but the run is ~150ms > 40ms: must NOT trip.
+        assert!(w.wait_timeout(Duration::from_millis(40)).is_ok());
+    }
+
+    #[test]
+    fn wait_trips_on_stall() {
+        // A dump that stays alive but stops advancing must trip after the stall timeout.
+        let progress = zero_progress();
+        let mut w = BackgroundMemoryWriter::start(
+            move || {
+                std::thread::sleep(Duration::from_millis(500)); // alive, never advances progress
+                Ok(())
+            },
+            progress,
+        )
+        .unwrap();
+        assert!(matches!(
+            w.wait_timeout(Duration::from_millis(50)),
+            Err(BackgroundWriteError::Timeout)
+        ));
+    }
+}
+
+impl Drop for BackgroundMemoryWriter {
+    fn drop(&mut self) {
+        // Join a still-running writer so a dropped or overwritten handle can never leave a
+        // detached thread writing the snapshot file — which would race a later writer on the
+        // same file and silently lose durability. `wait_timeout` already took the handle on a
+        // completed/failed write, so this only fires when the handle was dropped without being
+        // awaited. The writer owns an Arc clone of guest memory, so the join is sound even as
+        // the owning Vmm tears down (the mmaps outlive it via that refcount).
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}

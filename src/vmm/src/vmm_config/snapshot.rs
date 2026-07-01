@@ -61,6 +61,19 @@ pub struct CreateSnapshotParams {
     /// Requires `block_delta_dir`.
     #[serde(default)]
     pub flatten: bool,
+    /// If true (and `snapshot_type` is `Diff`), write the memory diff on a background
+    /// thread and return at the snapshot point; confirm durability with
+    /// `PUT /snapshot/complete`. The vCPUs must stay paused until then. Ignored for
+    /// `Full` snapshots.
+    #[serde(default)]
+    pub async_snapshot: bool,
+    /// Memfd bridge (requires `snapshot_type` is `Diff`): write the microVM state plus a
+    /// sidecar at this path listing the dirty pages' byte offsets (little-endian u64,
+    /// ascending), and skip the memory dump entirely. The orchestrator holds the guest
+    /// memory memfd and copies exactly those pages from it after Firecracker exits, so the
+    /// VM unit frees up immediately for a fast resume. The vCPUs must stay paused.
+    #[serde(default)]
+    pub dirty_offsets_path: Option<PathBuf>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
@@ -92,6 +105,9 @@ pub struct LoadSnapshotParams {
     /// Each overlay device will look for `{drive_id}.delta` in this directory
     /// and apply it to a fresh overlay, enabling fast VM cloning.
     pub block_delta_dir: Option<PathBuf>,
+    /// Back the restored guest memory with a memfd (MAP_SHARED) instead of an
+    /// anonymous mapping. See `MachineConfig::shared_mem`.
+    pub shared_mem: bool,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -124,6 +140,10 @@ pub struct LoadSnapshotConfig {
     /// Optional directory containing block device delta files for cloning.
     #[serde(default)]
     pub block_delta_dir: Option<PathBuf>,
+    /// Back the restored guest memory with a memfd (MAP_SHARED). See
+    /// `MachineConfig::shared_mem`.
+    #[serde(default)]
+    pub shared_mem: bool,
 }
 
 /// Stores the configuration used for managing snapshot memory.
@@ -142,6 +162,12 @@ pub struct MemBackendConfig {
     /// meaningful for `UffdInternal`; ignored otherwise.
     #[serde(default)]
     pub base_path: Option<PathBuf>,
+    /// Intermediate overlay (diff) files between `base_path` and `backend_path`, ordered
+    /// oldest → newest, for a multi-layer `UffdInternal` restore. Empty for a single-overlay
+    /// or monolithic restore. Only meaningful for `UffdInternal` with `base_path` set;
+    /// ignored otherwise.
+    #[serde(default)]
+    pub lower_overlay_paths: Vec<PathBuf>,
     /// When true, an unexpected `UffdInternal` handler death aborts Firecracker instead
     /// of leaving the guest to freeze on its next page fault. Only meaningful for
     /// `UffdInternal`; ignored otherwise. Defaults to false (opt-in).

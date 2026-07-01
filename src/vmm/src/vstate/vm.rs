@@ -393,6 +393,76 @@ impl Vm {
             .map_err(|err| MemoryBackingFile("sync_all", err))
     }
 
+    /// Begin an asynchronous diff memory snapshot: capture the dirty set now and run
+    /// the write + fsync on a background thread, returning a handle to await via
+    /// `complete_snapshot`. The caller MUST keep the vCPUs paused until then — the
+    /// thread reads the live guest mmaps (shared via the Arc clone), so a running
+    /// guest would race the dump.
+    pub(crate) fn begin_async_diff_snapshot(
+        &self,
+        mem_file_path: &Path,
+    ) -> Result<crate::snapshot::background_writer::BackgroundMemoryWriter, CreateSnapshotError> {
+        use crate::snapshot::background_writer::{
+            BackgroundMemoryWriter, BackgroundWriteError, ProgressWriter,
+        };
+        use crate::vstate::memory::GuestMemoryExtension;
+        use self::CreateSnapshotError::*;
+
+        let file_existed = mem_file_path.exists();
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(mem_file_path)
+            .map_err(|err| MemoryBackingFile("open", err))?;
+
+        let mem_size_mib = mem_size_mib(self.guest_memory());
+        let expected_size = mem_size_mib * 1024 * 1024;
+        if file_existed {
+            let file_size = file
+                .metadata()
+                .map_err(|e| MemoryBackingFile("get_metadata", e))?
+                .len();
+            if file_size != expected_size {
+                file.set_len(0)
+                    .map_err(|err| MemoryBackingFile("truncate", err))?;
+            }
+        }
+        file.set_len(expected_size)
+            .map_err(|e| MemoryBackingFile("set_length", e))?;
+
+        // Capture the dirty set and share the guest memory with the writer thread
+        // (the Arc clone shares the mmaps — no copy of guest RAM).
+        let dirty_bitmap = self.get_dirty_bitmap()?;
+        let memory = self.guest_memory().clone();
+
+        // Count bytes through a ProgressWriter so complete_snapshot can detect a stall
+        // (size-independent) rather than use a fixed deadline; recover the File to fsync.
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress_dump = std::sync::Arc::clone(&progress);
+        BackgroundMemoryWriter::start(
+            move || {
+                let mut writer = ProgressWriter::new(file, progress_dump);
+                memory
+                    .dump_dirty(&mut writer, &dirty_bitmap)
+                    .map_err(|e| BackgroundWriteError::Write(format!("dump_dirty: {e}")))?;
+                let mut file = writer.into_inner();
+                file.flush()
+                    .map_err(|e| BackgroundWriteError::Write(format!("flush: {e}")))?;
+                file.sync_all()
+                    .map_err(|e| BackgroundWriteError::Write(format!("sync_all: {e}")))?;
+                Ok(())
+            },
+            progress,
+        )
+        .map_err(|e| {
+            MemoryBackingFile(
+                "spawn_async_writer",
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            )
+        })
+    }
+
     /// Register a device IRQ
     pub fn register_irq(&self, fd: &EventFd, gsi: u32) -> Result<(), errno::Error> {
         self.common.fd.register_irqfd(fd, gsi)?;

@@ -215,6 +215,44 @@ impl<'a> GuestMemorySlot<'a> {
         Ok(())
     }
 
+    /// Append the file offsets (`file_base + page_offset`) of this slot's dirty
+    /// pages to `out`. Mirrors `dump_dirty`'s page selection exactly (KVM bitmap ∪
+    /// Firecracker bitmap, same bounds handling) but emits offsets instead of data,
+    /// so the memfd-bridge dump stays byte-for-byte equivalent to a normal diff.
+    pub(crate) fn dirty_page_offsets(
+        &self,
+        kvm_bitmap: &[u64],
+        page_size: usize,
+        file_base: u64,
+        out: &mut Vec<u64>,
+    ) -> Result<(), MemoryError> {
+        let firecracker_bitmap = self.slice.bitmap();
+        let expected_bitmap_array_len = (self.slice.len() / page_size).div_ceil(64);
+        if kvm_bitmap.len() > expected_bitmap_array_len {
+            return Err(MemoryError::DirtyBitmapTooLarge);
+        } else if kvm_bitmap.len() < expected_bitmap_array_len {
+            return Err(MemoryError::DirtyBitmapTooSmall);
+        }
+
+        for (i, v) in kvm_bitmap.iter().enumerate() {
+            for j in 0..64 {
+                let page_offset = ((i * 64) + j) * page_size;
+                if page_offset >= self.slice.len() {
+                    if (v >> j) != 0 {
+                        return Err(MemoryError::DirtyBitmapTooLarge);
+                    }
+                    break;
+                }
+                let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
+                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+                if is_kvm_page_dirty || is_firecracker_page_dirty {
+                    out.push(file_base + page_offset as u64);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Makes the slot host memory PROT_NONE (true) or PROT_READ|PROT_WRITE (false)
     pub(crate) fn protect(&self, protected: bool) -> Result<(), MemoryError> {
         let prot = if protected {
@@ -615,6 +653,13 @@ where
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError>;
 
+    /// Byte offsets (in the flattened mem-file layout) of the pages `dump_dirty`
+    /// would write for `dirty_bitmap` — the same KVM-log ∪ Firecracker-bitmap
+    /// selection, in ascending order, but without the page data. For the memfd
+    /// bridge: the orchestrator copies exactly these pages from the held guest-memory memfd, so
+    /// Firecracker need not dump them itself. Does not reset any dirty bitmap.
+    fn dirty_page_offsets(&self, dirty_bitmap: &DirtyBitmap) -> Result<Vec<u64>, MemoryError>;
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
 
@@ -742,6 +787,27 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         write_result
     }
 
+    fn dirty_page_offsets(&self, dirty_bitmap: &DirtyBitmap) -> Result<Vec<u64>, MemoryError> {
+        let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+        let mut out = Vec::new();
+        // file_base tracks each slot's start in the flattened mem file. It advances by
+        // every slot's length — plugged or not — matching dump_dirty's seek-over-unplugged.
+        let mut file_base: u64 = 0;
+        self.iter()
+            .flat_map(|region| region.slots())
+            .try_for_each(|(mem_slot, plugged)| {
+                if plugged {
+                    let kvm_bitmap = dirty_bitmap
+                        .get(&mem_slot.slot)
+                        .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+                    mem_slot.dirty_page_offsets(kvm_bitmap, page_size, file_base, &mut out)?;
+                }
+                file_base += mem_slot.slice.len() as u64;
+                Ok::<(), MemoryError>(())
+            })?;
+        Ok(out)
+    }
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self) {
         self.iter().for_each(|region| {
@@ -825,7 +891,17 @@ fn create_memfd(
     let opts = memfd::MemfdOptions::default()
         .hugetlb(hugetlb_size)
         .allow_sealing(true);
-    let mem_file = opts.create("guest_mem").map_err(MemoryError::Memfd)?;
+    // Name it per-VM ("guest_mem-<instance id>") so an orchestrator capturing a paused VM's memfd
+    // for a fast resume matches THIS VM's memory by name, not the first process on the host with a
+    // generic "guest_mem" memfd — which, on a mis-resolved PID, would be a different tenant's RAM.
+    let name = format!(
+        "guest_mem-{}",
+        crate::logger::INSTANCE_ID
+            .get()
+            .map(String::as_str)
+            .unwrap_or(crate::logger::DEFAULT_INSTANCE_ID)
+    );
+    let mem_file = opts.create(&name).map_err(MemoryError::Memfd)?;
 
     // Resize to guest mem size.
     mem_file
@@ -1313,6 +1389,61 @@ mod tests {
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
             guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            Err(MemoryError::DirtyBitmapTooSmall)
+        ));
+    }
+
+    #[test]
+    fn test_dirty_page_offsets() {
+        let page_size = get_page_size().unwrap();
+        let ps = page_size as u64;
+
+        // Two regions of two pages each, with a guest-address gap between them. In the
+        // mem file they are contiguous, so region 1 starts at file offset 2*page_size.
+        let region_1_address = GuestAddress(0);
+        let region_2_address = GuestAddress(ps * 3);
+        let region_size = page_size * 2;
+        let guest_memory = into_region_ext(
+            anonymous(
+                [
+                    (region_1_address, region_size),
+                    (region_2_address, region_size),
+                ]
+                .into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+
+        // Firecracker-bitmap contribution (set by writing): region 0 page 1, region 1 page 0.
+        guest_memory
+            .write(&vec![1u8; page_size], GuestAddress(ps))
+            .unwrap();
+        guest_memory
+            .write(&vec![2u8; page_size], region_2_address)
+            .unwrap();
+
+        // KVM-bitmap contribution: region 0 page 0, region 1 page 1.
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![0b01]);
+        kvm_dirty_bitmap.insert(1, vec![0b10]);
+
+        // Union, in ascending contiguous-file order:
+        //   region0 p0 (kvm) -> 0, region0 p1 (fc) -> ps,
+        //   region1 p0 (fc)  -> 2*ps, region1 p1 (kvm) -> 3*ps.
+        let offsets = guest_memory.dirty_page_offsets(&kvm_dirty_bitmap).unwrap();
+        assert_eq!(offsets, vec![0, ps, 2 * ps, 3 * ps]);
+
+        // Bitmap-size guards mirror dump_dirty exactly.
+        kvm_dirty_bitmap.insert(0, vec![0b1, 0b01]);
+        assert!(matches!(
+            guest_memory.dirty_page_offsets(&kvm_dirty_bitmap),
+            Err(MemoryError::DirtyBitmapTooLarge)
+        ));
+        kvm_dirty_bitmap.insert(0, vec![]);
+        assert!(matches!(
+            guest_memory.dirty_page_offsets(&kvm_dirty_bitmap),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
     }
