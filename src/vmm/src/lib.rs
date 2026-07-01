@@ -355,8 +355,11 @@ impl Vmm {
         // still in place, so a retry re-awaits the same write. Releasing it only after a
         // confirmed-durable wait prevents a retry from finding `None` and falsely reporting
         // completion for a write that's still in flight or already failed.
+        //
+        // Stall timeout, not a total deadline (see wait_timeout): a long-but-progressing write
+        // keeps going, so this needs no re-tuning as the guest-RAM cap grows.
         writer
-            .wait_timeout(std::time::Duration::from_secs(30))
+            .wait_timeout(std::time::Duration::from_secs(15))
             .map_err(crate::persist::CreateSnapshotError::AsyncBackgroundWrite)?;
         self.active_snapshot = None;
         log::info!("async memory snapshot complete (durable)");

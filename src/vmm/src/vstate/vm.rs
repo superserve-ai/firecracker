@@ -402,12 +402,14 @@ impl Vm {
         &self,
         mem_file_path: &Path,
     ) -> Result<crate::snapshot::background_writer::BackgroundMemoryWriter, CreateSnapshotError> {
-        use crate::snapshot::background_writer::{BackgroundMemoryWriter, BackgroundWriteError};
+        use crate::snapshot::background_writer::{
+            BackgroundMemoryWriter, BackgroundWriteError, ProgressWriter,
+        };
         use crate::vstate::memory::GuestMemoryExtension;
         use self::CreateSnapshotError::*;
 
         let file_existed = mem_file_path.exists();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
@@ -434,16 +436,25 @@ impl Vm {
         let dirty_bitmap = self.get_dirty_bitmap()?;
         let memory = self.guest_memory().clone();
 
-        BackgroundMemoryWriter::start(move || {
-            memory
-                .dump_dirty(&mut file, &dirty_bitmap)
-                .map_err(|e| BackgroundWriteError::Write(format!("dump_dirty: {e}")))?;
-            file.flush()
-                .map_err(|e| BackgroundWriteError::Write(format!("flush: {e}")))?;
-            file.sync_all()
-                .map_err(|e| BackgroundWriteError::Write(format!("sync_all: {e}")))?;
-            Ok(())
-        })
+        // Count bytes through a ProgressWriter so complete_snapshot can detect a stall
+        // (size-independent) rather than use a fixed deadline; recover the File to fsync.
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress_dump = std::sync::Arc::clone(&progress);
+        BackgroundMemoryWriter::start(
+            move || {
+                let mut writer = ProgressWriter::new(file, progress_dump);
+                memory
+                    .dump_dirty(&mut writer, &dirty_bitmap)
+                    .map_err(|e| BackgroundWriteError::Write(format!("dump_dirty: {e}")))?;
+                let mut file = writer.into_inner();
+                file.flush()
+                    .map_err(|e| BackgroundWriteError::Write(format!("flush: {e}")))?;
+                file.sync_all()
+                    .map_err(|e| BackgroundWriteError::Write(format!("sync_all: {e}")))?;
+                Ok(())
+            },
+            progress,
+        )
         .map_err(|e| {
             MemoryBackingFile(
                 "spawn_async_writer",
