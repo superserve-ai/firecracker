@@ -891,7 +891,17 @@ fn create_memfd(
     let opts = memfd::MemfdOptions::default()
         .hugetlb(hugetlb_size)
         .allow_sealing(true);
-    let mem_file = opts.create("guest_mem").map_err(MemoryError::Memfd)?;
+    // Name it per-VM ("guest_mem-<instance id>") so an orchestrator capturing a paused VM's memfd
+    // for a fast resume matches THIS VM's memory by name, not the first process on the host with a
+    // generic "guest_mem" memfd — which, on a mis-resolved PID, would be a different tenant's RAM.
+    let name = format!(
+        "guest_mem-{}",
+        crate::logger::INSTANCE_ID
+            .get()
+            .map(String::as_str)
+            .unwrap_or(crate::logger::DEFAULT_INSTANCE_ID)
+    );
+    let mem_file = opts.create(&name).map_err(MemoryError::Memfd)?;
 
     // Resize to guest mem size.
     mem_file
