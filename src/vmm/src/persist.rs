@@ -228,15 +228,11 @@ pub fn create_snapshot(
         }
         Err(_) => None,
     };
-    {
-        let f = File::create(crate::uffd_internal::presence_sidecar_path(
-            &params.mem_file_path,
-        ))
-        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero", err))?;
-        f.sync_all().map_err(|err| {
-            CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero_sync", err)
-        })?;
-    }
+    crate::uffd_internal::write_file_durable(
+        &crate::uffd_internal::presence_sidecar_path(&params.mem_file_path),
+        &[],
+    )
+    .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero", err))?;
 
     let diff_dump = vmm
         .vm
@@ -250,13 +246,29 @@ pub fn create_snapshot(
         page_size,
         npages,
         md.blksize(),
+        // An in-process UFFD handler means this VM was restored from a layered
+        // overlay, so the memory file is part of a layered chain.
+        vmm.uffd_handler.is_some(),
         diff_dump,
         prior_presence,
     )
     .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?;
-    if let Some(bits) = presence {
-        crate::uffd_internal::write_presence_bitmap(&params.mem_file_path, page_size, npages, &bits)
-            .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?;
+    match presence {
+        Some(bits) => crate::uffd_internal::write_presence_bitmap(
+            &params.mem_file_path,
+            page_size,
+            npages,
+            &bits,
+        )
+        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?,
+        // Replace the torn-save sentinel with the explicit "no presence derivable"
+        // marker so a layered restore of this file names the real cause instead of
+        // reporting a torn save.
+        None => crate::uffd_internal::write_file_durable(
+            &crate::uffd_internal::presence_sidecar_path(&params.mem_file_path),
+            &[crate::uffd_internal::PRESENCE_UNDERIVABLE],
+        )
+        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?,
     }
 
     // Write delta files for overlay block devices if a delta directory is specified.
@@ -288,13 +300,17 @@ pub fn create_snapshot(
 /// the pages it wrote. A diff merged into a pre-existing file provides the union of
 /// the prior file's pages and this dump's — the prior side-car is the authority on
 /// the former; extent scanning is only the fallback for merges into pre-side-car
-/// overlays, and is refused (with a warning) when the filesystem's allocation unit
-/// is coarser than a page, since the scan would over-report presence there.
+/// overlays of a layered chain, and is refused (with a warning) when the
+/// filesystem's allocation unit is coarser than a page, since the scan would
+/// over-report presence there. Merges outside a layered chain (`layered` false —
+/// e.g. upstream-style in-place diffs of a full-size memory file) skip the scan
+/// entirely: nothing will layer the file, so the scan would be pure hot-path cost.
 fn derive_presence(
     mem_path: &Path,
     page_size: usize,
     npages: usize,
     blksize: u64,
+    layered: bool,
     diff_dump: Option<DiffDump>,
     prior_presence: Option<Vec<u64>>,
 ) -> Result<Option<Vec<u64>>, io::Error> {
@@ -313,6 +329,8 @@ fn derive_presence(
         vec![0u64; words]
     } else if let Some(prior) = prior_presence.filter(|p| p.len() == words) {
         prior
+    } else if !layered {
+        return Ok(None);
     } else if blksize > page_size as u64 {
         warn!(
             "presence side-car skipped for {mem_path:?}: diff merged into a memory file \
@@ -338,16 +356,8 @@ fn snapshot_state_to_file(
 
     // Zero side-car before main: a torn save leaves a 0-byte sentinel rather
     // than NEW main + STALE OverlayState. `rename` isn't in the seccomp allowlist.
-    {
-        let f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(overlay_sidecar_path(snapshot_path))
-            .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero", err))?;
-        f.sync_all()
-            .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero_sync", err))?;
-    }
+    crate::uffd_internal::write_file_durable(&overlay_sidecar_path(snapshot_path), &[])
+        .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero", err))?;
 
     let mut snapshot_file = OpenOptions::new()
         .create(true)
@@ -419,15 +429,7 @@ fn write_overlay_sidecar(
     let path = overlay_sidecar_path(snapshot_path);
     let bytes = bitcode::serialize(&sidecar)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode sidecar: {e}")))?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)?;
-    f.write_all(&bytes)?;
-    f.flush()?;
-    f.sync_all()?;
-    Ok(())
+    crate::uffd_internal::write_file_durable(&path, &bytes)
 }
 
 /// Load the overlay side-car (if it exists) and inject its `OverlayState`
@@ -1021,7 +1023,7 @@ mod tests {
         let path = dir.path().join("mem");
 
         // Full dump: all pages present, tail bits past npages masked off.
-        let bits = derive_presence(&path, ps, 70, ps as u64, None, None)
+        let bits = derive_presence(&path, ps, 70, ps as u64, true, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(bits, vec![u64::MAX, (1u64 << 6) - 1]);
@@ -1032,7 +1034,7 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: false,
         };
-        let bits = derive_presence(&path, ps, 4, ps as u64, Some(diff), Some(vec![0b0001]))
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), Some(vec![0b0001]))
             .unwrap()
             .unwrap();
         assert_eq!(bits, vec![0b1010]);
@@ -1043,13 +1045,13 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: true,
         };
-        let bits = derive_presence(&path, ps, 4, ps as u64, Some(diff), Some(vec![0b0101]))
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), Some(vec![0b0101]))
             .unwrap()
             .unwrap();
         assert_eq!(bits, vec![0b1111]);
 
         // A prior side-car of the wrong geometry is ignored, and with a coarse
-        // filesystem the scan is refused too: no bitmap (sentinel stays).
+        // filesystem the scan is refused too: no bitmap (marker gets written).
         let diff = DiffDump {
             dumped_pages: vec![0b1010],
             merged: true,
@@ -1059,14 +1061,25 @@ mod tests {
             ps,
             4,
             (ps * 32) as u64,
+            true,
             Some(diff),
             Some(vec![0b1, 0b1]),
         )
         .unwrap();
         assert!(refused.is_none());
 
-        // Merged diff, no prior side-car, page-granular filesystem: legacy
-        // fallback scans the merged file's extents and unions the dump.
+        // A merge outside a layered chain never scans: no bitmap, regardless of
+        // the filesystem.
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: true,
+        };
+        let refused = derive_presence(&path, ps, 4, ps as u64, false, Some(diff), None).unwrap();
+        assert!(refused.is_none());
+
+        // Merged diff in a layered chain, no prior side-car, page-granular
+        // filesystem: legacy fallback scans the merged file's extents and unions
+        // the dump.
         let mut f = std::fs::File::create(&path).unwrap();
         f.set_len((4 * ps) as u64).unwrap();
         f.seek(SeekFrom::Start(0)).unwrap();
@@ -1077,7 +1090,7 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: true,
         };
-        let bits = derive_presence(&path, ps, 4, ps as u64, Some(diff), None)
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), None)
             .unwrap()
             .unwrap();
         assert_eq!(bits, vec![0b1011]);

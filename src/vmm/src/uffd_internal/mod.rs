@@ -425,6 +425,7 @@ fn mmap_snapshot(path: &Path) -> std::io::Result<SnapshotMmap> {
 /// One bit per guest page: set ⇒ the page is present in the overlay (diff) file,
 /// clear ⇒ it must be served from the base. Built once at setup from the overlay's
 /// allocated extents (see `scan_present_pages`).
+#[derive(Debug)]
 pub(crate) struct PresenceBitmap {
     pub(crate) bits: Vec<u64>,
 }
@@ -474,14 +475,16 @@ fn validate_layered(
             "base is {base_size} bytes, smaller than guest RAM {total_mem}"
         )));
     }
-    // dump_dirty writes dirtied pages at the host page size, so a huge-page guest
-    // (page_size > host) would leave a partially-dirty huge page as host-page data+hole
-    // extents while the scan marks the whole huge page present — serving its clean
-    // sub-ranges as overlay zeros. Require host-page granularity.
-    if page_size > host_page_size {
+    // dump_dirty writes dirtied pages at the host page size and the save stamps the
+    // side-car with it, so layered restore requires exactly host-page granularity:
+    // a huge-page guest (page_size > host) would leave a partially-dirty huge page
+    // as host-page data+hole extents while presence marks the whole huge page, and
+    // a sub-host page size (e.g. the default 4096 on a 16K/64K-page host) would
+    // misindex the bitmap and misalign every UFFDIO_COPY.
+    if page_size != host_page_size {
         return Err(InternalUffdError::LayeredInvalid(format!(
-            "layered restore needs host-page granularity, but page size is {page_size} \
-             (host page size {host_page_size}); huge-page overlays are unsupported"
+            "layered restore requires the host page size ({host_page_size}), but the \
+             restore page size is {page_size}; huge-page overlays are unsupported"
         )));
     }
     // Scanned presence is page-granular only when the filesystem's allocation unit is
@@ -546,8 +549,14 @@ pub(crate) fn scan_present_pages(path: &Path, page_size: usize) -> std::io::Resu
 /// artifact that out-of-band tooling must be able to parse and regenerate, and
 /// its encoding must not shift under a serialization-dependency upgrade.
 const PRESENCE_MAGIC: [u8; 8] = *b"FCPRSNC1";
-/// Side-car header: magic, page_size (u64 LE), npages (u64 LE).
+/// Side-car header: magic, page_size (u64 LE), npages (u64 LE). The bitmap words
+/// follow, then a trailing CRC64 (LE) over everything before it.
 const PRESENCE_HEADER_LEN: usize = 24;
+/// Single-byte side-car content marking a memory file whose save could not
+/// derive a presence bitmap (a diff merged into a pre-side-car overlay whose
+/// extent scan can't be trusted). Distinct from the 0-byte torn-save sentinel so
+/// a layered restore can name each cause precisely.
+pub(crate) const PRESENCE_UNDERIVABLE: u8 = 0x55;
 
 /// Path of the page-presence side-car for a given memory file path.
 pub fn presence_sidecar_path(mem_path: &Path) -> PathBuf {
@@ -556,9 +565,91 @@ pub fn presence_sidecar_path(mem_path: &Path) -> PathBuf {
     p.into()
 }
 
+/// Write `bytes` to `path` (create/truncate in place — `rename`/`unlink` are not
+/// in the seccomp allowlist), fsync the file, then fsync the parent directory so
+/// the dirent itself is durable. Without the directory fsync a crash can keep
+/// the data but lose a newly created file's directory entry — for a presence
+/// side-car that reads back as "no side-car" and silently re-enables extent
+/// scanning of a torn merge.
+pub(crate) fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+impl PresenceBitmap {
+    /// Serialize as a presence side-car: magic, page size, page count, bitmap
+    /// words, trailing CRC64. Kept as a pair with [`PresenceBitmap::decode`] so
+    /// any layout change is a single-impl edit.
+    fn encode(bits: &[u64], page_size: usize, npages: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(PRESENCE_HEADER_LEN + bits.len() * 8 + 8);
+        bytes.extend_from_slice(&PRESENCE_MAGIC);
+        bytes.extend_from_slice(&(page_size as u64).to_le_bytes());
+        bytes.extend_from_slice(&(npages as u64).to_le_bytes());
+        for w in bits {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let crc = crc64::crc64(0, &bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    /// Parse and validate a presence side-car produced by [`PresenceBitmap::encode`].
+    /// Rejects wrong magic, page-size/page-count mismatches against the overlay,
+    /// wrong total length, and CRC failures — a flipped word would otherwise
+    /// silently mis-layer 64 pages.
+    fn decode(
+        bytes: &[u8],
+        path: &Path,
+        page_size: usize,
+        expected_npages: usize,
+    ) -> Result<PresenceBitmap, InternalUffdError> {
+        let invalid = |msg: String| InternalUffdError::LayeredInvalid(msg);
+        let words = expected_npages.div_ceil(64);
+        let expected_len = PRESENCE_HEADER_LEN + words * 8 + 8;
+        if bytes.len() < PRESENCE_HEADER_LEN + 8 || bytes[..8] != PRESENCE_MAGIC {
+            return Err(invalid(format!(
+                "presence side-car at {path:?} has an unrecognized header"
+            )));
+        }
+        if bytes.len() != expected_len {
+            return Err(invalid(format!(
+                "presence side-car at {path:?} is {} bytes, expected {expected_len}",
+                bytes.len()
+            )));
+        }
+        let (payload, crc_bytes) = bytes.split_at(bytes.len() - 8);
+        let stored_crc = u64::from_le_bytes(crc_bytes.try_into().unwrap());
+        let computed_crc = crc64::crc64(0, payload);
+        if stored_crc != computed_crc {
+            return Err(invalid(format!(
+                "presence side-car at {path:?} fails its checksum \
+                 (stored {stored_crc:#x}, computed {computed_crc:#x})"
+            )));
+        }
+        let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        let (sc_page_size, sc_npages) = (u64_at(8), u64_at(16));
+        if sc_page_size != page_size as u64 || sc_npages != expected_npages as u64 {
+            return Err(invalid(format!(
+                "presence side-car at {path:?} describes page size {sc_page_size} / \
+                 {sc_npages} pages, but the overlay has page size {page_size} / \
+                 {expected_npages} pages"
+            )));
+        }
+        let mut pm = PresenceBitmap::with_pages(expected_npages);
+        for (i, chunk) in payload[PRESENCE_HEADER_LEN..].chunks_exact(8).enumerate() {
+            pm.bits[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        Ok(pm)
+    }
+}
+
 /// Write `<mem_path>.presence`: an explicit page-presence bitmap for the memory
-/// file, in a fixed little-endian layout (magic, page size, page count, bitmap
-/// words). One set bit per file page whose content the memory file provides.
+/// file. One set bit per file page whose content the memory file provides.
 ///
 /// Persisting presence explicitly is the point of the side-car: a sparse diff's
 /// extent map also encodes presence (written extent = dirty, hole = clean), but
@@ -579,19 +670,10 @@ pub(crate) fn write_presence_bitmap(
             npages.div_ceil(64)
         )));
     }
-    let mut bytes = Vec::with_capacity(PRESENCE_HEADER_LEN + bits.len() * 8);
-    bytes.extend_from_slice(&PRESENCE_MAGIC);
-    bytes.extend_from_slice(&(page_size as u64).to_le_bytes());
-    bytes.extend_from_slice(&(npages as u64).to_le_bytes());
-    for w in bits {
-        bytes.extend_from_slice(&w.to_le_bytes());
-    }
-    // File::create truncates in place; + fsync this is the same syscall envelope
-    // as the vmstate side-car (`rename`/`unlink` are not in the seccomp allowlist).
-    let mut f = std::fs::File::create(presence_sidecar_path(mem_path))?;
-    f.write_all(&bytes)?;
-    f.sync_all()?;
-    Ok(())
+    write_file_durable(
+        &presence_sidecar_path(mem_path),
+        &PresenceBitmap::encode(bits, page_size, npages),
+    )
 }
 
 /// Load `<overlay>.presence` if it exists. `Ok(None)` ⇒ no side-car (a pre-side-car
@@ -620,40 +702,23 @@ pub(crate) fn read_presence_sidecar(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(InternalUffdError::LayeredSetup(e)),
     };
+    // "(torn snapshot save)" is a load-bearing marker: orchestrators match this
+    // exact substring (shared with the vmstate side-car's torn error) to classify
+    // the failure as data loss and re-snapshot, rather than as a permanent
+    // precondition failure. Keep the wording in sync with persist.rs.
     if bytes.is_empty() {
         return Err(InternalUffdError::LayeredInvalid(format!(
-            "presence side-car at {path:?} is empty: the save was interrupted, or it \
-             could not derive presence for this memory file (a diff merged on a \
-             filesystem without page-granular allocation — see save-time warnings); \
-             this file cannot be layered"
+            "presence side-car at {path:?} is empty (torn snapshot save)"
         )));
     }
-    if bytes.len() < PRESENCE_HEADER_LEN || bytes[..8] != PRESENCE_MAGIC {
+    if bytes == [PRESENCE_UNDERIVABLE] {
         return Err(InternalUffdError::LayeredInvalid(format!(
-            "presence side-car at {path:?} has an unrecognized header"
+            "presence side-car at {path:?} marks the memory file as un-layerable: its \
+             save merged a diff without a prior side-car on a filesystem whose extent \
+             scan cannot be trusted (see save-time warnings)"
         )));
     }
-    let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-    let (sc_page_size, sc_npages) = (u64_at(8), u64_at(16));
-    if sc_page_size != page_size as u64 || sc_npages != expected_npages as u64 {
-        return Err(InternalUffdError::LayeredInvalid(format!(
-            "presence side-car at {path:?} describes page size {sc_page_size} / {sc_npages} \
-             pages, but the overlay has page size {page_size} / {expected_npages} pages"
-        )));
-    }
-    let words = expected_npages.div_ceil(64);
-    if bytes.len() != PRESENCE_HEADER_LEN + words * 8 {
-        return Err(InternalUffdError::LayeredInvalid(format!(
-            "presence side-car at {path:?} is {} bytes, expected {}",
-            bytes.len(),
-            PRESENCE_HEADER_LEN + words * 8
-        )));
-    }
-    let mut pm = PresenceBitmap::with_pages(expected_npages);
-    for (i, chunk) in bytes[PRESENCE_HEADER_LEN..].chunks_exact(8).enumerate() {
-        pm.bits[i] = u64::from_le_bytes(chunk.try_into().unwrap());
-    }
-    Ok(Some(pm))
+    PresenceBitmap::decode(&bytes, &path, page_size, expected_npages).map(Some)
 }
 
 /// The memory backing a layered (or single-file) restore. `overlay` is the file
@@ -1285,12 +1350,26 @@ mod tests {
         // No side-car ⇒ fall back to scanning (pre-side-car snapshots).
         assert!(read_presence_sidecar(&path, ps, 2).unwrap().is_none());
 
-        // 0-byte side-car is the torn-save / full-save sentinel ⇒ hard error.
+        // 0-byte side-car is the torn-save sentinel ⇒ hard error carrying the
+        // exact "(torn snapshot save)" marker orchestrators classify on.
         std::fs::write(presence_sidecar_path(&path), []).unwrap();
-        assert!(matches!(
-            read_presence_sidecar(&path, ps, 2),
-            Err(InternalUffdError::LayeredInvalid(_))
-        ));
+        match read_presence_sidecar(&path, ps, 2) {
+            Err(InternalUffdError::LayeredInvalid(msg)) => {
+                assert!(msg.contains("(torn snapshot save)"), "message was: {msg}");
+            }
+            other => panic!("expected LayeredInvalid, got {other:?}"),
+        }
+
+        // The 1-byte marker means the save couldn't derive presence ⇒ a distinct
+        // hard error that does NOT read as a torn save.
+        std::fs::write(presence_sidecar_path(&path), [PRESENCE_UNDERIVABLE]).unwrap();
+        match read_presence_sidecar(&path, ps, 2) {
+            Err(InternalUffdError::LayeredInvalid(msg)) => {
+                assert!(!msg.contains("(torn snapshot save)"), "message was: {msg}");
+                assert!(msg.contains("un-layerable"), "message was: {msg}");
+            }
+            other => panic!("expected LayeredInvalid, got {other:?}"),
+        }
 
         // A valid side-car for a *different* geometry ⇒ hard error, never a scan
         // fallback (the bitmap doesn't describe this overlay).
@@ -1312,6 +1391,20 @@ mod tests {
             read_presence_sidecar(&path, ps, 2),
             Err(InternalUffdError::LayeredInvalid(_))
         ));
+
+        // A single flipped bit anywhere in a valid side-car fails the checksum —
+        // without it, one flipped word silently mis-layers 64 pages.
+        let scanned = scan_present_pages(&path, ps).unwrap();
+        write_presence_bitmap(&path, ps, 2, &scanned.bits).unwrap();
+        let mut bytes = std::fs::read(presence_sidecar_path(&path)).unwrap();
+        bytes[PRESENCE_HEADER_LEN] ^= 0x01;
+        std::fs::write(presence_sidecar_path(&path), &bytes).unwrap();
+        match read_presence_sidecar(&path, ps, 2) {
+            Err(InternalUffdError::LayeredInvalid(msg)) => {
+                assert!(msg.contains("checksum"), "message was: {msg}");
+            }
+            other => panic!("expected LayeredInvalid, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1459,6 +1552,16 @@ mod tests {
             total,
             2 * 1024 * 1024,
             ps,
+            Some(ps as u64)
+        )));
+        // Sub-host page size (e.g. default 4096 on a 16K-page host) — would misindex
+        // the presence bitmap and misalign UFFDIO_COPY.
+        assert!(bad(validate_layered(
+            4 * ps,
+            4 * ps,
+            total,
+            ps,
+            4 * ps,
             Some(ps as u64)
         )));
         // Filesystem block size larger than the page — scanned holes wouldn't be
