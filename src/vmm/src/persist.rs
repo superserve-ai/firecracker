@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -208,8 +210,38 @@ pub fn create_snapshot(
         }
     }
 
+    // Zero the memory file's presence side-car before the dump: a torn save must
+    // leave the 0-byte sentinel, never a fresh memory file next to a stale bitmap
+    // (same discipline as the vmstate `.overlay` side-car). Full saves keep the
+    // sentinel: the File restore path never reads it, and a layered restore pointed
+    // at a full memory file must fail loudly rather than trust stale bits.
+    {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(crate::uffd_internal::presence_sidecar_path(
+                &params.mem_file_path,
+            ))
+            .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero", err))?;
+        f.sync_all().map_err(|err| {
+            CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero_sync", err)
+        })?;
+    }
+
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+
+    // A diff's dirty-page set is encoded in its extent map (dirty = written extent,
+    // clean = hole), which file transfers don't reliably preserve. Persist it as an
+    // explicit bitmap so the overlay stays restorable wherever it's copied.
+    if params.snapshot_type == SnapshotType::Diff {
+        crate::uffd_internal::write_presence_sidecar(
+            &params.mem_file_path,
+            crate::arch::host_page_size(),
+        )
+        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?;
+    }
 
     // Write delta files for overlay block devices if a delta directory is specified.
     if let Some(ref delta_dir) = params.block_delta_dir {
