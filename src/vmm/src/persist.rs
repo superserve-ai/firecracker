@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -36,6 +37,7 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
+use crate::vstate::vm::DiffDump;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
@@ -208,8 +210,66 @@ pub fn create_snapshot(
         }
     }
 
-    vmm.vm
+    // Presence side-car lifecycle around the memory dump. Read the prior side-car
+    // first: when a diff merges into a pre-existing memory file, the prior bitmap
+    // is the only trustworthy record of which of that file's pages hold real
+    // content (its extent map may descend from a transfer that rewrote extents —
+    // the exact signal the side-car replaces). Then zero the side-car so a torn
+    // save leaves a 0-byte sentinel rather than a fresh memory file next to a
+    // stale bitmap (same discipline as the vmstate `.overlay` side-car above).
+    let page_size = crate::arch::host_page_size();
+    let prior_presence = match std::fs::metadata(&params.mem_file_path) {
+        Ok(md) => {
+            let npages = u64_to_usize(md.len().div_ceil(page_size as u64));
+            crate::uffd_internal::read_presence_sidecar(&params.mem_file_path, page_size, npages)
+                .ok()
+                .flatten()
+                .map(|pm| pm.bits)
+        }
+        Err(_) => None,
+    };
+    crate::uffd_internal::write_file_durable(
+        &crate::uffd_internal::presence_sidecar_path(&params.mem_file_path),
+        &[],
+    )
+    .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero", err))?;
+
+    let diff_dump = vmm
+        .vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+
+    let md = std::fs::metadata(&params.mem_file_path)
+        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_stat", err))?;
+    let npages = u64_to_usize(md.len().div_ceil(page_size as u64));
+    let presence = derive_presence(
+        &params.mem_file_path,
+        page_size,
+        npages,
+        md.blksize(),
+        // An in-process UFFD handler means this VM was restored from a layered
+        // overlay, so the memory file is part of a layered chain.
+        vmm.uffd_handler.is_some(),
+        diff_dump,
+        prior_presence,
+    )
+    .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?;
+    match presence {
+        Some(bits) => crate::uffd_internal::write_presence_bitmap(
+            &params.mem_file_path,
+            page_size,
+            npages,
+            &bits,
+        )
+        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?,
+        // Replace the torn-save sentinel with the explicit "no presence derivable"
+        // marker so a layered restore of this file names the real cause instead of
+        // reporting a torn save.
+        None => crate::uffd_internal::write_file_durable(
+            &crate::uffd_internal::presence_sidecar_path(&params.mem_file_path),
+            &[crate::uffd_internal::PRESENCE_UNDERIVABLE],
+        )
+        .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?,
+    }
 
     // Write delta files for overlay block devices if a delta directory is specified.
     if let Some(ref delta_dir) = params.block_delta_dir {
@@ -232,6 +292,62 @@ pub fn create_snapshot(
     Ok(())
 }
 
+/// Presence bitmap for the memory file a dump just produced, or `None` when none
+/// can be derived — the 0-byte sentinel then stays in place and a layered restore
+/// of this file refuses loudly.
+///
+/// A full dump provides every page. A diff dump into a fresh file provides exactly
+/// the pages it wrote. A diff merged into a pre-existing file provides the union of
+/// the prior file's pages and this dump's — the prior side-car is the authority on
+/// the former; extent scanning is only the fallback for merges into pre-side-car
+/// overlays of a layered chain, and is refused (with a warning) when the
+/// filesystem's allocation unit is coarser than a page, since the scan would
+/// over-report presence there. Merges outside a layered chain (`layered` false —
+/// e.g. upstream-style in-place diffs of a full-size memory file) skip the scan
+/// entirely: nothing will layer the file, so the scan would be pure hot-path cost.
+fn derive_presence(
+    mem_path: &Path,
+    page_size: usize,
+    npages: usize,
+    blksize: u64,
+    layered: bool,
+    diff_dump: Option<DiffDump>,
+    prior_presence: Option<Vec<u64>>,
+) -> Result<Option<Vec<u64>>, io::Error> {
+    let words = npages.div_ceil(64);
+    let Some(diff) = diff_dump else {
+        // Full dump; mask the tail so bits past npages stay clear.
+        let mut bits = vec![u64::MAX; words];
+        if npages % 64 != 0 {
+            bits[words - 1] = (1u64 << (npages % 64)) - 1;
+        }
+        return Ok(Some(bits));
+    };
+    let mut bits = if !diff.merged {
+        // Fresh file: this dump is its entire content; any prior side-car
+        // described a file that no longer exists.
+        vec![0u64; words]
+    } else if let Some(prior) = prior_presence.filter(|p| p.len() == words) {
+        prior
+    } else if !layered {
+        return Ok(None);
+    } else if blksize > page_size as u64 {
+        warn!(
+            "presence side-car skipped for {mem_path:?}: diff merged into a memory file \
+             with no prior side-car on a filesystem without page-granular allocation \
+             (block size {blksize} > page size {page_size}); this file cannot be \
+             layered-restored"
+        );
+        return Ok(None);
+    } else {
+        crate::uffd_internal::scan_present_pages(mem_path, page_size)?.bits
+    };
+    for (bit_word, dumped) in bits.iter_mut().zip(diff.dumped_pages.iter()) {
+        *bit_word |= dumped;
+    }
+    Ok(Some(bits))
+}
+
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
@@ -240,16 +356,8 @@ fn snapshot_state_to_file(
 
     // Zero side-car before main: a torn save leaves a 0-byte sentinel rather
     // than NEW main + STALE OverlayState. `rename` isn't in the seccomp allowlist.
-    {
-        let f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(overlay_sidecar_path(snapshot_path))
-            .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero", err))?;
-        f.sync_all()
-            .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero_sync", err))?;
-    }
+    crate::uffd_internal::write_file_durable(&overlay_sidecar_path(snapshot_path), &[])
+        .map_err(|err| SnapshotBackingFile("overlay_sidecar_zero", err))?;
 
     let mut snapshot_file = OpenOptions::new()
         .create(true)
@@ -321,15 +429,7 @@ fn write_overlay_sidecar(
     let path = overlay_sidecar_path(snapshot_path);
     let bytes = bitcode::serialize(&sidecar)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode sidecar: {e}")))?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)?;
-    f.write_all(&bytes)?;
-    f.flush()?;
-    f.sync_all()?;
-    Ok(())
+    crate::uffd_internal::write_file_durable(&path, &bytes)
 }
 
 /// Load the overlay side-car (if it exists) and inject its `OverlayState`
@@ -914,6 +1014,87 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
+
+    #[test]
+    fn derive_presence_covers_every_dump_shape() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem");
+
+        // Full dump: all pages present, tail bits past npages masked off.
+        let bits = derive_presence(&path, ps, 70, ps as u64, true, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bits, vec![u64::MAX, (1u64 << 6) - 1]);
+
+        // Fresh-file diff: exactly the dumped pages; a prior side-car described a
+        // file that was truncated away and must be ignored.
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: false,
+        };
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), Some(vec![0b0001]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bits, vec![0b1010]);
+
+        // Merged diff with a prior side-car: prior ∪ dumped, never a rescan of the
+        // merged file's extents.
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: true,
+        };
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), Some(vec![0b0101]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bits, vec![0b1111]);
+
+        // A prior side-car of the wrong geometry is ignored, and with a coarse
+        // filesystem the scan is refused too: no bitmap (marker gets written).
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: true,
+        };
+        let refused = derive_presence(
+            &path,
+            ps,
+            4,
+            (ps * 32) as u64,
+            true,
+            Some(diff),
+            Some(vec![0b1, 0b1]),
+        )
+        .unwrap();
+        assert!(refused.is_none());
+
+        // A merge outside a layered chain never scans: no bitmap, regardless of
+        // the filesystem.
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: true,
+        };
+        let refused = derive_presence(&path, ps, 4, ps as u64, false, Some(diff), None).unwrap();
+        assert!(refused.is_none());
+
+        // Merged diff in a layered chain, no prior side-car, page-granular
+        // filesystem: legacy fallback scans the merged file's extents and unions
+        // the dump.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len((4 * ps) as u64).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&vec![7u8; ps]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: true,
+        };
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bits, vec![0b1011]);
+    }
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");

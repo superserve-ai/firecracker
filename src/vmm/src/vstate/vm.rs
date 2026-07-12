@@ -47,6 +47,18 @@ pub struct RoutingEntry {
     masked: bool,
 }
 
+/// Outcome of a diff memory dump, used by the caller to derive the memory
+/// file's presence side-car.
+#[derive(Debug)]
+pub(crate) struct DiffDump {
+    /// Bitmap over the memory file's pages (one bit per host page, LSB-first
+    /// per word) of exactly the pages this dump wrote.
+    pub dumped_pages: Vec<u64>,
+    /// True when the diff was merged into a pre-existing same-size file,
+    /// whose earlier pages remain in the file but are not in `dumped_pages`.
+    pub merged: bool,
+}
+
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
@@ -331,11 +343,16 @@ impl Vm {
     /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
     /// file of matching size, then the diff snapshot will be directly merged into the existing
     /// snapshot. Otherwise, existing files are simply overwritten.
+    ///
+    /// For diff snapshots, returns which file pages this dump wrote and whether it merged into a
+    /// pre-existing same-size file (whose earlier pages remain in the file but are not covered by
+    /// `dumped_pages`); the caller derives the memory file's presence side-car from this. Full
+    /// snapshots return `None` — every page of a full dump is authoritative.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
-    ) -> Result<(), CreateSnapshotError> {
+    ) -> Result<Option<DiffDump>, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
         // Need to check this here, as we create the file in the line below
@@ -352,6 +369,7 @@ impl Vm {
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
 
+        let mut merged = false;
         if file_existed {
             let file_size = file
                 .metadata()
@@ -368,6 +386,8 @@ impl Vm {
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
+            } else {
+                merged = true;
             }
         }
 
@@ -375,22 +395,28 @@ impl Vm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
-        match snapshot_type {
+        let diff_dump = match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                let dumped_pages = self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                Some(DiffDump {
+                    dumped_pages,
+                    merged,
+                })
             }
             SnapshotType::Full => {
                 self.guest_memory().dump(&mut file)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
+                None
             }
         };
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
-            .map_err(|err| MemoryBackingFile("sync_all", err))
+            .map_err(|err| MemoryBackingFile("sync_all", err))?;
+        Ok(diff_dump)
     }
 
     /// Register a device IRQ

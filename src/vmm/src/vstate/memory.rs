@@ -133,12 +133,20 @@ impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
 }
 
 impl<'a> GuestMemorySlot<'a> {
-    /// Dumps the dirty pages in this slot onto the writer
+    /// Dumps the dirty pages in this slot onto the writer.
+    ///
+    /// Every page written is also recorded in `dumped_pages` at bit index
+    /// `base_page + page index within the slot`, so the caller gets the exact
+    /// set of file pages this dump produced (the same kvm|firecracker dirty
+    /// predicate that decides what gets written — kept in one place so the
+    /// two can't drift).
     pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         kvm_bitmap: &[u64],
         page_size: usize,
+        base_page: usize,
+        dumped_pages: &mut [u64],
     ) -> Result<(), MemoryError> {
         let firecracker_bitmap = self.slice.bitmap();
         let mut write_size = 0;
@@ -171,6 +179,8 @@ impl<'a> GuestMemorySlot<'a> {
                 }
 
                 if is_kvm_page_dirty || is_firecracker_page_dirty {
+                    let file_page = base_page + (i * 64) + j;
+                    dumped_pages[file_page >> 6] |= 1u64 << (file_page & 63);
                     // We are at the start of a new batch of dirty pages.
                     if skip_size > 0 {
                         // Seek forward over the unmodified pages.
@@ -609,11 +619,14 @@ where
     fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
+    ///
+    /// Returns the exact set of file pages this dump wrote, as a bitmap over
+    /// the memory file's pages (one bit per host page, LSB-first per word).
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
-    ) -> Result<(), MemoryError>;
+    ) -> Result<Vec<u64>, MemoryError>;
 
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
@@ -711,9 +724,16 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<Vec<u64>, MemoryError> {
         let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+        let total_len: usize = self
+            .iter()
+            .flat_map(|region| region.slots())
+            .map(|(mem_slot, _)| mem_slot.slice.len())
+            .sum();
+        let mut dumped_pages = vec![0u64; (total_len / page_size).div_ceil(64)];
 
+        let mut file_offset = 0usize;
         let write_result =
             self.iter()
                 .flat_map(|region| region.slots())
@@ -728,18 +748,24 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                         let kvm_bitmap = dirty_bitmap
                             .get(&mem_slot.slot)
                             .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
-                        mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
+                        mem_slot.dump_dirty(
+                            writer,
+                            kvm_bitmap,
+                            page_size,
+                            file_offset / page_size,
+                            &mut dumped_pages,
+                        )?;
                     }
+                    file_offset += mem_slot.slice.len();
                     Ok(())
                 });
 
-        if write_result.is_err() {
+        if let Err(err) = write_result {
             self.store_dirty_bitmap(dirty_bitmap, page_size);
-        } else {
-            self.reset_dirty();
+            return Err(err);
         }
-
-        write_result
+        self.reset_dirty();
+        Ok(dumped_pages)
     }
 
     /// Resets all the memory region bitmaps
@@ -1196,9 +1222,11 @@ mod tests {
         kvm_dirty_bitmap.insert(1, vec![0b10]);
 
         let mut file = TempFile::new().unwrap().into_file();
-        guest_memory
+        let dumped = guest_memory
             .dump_dirty(&mut file, &kvm_dirty_bitmap)
             .unwrap();
+        // kvm ∪ firecracker bitmaps cover all 4 file pages on the first dump.
+        assert_eq!(dumped, vec![0b1111]);
 
         // We can restore from this because this is the first dirty dump.
         let restored_guest_memory =
@@ -1235,9 +1263,11 @@ mod tests {
         kvm_dirty_bitmap.insert(0, vec![0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
 
-        guest_memory
+        let dumped = guest_memory
             .dump_dirty(&mut reader, &kvm_dirty_bitmap)
             .unwrap();
+        // File pages 0 (kvm), 1 (firecracker), 3 (kvm) were written; page 2 is a hole.
+        assert_eq!(dumped, vec![0b1011]);
 
         // Check that only the dirty regions are dumped.
         let mut diff_file_content = Vec::new();
@@ -1270,9 +1300,11 @@ mod tests {
         file.as_file().set_len(logical_size).unwrap();
 
         let mut reader = file.into_file();
-        guest_memory
+        let dumped = guest_memory
             .dump_dirty(&mut reader, &kvm_dirty_bitmap)
             .unwrap();
+        // Only the firecracker bitmap is dirty this round: file pages 0 and 2.
+        assert_eq!(dumped, vec![0b0101]);
 
         // Check that only the dirty regions are dumped.
         let mut diff_file_content = Vec::new();
