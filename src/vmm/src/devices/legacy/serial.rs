@@ -215,14 +215,12 @@ impl std::io::Write for SerialOut {
         let n = self.sink.write(&buf[..take])?;
         self.written += n as u64;
         if n < take {
-            // Short write on the UNDER-cap portion — the sink is non-blocking
-            // and its buffer is full. Report only what was accepted so the
-            // caller (vm-superio's write_all) retries the rest, exactly as the
-            // uncapped sink did. Never claim more than the sink took here.
+            // Short write on the UNDER-cap portion (non-blocking sink full):
+            // report only what was accepted so the caller's write_all retries
+            // the rest, exactly as the uncapped sink did.
             return Ok(n);
         }
-        // All under-cap bytes were written; the over-cap remainder (if any) is
-        // dropped and counted, and reported consumed so the guest never blocks.
+        // Under-cap bytes written; drop and count the over-cap remainder.
         let dropped = buf.len() - take;
         if dropped > 0 {
             METRICS.missed_write_count.add(dropped as u64);
