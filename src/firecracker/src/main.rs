@@ -41,6 +41,11 @@ use crate::seccomp::SeccompConfig;
 // see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build capabilities advertised by `--version` (one `capability: <name>`
+/// line each). serial-console-cap: the serial device bounds guest console
+/// output per boot, so a supervisor may route it to a plain file safely.
+const CAPABILITIES: &[&str] = &["serial-console-cap"];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -278,6 +283,11 @@ fn main_exec() -> Result<(), MainError> {
 
     if arguments.flag_present("version") {
         println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+        // Advertise build capabilities, one per line, so a supervisor can
+        // verify a feature is present before relying on it.
+        for cap in CAPABILITIES {
+            println!("capability: {cap}");
+        }
         return Ok(());
     }
 
