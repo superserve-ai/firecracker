@@ -127,13 +127,24 @@ impl SerialEvents for SerialEventsWrapper {
     }
 }
 
+/// Per-boot cap on guest console output. The serial console is untrusted:
+/// without a bound, a guest that floods it grows the host-side console file
+/// without limit and can fill the host disk. Enforced here, inside
+/// Firecracker, so the bound holds regardless of the supervising daemon —
+/// there is no external drainer to keep alive. 1 MiB is far more than a boot
+/// log plus a panic dump; overflow is dropped. Reset per boot (a fresh device
+/// on each restore), so the host truncates its file per launch to keep the
+/// on-disk total bounded too.
+const CONSOLE_MAX_BYTES: u64 = 1 << 20;
+
+/// The concrete sink a serial device writes guest output to.
 #[derive(Debug)]
-pub enum SerialOut {
+pub enum SerialSink {
     Sink,
     Stdout(std::io::Stdout),
     File(File),
 }
-impl std::io::Write for SerialOut {
+impl std::io::Write for SerialSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Sink => Ok(buf.len()),
@@ -147,6 +158,61 @@ impl std::io::Write for SerialOut {
             Self::Stdout(stdout) => stdout.flush(),
             Self::File(file) => file.flush(),
         }
+    }
+}
+
+/// Serial output with a byte cap. Past the cap, writes are dropped but still
+/// reported as fully consumed, so a flooding guest is bounded without ever
+/// blocking on a full sink. cap == 0 means uncapped (used by the null sink).
+#[derive(Debug)]
+pub struct SerialOut {
+    sink: SerialSink,
+    written: u64,
+    cap: u64,
+    capped_logged: bool,
+}
+
+impl SerialOut {
+    /// A discarding sink, uncapped (nothing is written anywhere).
+    pub fn sink() -> Self {
+        Self { sink: SerialSink::Sink, written: 0, cap: 0, capped_logged: false }
+    }
+    /// Stdout, capped at CONSOLE_MAX_BYTES per boot.
+    pub fn stdout() -> Self {
+        Self {
+            sink: SerialSink::Stdout(std::io::stdout()),
+            written: 0,
+            cap: CONSOLE_MAX_BYTES,
+            capped_logged: false,
+        }
+    }
+    /// A file, capped at CONSOLE_MAX_BYTES per boot.
+    pub fn file(file: File) -> Self {
+        Self { sink: SerialSink::File(file), written: 0, cap: CONSOLE_MAX_BYTES, capped_logged: false }
+    }
+}
+
+impl std::io::Write for SerialOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.cap != 0 && self.written >= self.cap {
+            if !self.capped_logged {
+                self.capped_logged = true;
+                warn!("serial console hit {}-byte cap; dropping further output", self.cap);
+            }
+            return Ok(buf.len()); // drop; report consumed so the guest never blocks
+        }
+        let take = if self.cap != 0 {
+            let remaining = usize::try_from(self.cap - self.written).unwrap_or(usize::MAX);
+            buf.len().min(remaining)
+        } else {
+            buf.len()
+        };
+        let n = self.sink.write(&buf[..take])?;
+        self.written += n as u64;
+        Ok(buf.len()) // overflow beyond `take` is intentionally dropped
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
     }
 }
 
@@ -400,6 +466,34 @@ mod tests {
     use crate::logger::IncMetric;
 
     #[test]
+    fn test_serial_out_cap() {
+        use std::io::Write;
+
+        // A tempfile-backed capped SerialOut drops output past CONSOLE_MAX_BYTES
+        // but reports every write fully consumed (the guest never blocks).
+        let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let mut out = SerialOut::file(tmp.as_file().try_clone().unwrap());
+
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut reported: u64 = 0;
+        // Write well past the cap.
+        for _ in 0..(CONSOLE_MAX_BYTES / chunk.len() as u64 + 8) {
+            reported += out.write(&chunk).unwrap() as u64;
+        }
+        out.flush().unwrap();
+
+        // Every byte offered was reported consumed ...
+        assert!(reported > CONSOLE_MAX_BYTES);
+        // ... but the file on disk is bounded to the cap.
+        let size = tmp.as_file().metadata().unwrap().len();
+        assert_eq!(size, CONSOLE_MAX_BYTES, "capped output must bound the file");
+
+        // The uncapped sink never bounds (cap == 0).
+        let mut sink = SerialOut::sink();
+        assert_eq!(sink.write(&chunk).unwrap(), chunk.len());
+    }
+
+    #[test]
     fn test_serial_bus_read() {
         let intr_evt = EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
 
@@ -411,7 +505,7 @@ mod tests {
                 SerialEventsWrapper {
                     buffer_ready_event_fd: None,
                 },
-                SerialOut::Sink,
+                SerialOut::sink(),
             ),
             input: None::<std::io::Stdin>,
         };

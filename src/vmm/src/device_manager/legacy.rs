@@ -105,7 +105,7 @@ impl PortIODeviceManager {
                 SerialEventsWrapper {
                     buffer_ready_event_fd: None,
                 },
-                SerialOut::Sink,
+                SerialOut::sink(),
             ),
             input: None,
         }));
@@ -115,7 +115,7 @@ impl PortIODeviceManager {
                 SerialEventsWrapper {
                     buffer_ready_event_fd: None,
                 },
-                SerialOut::Sink,
+                SerialOut::sink(),
             ),
             input: None,
         }));
@@ -250,7 +250,7 @@ mod tests {
                     SerialEventsWrapper {
                         buffer_ready_event_fd: None,
                     },
-                    SerialOut::Sink,
+                    SerialOut::sink(),
                 ),
                 input: None,
             })),

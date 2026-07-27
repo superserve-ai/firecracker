@@ -125,11 +125,11 @@ impl DeviceManager {
         output: Option<&PathBuf>,
     ) -> Result<Arc<Mutex<SerialDevice>>, std::io::Error> {
         let (serial_in, serial_out) = match output {
-            Some(path) => (None, open_file_nonblock(path).map(SerialOut::File)?),
+            Some(path) => (None, open_file_nonblock(path).map(SerialOut::file)?),
             None => {
                 Self::set_stdout_nonblocking();
 
-                (Some(std::io::stdin()), SerialOut::Stdout(std::io::stdout()))
+                (Some(std::io::stdin()), SerialOut::stdout())
             }
         };
 
@@ -742,7 +742,7 @@ pub(crate) mod tests {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = PortIODeviceManager::new(
             Arc::new(Mutex::new(
-                SerialDevice::new(None, SerialOut::Sink).unwrap(),
+                SerialDevice::new(None, SerialOut::sink()).unwrap(),
             )),
             Arc::new(Mutex::new(
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
