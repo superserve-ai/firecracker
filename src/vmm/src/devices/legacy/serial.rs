@@ -132,9 +132,10 @@ impl SerialEvents for SerialEventsWrapper {
 /// without limit and can fill the host disk. Enforced here, inside
 /// Firecracker, so the bound holds regardless of the supervising daemon —
 /// there is no external drainer to keep alive. 1 MiB is far more than a boot
-/// log plus a panic dump; overflow is dropped. Reset per boot (a fresh device
-/// on each restore), so the host truncates its file per launch to keep the
-/// on-disk total bounded too.
+/// log plus a panic dump; overflow is dropped. The counter resets per boot (a
+/// fresh device on each restore); to keep the ON-DISK total bounded across
+/// boots too, a regular serial output file is truncated at open
+/// (setup_serial_device), and the stdout path is a host-truncated fd.
 const CONSOLE_MAX_BYTES: u64 = 1 << 20;
 
 /// The concrete sink a serial device writes guest output to.
@@ -199,7 +200,11 @@ impl std::io::Write for SerialOut {
                 self.capped_logged = true;
                 warn!("serial console hit {}-byte cap; dropping further output", self.cap);
             }
-            return Ok(buf.len()); // drop; report consumed so the guest never blocks
+            // Fully over the cap: drop, but report the bytes consumed so the
+            // guest never blocks. Count them as missed writes so the drop is
+            // observable, like the device's other loss paths.
+            METRICS.missed_write_count.add(buf.len() as u64);
+            return Ok(buf.len());
         }
         let take = if self.cap != 0 {
             let remaining = usize::try_from(self.cap - self.written).unwrap_or(usize::MAX);
@@ -209,7 +214,20 @@ impl std::io::Write for SerialOut {
         };
         let n = self.sink.write(&buf[..take])?;
         self.written += n as u64;
-        Ok(buf.len()) // overflow beyond `take` is intentionally dropped
+        if n < take {
+            // Short write on the UNDER-cap portion — the sink is non-blocking
+            // and its buffer is full. Report only what was accepted so the
+            // caller (vm-superio's write_all) retries the rest, exactly as the
+            // uncapped sink did. Never claim more than the sink took here.
+            return Ok(n);
+        }
+        // All under-cap bytes were written; the over-cap remainder (if any) is
+        // dropped and counted, and reported consumed so the guest never blocks.
+        let dropped = buf.len() - take;
+        if dropped > 0 {
+            METRICS.missed_write_count.add(dropped as u64);
+        }
+        Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.sink.flush()
