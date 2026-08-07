@@ -31,7 +31,7 @@ fn create_serial(
             SerialEventsWrapper {
                 buffer_ready_event_fd: Some(kick_stdin_evt.try_clone().unwrap()),
             },
-            SerialOut::Stdout(std::io::stdout()),
+            SerialOut::stdout(),
         ),
         input: Some(Box::new(serial_in)),
     }))
