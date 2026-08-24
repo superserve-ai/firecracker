@@ -27,17 +27,17 @@ recommended.
 
 Firecracker implements the 8250 serial device, which is visible from the guest
 side and is tied to the Firecracker/non-daemonized jailer process stdout.
-Without proper handling, because the guest has access to the serial device, this
-can lead to unbound memory or storage usage on the host side. Firecracker does
-not offer users the option to limit serial data transfer, nor does it impose any
-restrictions on stdout handling. Users are responsible for handling the memory
-and storage usage of the Firecracker process stdout. We suggest using any
-upper-bounded forms of storage, such as fixed-size or ring buffers, using
-programs like `journald` or `logrotate`, or redirecting to `/dev/null` or a
-named pipe. Furthermore, we do not recommend that users enable the serial device
-in production. To disable it in the guest kernel, use the `8250.nr_uarts=0` boot
-argument when configuring the boot source. Please be aware that the device can
-be reactivated from within the guest even if it was disabled at boot.
+Without proper handling, because the guest has access to the serial device. This
+can lead to unbound memory or storage usage on the host side. Users are
+responsible for handling the memory and storage usage of the Firecracker process
+stdout. We recommend using the rate limiter for the serial data transfer that
+Firecracker offers or any upper-bounded forms of storage, such as fixed-size or
+ring buffers, using programs like `journald` or `logrotate`, or redirecting to
+`/dev/null` or a named pipe. Furthermore, we do not recommend that users enable
+the serial device in production. To disable it in the guest kernel, use the
+`8250.nr_uarts=0` boot argument when configuring the boot source. Please be
+aware that the device can be reactivated from within the guest even if it was
+disabled at boot.
 
 If Firecracker's `stdout` buffer is non-blocking and full (assuming it has a
 bounded size), any subsequent writes will fail, resulting in data loss, until
@@ -96,6 +96,11 @@ namespace isolation and drops privileges of the Firecracker process.
 
 To set up the jailer correctly, you'll need to:
 
+- Ensure that all paths provided to the jailer (`--exec-file`,
+  `--chroot-base-dir`, `--netns`) and their parent directories are not writable
+  by unprivileged users. The jailer treats all its inputs as trusted; it is the
+  operator's responsibility to ensure that these paths cannot be tampered with
+  by other local users.
 - Create a dedicated non-privileged POSIX user and group to run Firecracker
   under. Use the created POSIX user and group IDs in Jailer's `--uid <uid>` and
   `--gid <gid>` flags, respectively. This will run the Firecracker as the
@@ -216,6 +221,34 @@ most classful qdiscs perform rate control.
     responsible for them
   - `connlimit` - restricts the number of connections for a destination IP
     address/from a source IP address, as well as limit the bandwidth
+
+### Filtering Guest Egress Network Traffic
+
+As stated in Firecracker's [threat model](./design.md#threat-containment),
+Firecracker does not perform any network traffic filtering. Packets are
+forwarded directly from the guest's virtual network interface to the TAP device.
+Firewall rules should therefore be implemented on the host to ensure that a
+malicious VM cannot access restricted addresses.
+
+`nft` or `iptables-nft` can be used to implement packet filtering rules. One
+commonly used rule is to drop packets from VMs with the host's IMDS store as the
+destination. Using the same rule tables and chains as the
+[network setup guide](./network-setup.md#on-the-host):
+
+#### `nft`
+
+```
+sudo nft add rule firecracker filter iifname "tap*" ip daddr 169.254.169.254 counter drop
+```
+
+#### `iptables-nft`
+
+```
+sudo iptables-nft -I FORWARD -i tap+ -d 169.254.169.254 -j DROP
+```
+
+This will drop all IPv4 packets originating from any TAP device with IMDS as the
+destination.
 
 ### Mitigating Noisy-Neighbour Storage Device Contention
 

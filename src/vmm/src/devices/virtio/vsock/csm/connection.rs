@@ -82,7 +82,6 @@ use std::num::Wrapping;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use log::{debug, error, info, warn};
 use vm_memory::GuestMemoryError;
 use vm_memory::io::{ReadVolatile, WriteVolatile};
 use vmm_sys_util::epoll::EventSet;
@@ -93,7 +92,7 @@ use super::txbuf::TxBuf;
 use super::{ConnState, PendingRx, PendingRxSet, VsockCsmError, defs};
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketHeader, VsockPacketRx, VsockPacketTx};
-use crate::logger::IncMetric;
+use crate::logger::{IncMetric, debug, error, info, warn};
 use crate::utils::wrap_usize_to_u32;
 
 /// Trait that vsock connection backends need to implement.
@@ -291,8 +290,9 @@ where
     /// using them to manage the internal connection state.
     ///
     /// Returns:
-    /// always `Ok(())`: the packet has been consumed;
-    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError> {
+    /// The packet is always consumed: host-side back-pressure is buffered and unrecoverable
+    /// stream errors terminate the connection.
+    fn send_pkt(&mut self, pkt: &VsockPacketTx) {
         // Update the peer credit information.
         self.peer_buf_alloc = pkt.hdr.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt());
@@ -310,7 +310,7 @@ where
                         "vsock: dropping empty data packet from guest (lp={}, pp={}",
                         self.local_port, self.peer_port
                     );
-                    return Ok(());
+                    return;
                 }
 
                 // Unwrapping here is safe, since we just checked `pkt.buf()` above.
@@ -322,7 +322,7 @@ where
                         self.local_port, self.peer_port, err
                     );
                     self.kill();
-                    return Ok(());
+                    return;
                 }
 
                 // We might've just consumed some data. If that's the case, we might need to
@@ -395,8 +395,6 @@ where
                 );
             }
         };
-
-        Ok(())
     }
 
     /// Check if the connection has any pending packet addressed to the peer.
@@ -923,7 +921,7 @@ mod tests {
         }
 
         fn send(&mut self) {
-            self.conn.send_pkt(&self.tx_pkt).unwrap();
+            self.conn.send_pkt(&self.tx_pkt);
         }
 
         fn recv(&mut self) {

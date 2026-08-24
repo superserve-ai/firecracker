@@ -1,6 +1,12 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(all(feature = "fuzzing", not(debug_assertions)))]
+compile_error!(
+    "The `fuzzing` feature must not be used in release builds. \
+     Build with the dev profile instead: `cargo build --features fuzzing`"
+);
+
 mod api_server;
 mod api_server_adapter;
 mod generated;
@@ -21,8 +27,11 @@ use utils::arg_parser::{ArgParser, Argument};
 use utils::validators::validate_instance_id;
 use vmm::arch::host_page_size;
 use vmm::builder::StartMicrovmError;
+#[cfg(feature = "fuzzing")]
+use vmm::logger::warn_unrestricted;
 use vmm::logger::{
-    LOGGER, LoggerConfig, METRICS, ProcessTimeReporter, StoreMetric, debug, error, info,
+    LOGGER, LoggerConfig, METRICS, ProcessTimeReporter, StoreMetric, debug, error_unrestricted,
+    info_unrestricted,
 };
 use vmm::persist::SNAPSHOT_VERSION;
 use vmm::resources::VmResources;
@@ -40,7 +49,11 @@ use crate::seccomp::SeccompConfig;
 // runtime file.
 // see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
-const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
+    concat!(env!("CARGO_PKG_VERSION"), "+fuzzing")
+} else {
+    env!("CARGO_PKG_VERSION")
+};
 
 /// Build capabilities advertised by `--version` (one `capability: <name>`
 /// line each). serial-console-cap: the serial device bounds guest console
@@ -99,13 +112,13 @@ impl From<MainError> for FcExitCode {
 fn main() -> ExitCode {
     let result = main_exec();
     if let Err(err) = result {
-        error!("{err}");
+        error_unrestricted!("{err}");
         eprintln!("Error: {err:?}");
         let exit_code = FcExitCode::from(err) as u8;
-        error!("Firecracker exiting with error. exit_code={exit_code}");
+        error_unrestricted!("Firecracker exiting with error. exit_code={exit_code}");
         ExitCode::from(exit_code)
     } else {
-        info!("Firecracker exiting successfully. exit_code=0");
+        info_unrestricted!("Firecracker exiting successfully. exit_code=0");
         ExitCode::SUCCESS
     }
 }
@@ -128,9 +141,9 @@ fn main_exec() -> Result<(), MainError> {
         // We're currently using the closure parameter, which is a &PanicInfo, for printing the
         // origin of the panic, including the payload passed to panic! and the source code location
         // from which the panic originated.
-        error!("Firecracker {}", info);
+        error_unrestricted!("Firecracker {}", info);
         if let Err(err) = stdin.lock().set_canon_mode() {
-            error!(
+            error_unrestricted!(
                 "Failure while trying to reset stdin to canonical mode: {}",
                 err
             );
@@ -140,7 +153,7 @@ fn main_exec() -> Result<(), MainError> {
 
         // Write the metrics before aborting.
         if let Err(err) = METRICS.write() {
-            error!("Failed to write metrics while panicking: {}", err);
+            error_unrestricted!("Failed to write metrics while panicking: {}", err);
         }
     }));
 
@@ -327,7 +340,13 @@ fn main_exec() -> Result<(), MainError> {
             module,
         })
         .map_err(MainError::LoggerInitialization)?;
-    info!("Running Firecracker v{FIRECRACKER_VERSION}");
+    info_unrestricted!("Running Firecracker v{FIRECRACKER_VERSION}");
+
+    #[cfg(feature = "fuzzing")]
+    warn_unrestricted!(
+        "This Firecracker binary was built with the `fuzzing` feature enabled. This disables \
+         security-critical randomness and relaxes error handling. DO NOT use in production."
+    );
 
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
 
@@ -529,12 +548,12 @@ pub fn enable_ssbd_mitigation() {
 
     if ret < 0 {
         let last_error = std::io::Error::last_os_error().raw_os_error().unwrap();
-        error!(
+        error_unrestricted!(
             "Could not enable SSBD mitigation through prctl, error {}",
             last_error
         );
         if last_error == libc::EINVAL {
-            error!("The host does not support SSBD mitigation through prctl.");
+            error_unrestricted!("The host does not support SSBD mitigation through prctl.");
         }
     }
 }
@@ -596,7 +615,7 @@ fn build_microvm_from_json(
     )
     .map_err(BuildFromJsonError::StartMicroVM)?;
 
-    info!("Successfully started microvm that was configured from one single json");
+    info_unrestricted!("Successfully started microvm that was configured from one single json");
 
     Ok(vmm)
 }

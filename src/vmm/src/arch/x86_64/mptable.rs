@@ -10,11 +10,11 @@ use std::fmt::Debug;
 use std::mem::{self, size_of};
 
 use libc::c_char;
-use log::debug;
 use vm_allocator::AllocPolicy;
 
 use crate::arch::GSI_LEGACY_END;
 use crate::arch::x86_64::generated::mpspec;
+use crate::logger::debug;
 use crate::vstate::memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap,
 };
@@ -124,8 +124,10 @@ pub fn setup_mptable(
     }
 
     let mp_size = compute_mp_size(num_cpus);
-    let mptable_addr =
-        resource_allocator.allocate_system_memory(mp_size as u64, 1, AllocPolicy::FirstMatch)?;
+    let mptable_addr = resource_allocator
+        .system_memory
+        .allocate(mp_size as u64, 1, AllocPolicy::FirstMatch)?
+        .start();
     debug!(
         "mptable: Allocated {mp_size} bytes for MPTable {num_cpus} vCPUs at address {:#010x}",
         mptable_addr

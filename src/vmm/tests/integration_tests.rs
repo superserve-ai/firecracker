@@ -105,14 +105,21 @@ fn test_build_microvm() {
 
 fn pause_resume_microvm(vmm: Arc<Mutex<Vmm>>) {
     let mut api_controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
 
     // There's a race between this thread and the vcpu thread, but this thread
     // should be able to pause vcpu thread before it finishes running its test-binary.
-    api_controller.handle_request(VmmAction::Pause).unwrap();
+    api_controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
     // Pausing again the microVM should not fail (microVM remains in the
     // `Paused` state).
-    api_controller.handle_request(VmmAction::Pause).unwrap();
-    api_controller.handle_request(VmmAction::Resume).unwrap();
+    api_controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    api_controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
@@ -140,7 +147,14 @@ fn test_dirty_bitmap_success() {
     for (vmm, _) in vmms {
         // Let it churn for a while and dirty some pages...
         thread::sleep(Duration::from_millis(100));
-        let bitmap = vmm.lock().unwrap().vm.get_dirty_bitmap().unwrap();
+        let bitmap = vmm
+            .lock()
+            .unwrap()
+            .vm
+            .as_kvm()
+            .unwrap()
+            .get_dirty_bitmap()
+            .unwrap();
         let num_dirty_pages: u32 = bitmap
             .values()
             .map(|bitmap_per_region| {
@@ -215,12 +229,15 @@ fn verify_create_snapshot(
 
     let vm_info = VmInfo::from(&*vmm.lock().unwrap());
     let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
 
     // Be sure that the microVM is running.
     thread::sleep(Duration::from_millis(200));
 
     // Pause microVM.
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
 
     // Create snapshot.
     let snapshot_type = match is_diff {
@@ -236,7 +253,10 @@ fn verify_create_snapshot(
     };
 
     controller
-        .handle_request(VmmAction::CreateSnapshot(snapshot_params))
+        .handle_request(
+            VmmAction::CreateSnapshot(snapshot_params),
+            &mut event_manager,
+        )
         .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
@@ -303,6 +323,8 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
             block_delta_dir: None,
         }))
         .unwrap();
@@ -321,7 +343,7 @@ fn create_vmm_with_overlay_drive(
     base_path: &str,
     overlay_path: &str,
     disk_size_bytes: u64,
-) -> Arc<Mutex<Vmm>> {
+) -> (Arc<Mutex<Vmm>>, EventManager) {
     use vmm::test_utils::mock_resources::{MockBootSourceConfig, MockVmResources};
     use vmm::vmm_config::drive::FileEngineType;
 
@@ -372,7 +394,7 @@ fn create_vmm_with_overlay_drive(
     )
     .unwrap();
     vmm.lock().unwrap().resume_vm().unwrap();
-    vmm
+    (vmm, event_manager)
 }
 
 // Wiring test (empty bitmap): CreateSnapshot with flatten=true against a VMM
@@ -387,11 +409,11 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
     std::fs::create_dir(&delta_dir).unwrap();
 
     let disk_size = 1024 * 1024_u64; // 1 MiB, sized for the bitmap
-    let vmm = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
+    let (vmm, mut event_manager) = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
 
     let mut controller = RuntimeApiController::new(vmm.clone());
     thread::sleep(Duration::from_millis(200));
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let snapshot_file = TempFile::new().unwrap();
     let memory_file = TempFile::new().unwrap();
@@ -403,7 +425,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         flatten: true,
     };
     controller
-        .handle_request(VmmAction::CreateSnapshot(params))
+        .handle_request(VmmAction::CreateSnapshot(params), &mut event_manager)
         .expect("flatten snapshot must succeed");
 
     assert_eq!(
@@ -451,6 +473,8 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
         }))
         .expect("restore from flattened snapshot must succeed");
@@ -484,7 +508,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
         .open(&overlay_path).unwrap()
         .set_len(disk_size).unwrap();
 
-    let vmm = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
+    let (vmm, mut event_manager) = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
 
     // 200ms cushion — without it Pause can race boot on slow runners.
     thread::sleep(Duration::from_millis(200));
@@ -493,7 +517,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
     // guest can read it would create a transient filesystem inconsistency
     // visible to the guest. After pause, no concurrent device I/O.
     let mut controller = RuntimeApiController::new(vmm.clone());
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
     vmm.lock()
         .unwrap()
         .force_dirty_block_for_test("data", target_block_idx, &dirty_content)
@@ -508,7 +532,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             mem_file_path: memory_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
-        }))
+        }), &mut event_manager)
         .expect("flatten snapshot");
 
     // Bake verification: read base.ext4 from disk, assert target block now
@@ -559,6 +583,8 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
         }))
         .expect("restore from flat snapshot");
@@ -583,6 +609,7 @@ fn delta_dirty_count(path: impl AsRef<std::path::Path>) -> u64 {
 // fail with a CreateSnapshotError::FlattenOverlays.
 fn flatten_snapshot_expect_overlay_err(
     controller: &mut RuntimeApiController,
+    event_manager: &mut EventManager,
     snapshot_path: std::path::PathBuf,
     mem_path: std::path::PathBuf,
     delta_dir: std::path::PathBuf,
@@ -594,7 +621,7 @@ fn flatten_snapshot_expect_overlay_err(
             mem_file_path: mem_path,
             block_delta_dir: Some(delta_dir),
             flatten: true,
-        }))
+        }), event_manager)
         .expect_err("expected overlay error from flatten");
     match err {
         VmmActionError::CreateSnapshot(CreateSnapshotError::FlattenOverlays(e)) => e,
@@ -614,18 +641,19 @@ fn test_flatten_pre_flight_rejects_missing_base() {
     std::fs::create_dir(&delta_dir).unwrap();
 
     let disk_size = 1024 * 1024_u64;
-    let vmm = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
+    let (vmm, mut event_manager) = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
     // Drop the base file. Engine's open FD survives via inode pinning, but the
     // path is now gone — pre-flight's open(2) by path will get ENOENT.
     std::fs::remove_file(&base_path).unwrap();
 
     let mut controller = RuntimeApiController::new(vmm.clone());
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let snapshot_file = TempFile::new().unwrap();
     let mem_file = TempFile::new().unwrap();
     let err = flatten_snapshot_expect_overlay_err(
         &mut controller,
+        &mut event_manager,
         snapshot_file.as_path().to_path_buf(),
         mem_file.as_path().to_path_buf(),
         std::path::PathBuf::from(&delta_dir),
@@ -649,7 +677,7 @@ fn test_flatten_pre_flight_rejects_size_mismatch() {
     std::fs::create_dir(&delta_dir).unwrap();
 
     let disk_size = 1024 * 1024_u64;
-    let vmm = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
+    let (vmm, mut event_manager) = create_vmm_with_overlay_drive(&base_path, &overlay_path, disk_size);
     // Truncate base to a wrong size. Engine's FD is unaffected, but
     // pre-flight reads metadata().len() and compares against bitmap dims.
     std::fs::OpenOptions::new()
@@ -660,12 +688,13 @@ fn test_flatten_pre_flight_rejects_size_mismatch() {
         .unwrap();
 
     let mut controller = RuntimeApiController::new(vmm.clone());
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let snapshot_file = TempFile::new().unwrap();
     let mem_file = TempFile::new().unwrap();
     let err = flatten_snapshot_expect_overlay_err(
         &mut controller,
+        &mut event_manager,
         snapshot_file.as_path().to_path_buf(),
         mem_file.as_path().to_path_buf(),
         std::path::PathBuf::from(&delta_dir),
@@ -746,7 +775,7 @@ fn test_flatten_skips_non_overlay_device() {
     vmm.lock().unwrap().resume_vm().unwrap();
 
     let mut controller = RuntimeApiController::new(vmm.clone());
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let snapshot_file = TempFile::new().unwrap();
     let mem_file = TempFile::new().unwrap();
@@ -757,7 +786,7 @@ fn test_flatten_skips_non_overlay_device() {
             mem_file_path: mem_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
-        }))
+        }), &mut event_manager)
         .expect("flatten must succeed even with a non-overlay drive in the mix");
 
     // Non-overlay drive must NOT have produced a delta file (only overlay devices do).
@@ -776,10 +805,10 @@ fn test_flatten_skips_non_overlay_device() {
 // the error would be a backing-file write failure, not FlattenRequiresDeltaDir.
 #[test]
 fn test_create_snapshot_flatten_requires_delta_dir() {
-    let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
+    let (vmm, mut event_manager) = default_vmm(Some(NOISY_KERNEL_IMAGE));
     let mut controller = RuntimeApiController::new(vmm.clone());
     thread::sleep(Duration::from_millis(200));
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let params = CreateSnapshotParams {
         snapshot_type: SnapshotType::Full,
@@ -789,7 +818,7 @@ fn test_create_snapshot_flatten_requires_delta_dir() {
         flatten: true,
     };
     let err = controller
-        .handle_request(VmmAction::CreateSnapshot(params))
+        .handle_request(VmmAction::CreateSnapshot(params), &mut event_manager)
         .expect_err("expected FlattenRequiresDeltaDir");
     assert!(
         matches!(
@@ -881,6 +910,8 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         track_dirty_pages: false,
         resume_vm: false,
         network_overrides: vec![],
+        vsock_override: None,
+        clock_realtime: false,
         block_delta_dir: None,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
@@ -927,6 +958,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         iface_id: String::new(),
         host_dev_name: String::new(),
         guest_mac: None,
+        mtu: None,
         rx_rate_limiter: None,
         tx_rate_limiter: None,
     });

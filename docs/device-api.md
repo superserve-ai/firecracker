@@ -32,6 +32,7 @@ BadRequest - HTTP response.
 | `vsock`                   |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |
 | `entropy`                 |    O     |       O        |      O       |        O         |     O      |      O       |   **R**    |      O      |     O      |
 | `pmem/{id}`               |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
+| `serial`                  |    O     |     **R**      |      O       |        O         |     O      |      O       |     O      |      O      |     O      |
 
 ## Input Schema
 
@@ -82,6 +83,7 @@ specification:
 | `NetworkInterface`        | guest_mac          |    O     |       O        |      O       |        O         |   **R**    |      O       |     O      |      O      |     O      |
 |                           | host_dev_name      |    O     |       O        |      O       |        O         |   **R**    |      O       |     O      |      O      |     O      |
 |                           | iface_id           |    O     |       O        |      O       |        O         |   **R**    |      O       |     O      |      O      |     O      |
+|                           | mtu                |    O     |       O        |      O       |        O         |   **R**    |      O       |     O      |      O      |     O      |
 |                           | rx_rate_limiter    |    O     |       O        |      O       |        O         |   **R**    |      O       |     O      |      O      |     O      |
 |                           | tx_rate_limiter    |    O     |       O        |      O       |        O         |   **R**    |      O       |     O      |      O      |     O      |
 | `PartialDrive`            | drive_id           |    O     |       O        |    **R**     |        O         |     O      |      O       |     O      |      O      |     O      |
@@ -106,6 +108,11 @@ specification:
 |                           | path_on_host       |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
 |                           | root_device        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
 |                           | read_only          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
+|                           | rate_limiter       |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
+| `PartialPmem`             | id                 |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
+|                           | rate_limiter       |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |
+| `SerialConfig`            | serial_out_path    |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |
+|                           | rate_limiter       |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |
 | `MemoryHotplugConfig`     | total_size_mib     |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |   **R**    |
 |                           | slot_size_mib      |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |   **R**    |
 |                           | block_size_mi      |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |   **R**    |
@@ -115,7 +122,7 @@ specification:
 either virtio-block or vhost-user-block devices.
 
 \*\* The `TokenBucket` can be configured with any combination of virtio-net,
-virtio-block and virtio-rng devices.
+virtio-block, virtio-pmem, virtio-rng and serial devices.
 
 ## Output Schema
 

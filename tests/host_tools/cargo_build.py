@@ -98,7 +98,7 @@ def run_seccompiler_bin(
     utils.check_output(f"{seccompiler} {seccompiler_args}")
 
 
-def run_snap_editor_rebase(base_snap, diff_snap):
+def run_snap_editor_rebase(base_snap, diff_snap, binary_dir=DEFAULT_BINARY_DIR):
     """
     Run apply_diff_snap.
 
@@ -106,7 +106,7 @@ def run_snap_editor_rebase(base_snap, diff_snap):
     :param diff_snap: path to diff snapshot mem file
     """
 
-    snap_ed = get_binary("snapshot-editor")
+    snap_ed = get_binary("snapshot-editor", binary_dir=binary_dir)
     utils.check_output(
         f"{snap_ed} edit-memory rebase --memory-path {base_snap} --diff-path {diff_snap}"
     )
@@ -142,3 +142,17 @@ def build_gdb():
     )
 
     return build_path / DEFAULT_TARGET / "debug"
+
+
+def build_fuzzing(release=False):
+    """Builds Firecracker with fuzzing feature enabled. Returns the binary dir"""
+    profile = "release" if release else "debug"
+    build_path = LOCAL_BUILD_PATH / "fuzzing"
+    release_flag = " --release" if release else ""
+    cargo(
+        "build",
+        f"--features fuzzing{release_flag} --target {DEFAULT_TARGET} --all",
+        env={"CARGO_TARGET_DIR": build_path},
+    )
+
+    return build_path / DEFAULT_TARGET / profile

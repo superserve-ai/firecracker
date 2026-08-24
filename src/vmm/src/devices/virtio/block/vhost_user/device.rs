@@ -7,7 +7,6 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use log::error;
 use utils::time::{ClockType, get_time_us};
 use vhost::vhost_user::Frontend;
 use vhost::vhost_user::message::*;
@@ -26,11 +25,11 @@ use crate::devices::virtio::vhost_user::{VhostUserHandleBackend, VhostUserHandle
 use crate::devices::virtio::vhost_user_metrics::{
     VhostUserDeviceMetrics, VhostUserMetricsPerDevice,
 };
-use crate::impl_device_type;
-use crate::logger::{IncMetric, StoreMetric, log_dev_preview_warning};
+use crate::logger::{IncMetric, StoreMetric, error, log_dev_preview_warning};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
+use crate::{MutEventSubscriber, impl_device_type};
 
 /// Block device config space size in bytes.
 const BLOCK_CONFIG_SPACE_SIZE: u32 = 60;
@@ -288,7 +287,10 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
     }
 }
 
-impl<T: VhostUserHandleBackend + Send + 'static> VirtioDevice for VhostUserBlockImpl<T> {
+impl<T: VhostUserHandleBackend + Send + 'static> VirtioDevice for VhostUserBlockImpl<T>
+where
+    VhostUserBlockImpl<T>: MutEventSubscriber,
+{
     impl_device_type!(VirtioDeviceType::Block);
 
     fn id(&self) -> &str {
@@ -387,6 +389,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
 
+    use event_manager::{EventOps, Events, MutEventSubscriber};
     use vhost::{VhostUserMemoryRegionInfo, VringConfigData};
     use vmm_sys_util::tempfile::TempFile;
 
@@ -498,6 +501,11 @@ mod tests {
             }
         }
 
+        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
+            fn process(&mut self, _: Events, _: &mut EventOps) {}
+            fn init(&mut self, _: &mut EventOps) {}
+        }
+
         let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
 
         let vhost_block_config = VhostUserBlockConfig {
@@ -596,6 +604,11 @@ mod tests {
             ) -> Result<(VhostUserConfig, VhostUserConfigPayload), vhost::Error> {
                 Ok((VhostUserConfig::default(), vec![0x69, 0x69, 0x69]))
             }
+        }
+
+        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
+            fn process(&mut self, _: Events, _: &mut EventOps) {}
+            fn init(&mut self, _: &mut EventOps) {}
         }
 
         let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
@@ -786,6 +799,11 @@ mod tests {
                 unsafe { (*self.vring_enabled.get()) = true };
                 Ok(())
             }
+        }
+
+        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
+            fn process(&mut self, _: Events, _: &mut EventOps) {}
+            fn init(&mut self, _: &mut EventOps) {}
         }
 
         // Block creation

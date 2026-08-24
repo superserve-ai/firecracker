@@ -320,10 +320,8 @@ impl Request {
                     return Err(VirtioBlockError::InvalidDataLength);
                 }
             }
-            RequestType::GetDeviceID => {
-                if req.data_len < VIRTIO_BLK_ID_BYTES {
-                    return Err(VirtioBlockError::InvalidDataLength);
-                }
+            RequestType::GetDeviceID if req.data_len < VIRTIO_BLK_ID_BYTES => {
+                return Err(VirtioBlockError::InvalidDataLength);
             }
             _ => {}
         }
