@@ -168,6 +168,37 @@ pub enum CreateSnapshotError {
     FlattenOverlays(
         crate::devices::virtio::block::virtio::io::overlay_io::OverlayIoError,
     ),
+    /// Dirty-tracking session mismatch: the live dirty bitmap is not the baseline the caller armed
+    DirtyTrackingSessionMismatch,
+}
+
+/// Validates a guarded snapshot request's expected token against the live
+/// dirty-tracking session, then invalidates the current generation. A request
+/// carrying an expected token must match the live session exactly (id and
+/// generation) or it is rejected before the dirty bitmap or any output file
+/// is touched; requests without a token are never rejected, but still consume
+/// the generation. On counter overflow the session is dropped rather than
+/// wrapped, so later guarded requests mismatch — the safe direction.
+fn consume_dirty_tracking_generation(
+    live: &mut Option<(String, u64)>,
+    expected_session_id: Option<&str>,
+    expected_generation: Option<u64>,
+) -> Result<(), CreateSnapshotError> {
+    if expected_session_id.is_some() || expected_generation.is_some() {
+        let matched = matches!(
+            (live.as_ref(), expected_session_id, expected_generation),
+            (Some((id, generation)), Some(expected_id), Some(expected))
+                if id == expected_id && *generation == expected
+        );
+        if !matched {
+            return Err(CreateSnapshotError::DirtyTrackingSessionMismatch);
+        }
+    }
+    *live = match live.take() {
+        Some((id, generation)) => generation.checked_add(1).map(|next| (id, next)),
+        None => None,
+    };
+    Ok(())
 }
 
 /// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
@@ -187,6 +218,17 @@ pub fn create_snapshot(
     if params.flatten && params.block_delta_dir.is_none() {
         return Err(CreateSnapshotError::FlattenRequiresDeltaDir);
     }
+
+    // Guarded snapshot: compare the caller's expected token against the live
+    // session BEFORE any side effect, then invalidate the current generation.
+    // The increment covers every snapshot attempt — Diff reads the KVM dirty
+    // bitmap destructively per memslot and Full resets it, and an attempt that
+    // fails midway has still consumed part of the baseline.
+    consume_dirty_tracking_generation(
+        &mut vmm.dirty_tracking_session,
+        params.expected_session_id.as_deref(),
+        params.expected_generation,
+    )?;
 
     // Flatten before save_state so the captured microvm_state reflects
     // post-flatten engine state — no separate side-car mutation needed.
@@ -993,6 +1035,37 @@ fn send_uffd_handshake(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_consume_dirty_tracking_generation() {
+        use super::consume_dirty_tracking_generation as consume;
+        // A matching guarded request consumes the generation.
+        let mut live = Some(("s1".to_string(), 0));
+        consume(&mut live, Some("s1"), Some(0)).unwrap();
+        assert_eq!(live, Some(("s1".to_string(), 1)));
+        // A stale generation is rejected and consumes nothing.
+        let err = consume(&mut live, Some("s1"), Some(0)).unwrap_err();
+        assert!(matches!(
+            err,
+            CreateSnapshotError::DirtyTrackingSessionMismatch
+        ));
+        assert_eq!(live, Some(("s1".to_string(), 1)));
+        // A wrong session id is rejected.
+        assert!(consume(&mut live, Some("other"), Some(1)).is_err());
+        // A half-specified token never matches.
+        assert!(consume(&mut live, Some("s1"), None).is_err());
+        // A guarded request against no live session is rejected.
+        let mut none: Option<(String, u64)> = None;
+        assert!(consume(&mut none, Some("s1"), Some(0)).is_err());
+        // An unguarded request is never rejected but still consumes.
+        let mut live = Some(("s1".to_string(), 3));
+        consume(&mut live, None, None).unwrap();
+        assert_eq!(live, Some(("s1".to_string(), 4)));
+        // Counter overflow drops the session instead of wrapping.
+        let mut live = Some(("s1".to_string(), u64::MAX));
+        consume(&mut live, None, None).unwrap();
+        assert_eq!(live, None);
+    }
     use std::os::unix::net::UnixListener;
 
     use vmm_sys_util::tempfile::TempFile;

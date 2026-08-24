@@ -334,6 +334,13 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    // Dirty-tracking session token: (session_id, generation). Installed when a
+    // snapshot load arms dirty tracking with a caller-provided session id;
+    // generation starts at 0 and increments on every snapshot attempt (any
+    // snapshot type consumes or resets the KVM dirty bitmap, including
+    // attempts that fail midway). Guarded snapshot requests compare their
+    // expected token against this before touching the bitmap.
+    dirty_tracking_session: Option<(String, u64)>,
 }
 
 impl Vmm {
@@ -345,6 +352,13 @@ impl Vmm {
     /// Gets Vmm instance info.
     pub fn instance_info(&self) -> InstanceInfo {
         self.instance_info.clone()
+    }
+
+    /// Installs the dirty-tracking session token at generation 0. Called when
+    /// a snapshot load arms dirty tracking with a caller-provided session id;
+    /// replaces any previous session.
+    pub fn set_dirty_tracking_session(&mut self, session_id: String) {
+        self.dirty_tracking_session = Some((session_id, 0));
     }
 
     /// Test fixture: forwards to `DeviceManager::force_dirty_block_for_test`.

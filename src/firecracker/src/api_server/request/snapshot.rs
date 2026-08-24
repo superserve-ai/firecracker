@@ -116,6 +116,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         network_overrides: snapshot_config.network_overrides,
         block_delta_dir: snapshot_config.block_delta_dir,
         clock_realtime: snapshot_config.clock_realtime,
+        tracking_session_id: snapshot_config.tracking_session_id,
     };
 
     // Construct the `ParsedRequest` object.
@@ -179,6 +180,8 @@ mod tests {
             mem_file_path: PathBuf::from("bar"),
             block_delta_dir: None,
             flatten: false,
+            expected_session_id: None,
+            expected_generation: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -195,6 +198,8 @@ mod tests {
             mem_file_path: PathBuf::from("bar"),
             block_delta_dir: None,
             flatten: false,
+            expected_session_id: None,
+            expected_generation: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -229,6 +234,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -265,6 +271,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -301,6 +308,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -346,6 +354,7 @@ mod tests {
             }],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -379,6 +388,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(

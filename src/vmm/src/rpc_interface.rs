@@ -654,6 +654,16 @@ impl<'a> PrebootApiController<'a> {
                     self.fatal_error = Some(BuildMicrovmFromRequestsError::Resume);
                 })?;
         }
+        // Arm the dirty-tracking session token: the caller's id at generation 0.
+        // After the resume above so a failed resume (fatal) never leaves an
+        // armed token behind.
+        if load_params.track_dirty_pages {
+            if let Some(session_id) = &load_params.tracking_session_id {
+                vmm.lock()
+                    .expect("Poisoned lock")
+                    .set_dirty_tracking_session(session_id.clone());
+            }
+        }
         // Set the VM
         self.built_vmm = Some(vmm);
 
@@ -1175,6 +1185,8 @@ mod tests {
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
                 flatten: false,
+                expected_session_id: None,
+                expected_generation: None,
             },
         )));
         #[cfg(target_arch = "x86_64")]
@@ -1294,6 +1306,7 @@ mod tests {
                 network_overrides: vec![],
                 block_delta_dir: None,
                 clock_realtime: None,
+                tracking_session_id: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

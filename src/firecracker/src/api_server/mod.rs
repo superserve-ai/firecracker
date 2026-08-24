@@ -278,6 +278,8 @@ mod tests {
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
                 flatten: false,
+                expected_session_id: None,
+                expected_generation: None,
             })),
             start_time_us,
         );
@@ -293,6 +295,8 @@ mod tests {
                 mem_file_path: PathBuf::new(),
                 block_delta_dir: None,
                 flatten: false,
+                expected_session_id: None,
+                expected_generation: None,
             })),
             start_time_us,
         );

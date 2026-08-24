@@ -61,6 +61,20 @@ pub struct CreateSnapshotParams {
     /// Requires `block_delta_dir`.
     #[serde(default)]
     pub flatten: bool,
+    /// Expected dirty-tracking session id for a guarded snapshot. When set
+    /// (together with `expected_generation`), the snapshot is created only if
+    /// the token matches the live session installed at snapshot-load time; a
+    /// mismatch is rejected before the dirty bitmap or any output file is
+    /// touched. Lets an orchestrator prove the dirty bitmap still describes
+    /// the baseline it armed — e.g. across its own restart — instead of
+    /// trusting cached state.
+    #[serde(default)]
+    pub expected_session_id: Option<String>,
+    /// Expected dirty-bitmap generation accompanying `expected_session_id`.
+    /// The generation starts at 0 when tracking is armed and increments on
+    /// every snapshot attempt (any type consumes or resets the bitmap).
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
@@ -97,6 +111,10 @@ pub struct LoadSnapshotParams {
     /// taken. `Some(false)` resumes kvmclock from where it was at snapshot time. `None` restores
     /// the flags the snapshot itself carries, which is what callers got before this option existed.
     pub clock_realtime: Option<bool>,
+    /// Caller-chosen dirty-tracking session id. Only meaningful with
+    /// `track_dirty_pages`; installs a `(session_id, generation=0)` token that
+    /// guarded snapshot requests can later compare against.
+    pub tracking_session_id: Option<String>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -141,6 +159,9 @@ pub struct LoadSnapshotConfig {
     /// upstream.
     #[serde(default)]
     pub clock_realtime: Option<bool>,
+    /// Caller-chosen dirty-tracking session id; see `LoadSnapshotParams`.
+    #[serde(default)]
+    pub tracking_session_id: Option<String>,
 }
 
 /// Stores the configuration used for managing snapshot memory.
