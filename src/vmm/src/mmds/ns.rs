@@ -1,7 +1,6 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// TODO: get rid of this when splitting dumbo into public and internal parts.
 #![allow(missing_docs)]
 
 use std::convert::From;
@@ -141,7 +140,7 @@ impl MmdsNetworkStack {
     ///
     /// # Returns
     ///
-    /// `true` if the frame was consumed by `mmds` or `false` if an error occured
+    /// `true` if the frame was consumed by `mmds` or `false` if an error occurred
     pub fn detour_frame(&mut self, src: &[u8]) -> bool {
         if let Ok(eth) = EthernetFrame::from_bytes(src) {
             match eth.ethertype() {

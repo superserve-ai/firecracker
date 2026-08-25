@@ -90,6 +90,10 @@ is copied by the Firecracker I/O thread from the emulated network interface to
 the backing host TAP device, and I/O rate limiting is applied at this point.
 These barriers are marked in the diagram below.
 
+Firecracker does not perform any network traffic filtering. All egress traffic
+from a guest is therefore considered untrusted, and should be filtered at the
+host-level.
+
 ![Firecracker Threat Containment](images/firecracker_threat_containment.png?raw=true "Firecracker Threat Containment")
 
 ## Components and Features
@@ -118,7 +122,11 @@ and/or creating their own custom CPU templates.
 
 #### Clocksources available to guests
 
-Firecracker only exposes kvm-clock to customers.
+Firecracker exposes the following clock sources to guests:
+
+- x86_64: kvm-clock and tsc. Linux guests >=5.10 will pick tsc by default if
+  stable.
+- aarch64: arch_sys_counter
 
 ### I/O: Storage, Networking and Rate Limiting
 

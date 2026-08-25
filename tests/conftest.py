@@ -19,6 +19,7 @@ designed with the following goals in mind:
   https://docs.pytest.org/en/7.2.x/explanation/fixtures.html
 """
 
+import ctypes
 import inspect
 import json
 import os
@@ -51,6 +52,16 @@ if sys.version_info < (3, 10):
 # Some tests create system-level resources; ensure we run as root.
 if os.geteuid() != 0:
     raise PermissionError("Test session needs to be run as root.")
+
+
+# Become a child subreaper so that orphaned descendants (Firecracker, after
+# its jailer parent exits) reparent to us instead of init. This lets us
+# waitpid() on the firecracker PID directly, avoiding the pidfd notification
+# race for multi-threaded processes on kernels older than 6.15.
+_PR_SET_CHILD_SUBREAPER = 36
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+if _libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
 
 
 METRICS = get_metrics_logger()
@@ -237,6 +248,14 @@ def bin_vsock_path(test_fc_session_root_path):
 
 
 @pytest.fixture(scope="session")
+def bin_sysgenid_path(test_fc_session_root_path):
+    """Build a simple util for test SysGenID device"""
+    sysgenid_helper_bin_path = os.path.join(test_fc_session_root_path, "sysgenid")
+    build_tools.gcc_compile("host_tools/sysgenid.c", sysgenid_helper_bin_path)
+    yield sysgenid_helper_bin_path
+
+
+@pytest.fixture(scope="session")
 def bin_vmclock_path(test_fc_session_root_path):
     """Build a simple util for test VMclock device"""
     vmclock_helper_bin_path = os.path.join(test_fc_session_root_path, "vmclock")
@@ -256,6 +275,18 @@ def change_net_config_space_bin(test_fc_session_root_path):
         extra_flags="-static",
     )
     yield change_net_config_space_bin
+
+
+@pytest.fixture(scope="session")
+def devmem_bin(test_fc_session_root_path):
+    """Build a minimal /dev/mem read/write tool."""
+    bin_path = os.path.join(test_fc_session_root_path, "devmem")
+    build_tools.gcc_compile(
+        "host_tools/devmem.c",
+        bin_path,
+        extra_flags="-static",
+    )
+    yield bin_path
 
 
 @pytest.fixture(scope="session")
@@ -379,17 +410,11 @@ def microvm_factory(request, record_property, results_dir, netns_factory):
     # if the test failed, save important files from the root of the uVM into `test_results` for troubleshooting
     report = request.node.stash[PHASE_REPORT_KEY]
     if "call" in report and report["call"].failed:
+        dump_full = os.environ.get("FC_TEST_DUMP_ON_FAILURE") == "1"
         for uvm in uvm_factory.vms:
             # This is best effort. We want to proceed even if the VM is not responding.
             try:
                 uvm.flush_metrics()
-            except:  # pylint: disable=bare-except
-                pass
-
-            try:
-                uvm.snapshot_full(
-                    mem_path="post_failure.mem", vmstate_path="post_failure.vmstate"
-                )
             except:  # pylint: disable=bare-except
                 pass
 
@@ -398,9 +423,20 @@ def microvm_factory(request, record_property, results_dir, netns_factory):
             uvm_data.joinpath("host-dmesg.log").write_text(
                 utils.run_cmd(["dmesg", "-dPx"]).stdout
             )
-            shutil.copy(ARTIFACT_DIR / "id_rsa", uvm_data)
             if Path(uvm.screen_log).exists():
                 shutil.copy(uvm.screen_log, uvm_data)
+
+            if not dump_full:
+                continue
+
+            try:
+                uvm.snapshot_full(
+                    mem_path="post_failure.mem", vmstate_path="post_failure.vmstate"
+                )
+            except:  # pylint: disable=bare-except
+                pass
+
+            shutil.copy(ARTIFACT_DIR / "id_rsa", uvm_data)
 
             uvm_root = Path(uvm.chroot())
             for item in os.listdir(uvm_root):
@@ -510,40 +546,45 @@ guest_kernel_linux_6_1 = pytest.fixture(
     guest_kernel_fxt,
     params=kernel_params("vmlinux-6.1*"),
 )
+guest_kernel_default = guest_kernel_linux_6_1
+
+
+def match_rootfs_to_kernel(request):
+    """For 5.10, use Ubuntu as rootfs, otherwise use AL2023.
+    Reason: AL2023 does not officially support 5.10"""
+    for name in request.fixturenames:
+        if name.startswith("guest_kernel"):
+            kernel = request.getfixturevalue(name)
+            if kernel and kernel.stem[2:] == "linux-5.10":
+                return "ubuntu"
+            break
+    return "amazonlinux"
 
 
 @pytest.fixture
-def rootfs():
-    """Return an Ubuntu 24.04 read-only rootfs"""
-    disk_list = disks("ubuntu-24.04.squashfs")
+def rootfs(request):
+    """Return a read-only rootfs. Ubuntu for 5.10, AL2023 for 6.1."""
+    distro = match_rootfs_to_kernel(request)
+    disk_list = disks(f"{distro}*.squashfs")
     if not disk_list:
-        pytest.fail(
-            f"No disk artifacts found matching 'ubuntu-24.04.squashfs' in {ARTIFACT_DIR}"
-        )
+        pytest.fail(f"No {distro} squashfs found in {ARTIFACT_DIR}")
     return disk_list[0]
 
 
 @pytest.fixture
-def rootfs_rw():
-    """Return an Ubuntu 24.04 ext4 rootfs"""
-    disk_list = disks("ubuntu-24.04.ext4")
+def rootfs_rw(request):
+    """Return a writeable rootfs. Ubuntu for 5.10, AL2023 for 6.1."""
+    distro = match_rootfs_to_kernel(request)
+    disk_list = disks(f"{distro}*.ext4")
     if not disk_list:
-        pytest.fail(
-            f"No disk artifacts found matching 'ubuntu-24.04.ext4' in {ARTIFACT_DIR}"
-        )
+        pytest.fail(f"No {distro} ext4 found in {ARTIFACT_DIR}")
     return disk_list[0]
 
 
 @pytest.fixture
-def uvm_plain(microvm_factory, guest_kernel_linux_5_10, rootfs, pci_enabled):
+def uvm_plain(microvm_factory, guest_kernel_default, rootfs, pci_enabled):
     """Create a vanilla VM, non-parametrized"""
-    return microvm_factory.build(guest_kernel_linux_5_10, rootfs, pci=pci_enabled)
-
-
-@pytest.fixture
-def uvm_plain_6_1(microvm_factory, guest_kernel_linux_6_1, rootfs, pci_enabled):
-    """Create a vanilla VM, non-parametrized"""
-    return microvm_factory.build(guest_kernel_linux_6_1, rootfs, pci=pci_enabled)
+    return microvm_factory.build(guest_kernel_default, rootfs, pci=pci_enabled)
 
 
 @pytest.fixture
@@ -553,9 +594,9 @@ def uvm_plain_acpi(microvm_factory, guest_kernel_acpi, rootfs, pci_enabled):
 
 
 @pytest.fixture
-def uvm_plain_rw(microvm_factory, guest_kernel_linux_5_10, rootfs_rw):
+def uvm_plain_rw(microvm_factory, guest_kernel_default, rootfs_rw):
     """Create a vanilla VM, non-parametrized"""
-    return microvm_factory.build(guest_kernel_linux_5_10, rootfs_rw)
+    return microvm_factory.build(guest_kernel_default, rootfs_rw)
 
 
 @pytest.fixture
@@ -578,7 +619,7 @@ def artifact_dir():
 def uvm_plain_any(microvm_factory, guest_kernel, rootfs, pci_enabled):
     """All guest kernels
     kernel: all
-    rootfs: Ubuntu 24.04
+    rootfs: Ubuntu for 5.10, AL2023 for 6.1
     """
     return microvm_factory.build(guest_kernel, rootfs, pci=pci_enabled)
 
@@ -587,12 +628,13 @@ guest_kernel_6_1_debug = pytest.fixture(
     guest_kernel_fxt,
     params=kernel_params("vmlinux-6.1*", artifact_dir=defs.ARTIFACT_DIR / "debug"),
 )
+guest_kernel_default_debug = guest_kernel_6_1_debug
 
 
 @pytest.fixture
-def uvm_plain_debug(microvm_factory, guest_kernel_6_1_debug, rootfs_rw):
+def uvm_plain_debug(microvm_factory, guest_kernel_default_debug, rootfs_rw):
     """VM running a kernel with debug/trace Kconfig options"""
-    return microvm_factory.build(guest_kernel_6_1_debug, rootfs_rw)
+    return microvm_factory.build(guest_kernel_default_debug, rootfs_rw)
 
 
 @pytest.fixture
@@ -748,3 +790,25 @@ def uvm_any_without_pci(
         vcpu_count=vcpu_count,
         mem_size_mib=mem_size_mib,
     )
+
+
+@pytest.fixture
+def uvm_with_fips(microvm_factory, guest_kernel_linux_6_1, rootfs_rw):
+    """Boot a microVM with FIPS mode enabled."""
+    uvm = microvm_factory.build(guest_kernel_linux_6_1, rootfs_rw)
+    uvm.spawn()
+    uvm.basic_config(boot_args="console=ttyS0 reboot=k panic=1 pci=off fips=1")
+    uvm.add_net_iface()
+    uvm.start()
+    return uvm
+
+
+@pytest.fixture
+def fips_snapshot_pair(uvm_with_fips, microvm_factory):
+    """Boot a FIPS VM, snapshot it, restore two VMs from the same snapshot."""
+    snapshot = uvm_with_fips.snapshot_full()
+    uvm_with_fips.kill()
+
+    uvm_a = microvm_factory.build_from_snapshot(snapshot)
+    uvm_b = microvm_factory.build_from_snapshot(snapshot)
+    yield uvm_a, uvm_b

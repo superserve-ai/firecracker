@@ -26,7 +26,7 @@ use crate::vcpu::{VcpuConfig, VcpuError};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::{Address, GuestMemoryMmap};
 use crate::vstate::vcpu::VcpuEmulation;
-use crate::vstate::vm::Vm;
+use crate::vstate::vm::KvmVm;
 
 /// Errors thrown while setting aarch64 registers.
 #[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
@@ -98,6 +98,8 @@ pub enum KvmVcpuError {
     RestoreState(VcpuArchError),
     /// Failed to save the state of the vcpu: {0}
     SaveState(VcpuArchError),
+    /// Found unsupported KVM_ARM_VCPU_PMU_V3 bit set in vcpu features.
+    UnsupportedPmuV3,
 }
 
 /// Error type for [`KvmVcpu::configure`].
@@ -131,7 +133,7 @@ impl KvmVcpu {
     ///
     /// * `index` - Represents the 0-based CPU index between [0, max vcpus).
     /// * `vm` - The vm to which this vcpu will get attached.
-    pub fn new(index: u8, vm: &Vm) -> Result<Self, KvmVcpuError> {
+    pub fn new(index: u8, vm: &KvmVm) -> Result<Self, KvmVcpuError> {
         let kvm_vcpu = vm
             .fd()
             .create_vcpu(index.into())
@@ -299,6 +301,16 @@ impl KvmVcpu {
 
     /// Initializes internal vcpufd.
     fn init_vcpu(&self) -> Result<(), KvmVcpuError> {
+        // Setting KVM_ARM_VCPU_PMU_V3 without initialising the PMU causes KVM
+        // to crash on KVM_RUN with EINVAL.
+        //
+        // To properly initialise the PMU, the KVM_SET_DEVICE_ATTR ioctl must
+        // be made with the flag KVM_ARM_VCPU_PMU_V3_INIT set. Firecracker
+        // currently does not handle this, so we should return an error instead.
+        if (self.kvi.features[0] & (1 << KVM_ARM_VCPU_PMU_V3)) != 0 {
+            return Err(KvmVcpuError::UnsupportedPmuV3);
+        }
+
         self.fd.vcpu_init(&self.kvi).map_err(KvmVcpuError::Init)?;
         Ok(())
     }
@@ -489,8 +501,6 @@ impl Peripherals {
     /// Returns error or enum specifying whether emulation was handled or interrupted.
     pub fn run_arch_emulation(&self, exit: VcpuExit) -> Result<VcpuEmulation, VcpuError> {
         METRICS.vcpu.failures.inc();
-        // TODO: Are we sure we want to finish running a vcpu upon
-        // receiving a vm exit that is not necessarily an error?
         error!("Unexpected exit reason on vcpu run: {:?}", exit);
         Err(VcpuError::UnhandledKvmExit(format!("{:?}", exit)))
     }
@@ -551,27 +561,25 @@ mod tests {
     use crate::cpu_config::templates::RegisterValueFilter;
     use crate::test_utils::arch_mem;
     use crate::vcpu::VcpuConfig;
-    use crate::vstate::kvm::Kvm;
-    use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
-    fn setup_vcpu(mem_size: usize) -> (Kvm, Vm, KvmVcpu) {
-        let (kvm, mut vm, mut vcpu) = setup_vcpu_no_init(mem_size);
+    fn setup_vcpu(mem_size: usize) -> (KvmVm, KvmVcpu) {
+        let (mut vm, mut vcpu) = setup_vcpu_no_init(mem_size);
         vcpu.init(&[]).unwrap();
         vm.setup_irqchip(1).unwrap();
-        (kvm, vm, vcpu)
+        (vm, vcpu)
     }
 
-    fn setup_vcpu_no_init(mem_size: usize) -> (Kvm, Vm, KvmVcpu) {
-        let (kvm, vm) = setup_vm_with_memory(mem_size);
+    fn setup_vcpu_no_init(mem_size: usize) -> (KvmVm, KvmVcpu) {
+        let vm = setup_vm_with_memory(mem_size);
         let vcpu = KvmVcpu::new(0, &vm).unwrap();
 
-        (kvm, vm, vcpu)
+        (vm, vcpu)
     }
 
     #[test]
     fn test_create_vcpu() {
-        let (_, vm) = setup_vm_with_memory(0x1000);
+        let vm = setup_vm_with_memory(0x1000);
 
         unsafe { libc::close(vm.fd().as_raw_fd()) };
 
@@ -590,8 +598,8 @@ mod tests {
 
     #[test]
     fn test_configure_vcpu() {
-        let (kvm, vm, mut vcpu) = setup_vcpu(0x10000);
-        let optional_capabilities = kvm.optional_capabilities();
+        let (vm, mut vcpu) = setup_vcpu(0x10000);
+        let optional_capabilities = vm.kvm().optional_capabilities();
 
         let vcpu_config = VcpuConfig {
             vcpu_count: 1,
@@ -639,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_init_vcpu() {
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        let mut vm = setup_vm_with_memory(0x1000);
         let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
         vm.setup_irqchip(1).unwrap();
 
@@ -657,8 +665,28 @@ mod tests {
     }
 
     #[test]
+    fn test_pmu_v3_feature_invalid() {
+        let mut vm = setup_vm_with_memory(0x1000);
+        let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
+        vm.setup_irqchip(1).unwrap();
+
+        // Firecracker does not support KVM_ARM_VCPU_PMU_V3. Check that
+        // attempting to enable this feature returns an error.
+        let vcpu_features = vec![VcpuFeatures {
+            index: 0,
+            bitmap: RegisterValueFilter {
+                filter: 1 << KVM_ARM_VCPU_PMU_V3,
+                value: 1 << KVM_ARM_VCPU_PMU_V3,
+            },
+        }];
+
+        let res = vcpu.init(&vcpu_features);
+        assert!(matches!(res.unwrap_err(), KvmVcpuError::UnsupportedPmuV3));
+    }
+
+    #[test]
     fn test_vcpu_save_restore_state() {
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        let mut vm = setup_vm_with_memory(0x1000);
         let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
         vm.setup_irqchip(1).unwrap();
 
@@ -702,7 +730,7 @@ mod tests {
         //
         // This should fail with ENOEXEC.
         // https://elixir.bootlin.com/linux/v5.10.176/source/arch/arm64/kvm/arm.c#L1165
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        let mut vm = setup_vm_with_memory(0x1000);
         let vcpu = KvmVcpu::new(0, &vm).unwrap();
         vm.setup_irqchip(1).unwrap();
 
@@ -712,7 +740,7 @@ mod tests {
     #[test]
     fn test_dump_cpu_config_after_init() {
         // Test `dump_cpu_config()` after `KVM_VCPU_INIT`.
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        let mut vm = setup_vm_with_memory(0x1000);
         let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
         vm.setup_irqchip(1).unwrap();
         vcpu.init(&[]).unwrap();
@@ -722,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_setup_non_boot_vcpu() {
-        let (_, vm) = setup_vm_with_memory(0x1000);
+        let vm = setup_vm_with_memory(0x1000);
         let mut vcpu1 = KvmVcpu::new(0, &vm).unwrap();
         vcpu1.init(&[]).unwrap();
         let mut vcpu2 = KvmVcpu::new(1, &vm).unwrap();
@@ -734,7 +762,7 @@ mod tests {
         // Test `get_regs()` with valid register IDs.
         // - X0: 0x6030 0000 0010 0000
         // - X1: 0x6030 0000 0010 0002
-        let (_, _, vcpu) = setup_vcpu(0x10000);
+        let (_, vcpu) = setup_vcpu(0x10000);
         let reg_list = Vec::<u64>::from([0x6030000000100000, 0x6030000000100002]);
         get_registers(&vcpu.fd, &reg_list, &mut Aarch64RegisterVec::default()).unwrap();
     }
@@ -742,16 +770,16 @@ mod tests {
     #[test]
     fn test_get_invalid_regs() {
         // Test `get_regs()` with invalid register IDs.
-        let (_, _, vcpu) = setup_vcpu(0x10000);
+        let (_, vcpu) = setup_vcpu(0x10000);
         let reg_list = Vec::<u64>::from([0x6030000000100001, 0x6030000000100003]);
         get_registers(&vcpu.fd, &reg_list, &mut Aarch64RegisterVec::default()).unwrap_err();
     }
 
     #[test]
     fn test_setup_regs() {
-        let (kvm, _, vcpu) = setup_vcpu_no_init(0x10000);
+        let (vm, vcpu) = setup_vcpu_no_init(0x10000);
         let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
-        let optional_capabilities = kvm.optional_capabilities();
+        let optional_capabilities = vm.kvm().optional_capabilities();
 
         let res = vcpu.setup_boot_regs(0x0, &mem, &optional_capabilities);
         assert!(matches!(
@@ -786,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_read_mpidr() {
-        let (_, _, vcpu) = setup_vcpu_no_init(0x10000);
+        let (_, vcpu) = setup_vcpu_no_init(0x10000);
 
         // Must fail when vcpu is not initialized yet.
         let res = vcpu.get_mpidr();
@@ -801,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_get_set_regs() {
-        let (_, _, vcpu) = setup_vcpu_no_init(0x10000);
+        let (_, vcpu) = setup_vcpu_no_init(0x10000);
 
         // Must fail when vcpu is not initialized yet.
         let mut regs = Aarch64RegisterVec::default();
@@ -819,7 +847,7 @@ mod tests {
     fn test_mpstate() {
         use std::os::unix::io::AsRawFd;
 
-        let (_, _, vcpu) = setup_vcpu(0x10000);
+        let (_, vcpu) = setup_vcpu(0x10000);
 
         let res = vcpu.get_mpstate();
         vcpu.set_mpstate(res.unwrap()).unwrap();

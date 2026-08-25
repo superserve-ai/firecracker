@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
-use log::error;
 use serde::{Deserialize, Serialize};
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
@@ -22,12 +21,13 @@ pub use vm_memory::{
     GuestUsize, MemoryRegionAddress, MmapRegion, address,
 };
 use vm_memory::{GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVolatile};
-use vmm_sys_util::errno;
 
-use crate::utils::{get_page_size, u64_to_usize};
+use crate::DirtyBitmap;
+use crate::arch::host_page_size;
+use crate::logger::error;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::machine_config::HugePageConfig;
-use crate::vstate::vm::VmError;
-use crate::{DirtyBitmap, Vm};
+use crate::vstate::vm::{KvmVm, VmError};
 
 /// Type of GuestRegionMmap.
 pub type GuestRegionMmap = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
@@ -39,8 +39,6 @@ pub type GuestMmapRegion = vm_memory::MmapRegion<Option<AtomicBitmap>>;
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MemoryError {
-    /// Cannot fetch system's page size: {0}
-    PageSize(errno::Error),
     /// Cannot dump memory: {0}
     WriteMemory(GuestMemoryError),
     /// Cannot create mmap region: {0}
@@ -55,8 +53,15 @@ pub enum MemoryError {
     OffsetTooLarge,
     /// Cannot retrieve snapshot file metadata: {0}
     FileMetadata(std::io::Error),
-    /// Memory region is not aligned
-    Unaligned,
+    /// Memory region has zero slots
+    ZeroSlots,
+    /// Memory region of {region_size} bytes is not evenly divisible into {slot_count} slots
+    Unaligned {
+        /// Region size in bytes.
+        region_size: u64,
+        /// Number of slots declared in the snapshot.
+        slot_count: usize,
+    },
     /// Error protecting memory slot: {0}
     Mprotect(std::io::Error),
     /// Size too large for i64 conversion
@@ -248,14 +253,6 @@ impl<'a> GuestMemorySlot<'a> {
     }
 }
 
-fn addr_in_range(addr: GuestAddress, start: GuestAddress, len: usize) -> bool {
-    if let Some(end) = start.checked_add(len as u64) {
-        addr >= start && addr < end
-    } else {
-        false
-    }
-}
-
 impl GuestRegionMmapExt {
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
@@ -292,9 +289,16 @@ impl GuestRegionMmapExt {
         slot_from: u32,
     ) -> Result<Self, MemoryError> {
         let slot_cnt = state.plugged.len();
-        let slot_size = u64_to_usize(region.len())
+        let region_len = u64_to_usize(region.len());
+        let slot_size = region_len
             .checked_div(slot_cnt)
-            .ok_or(MemoryError::Unaligned)?;
+            .ok_or(MemoryError::ZeroSlots)?;
+        if slot_size * slot_cnt != region_len {
+            return Err(MemoryError::Unaligned {
+                region_size: region.len(),
+                slot_count: slot_cnt,
+            });
+        }
 
         Ok(GuestRegionMmapExt {
             inner: region,
@@ -358,18 +362,24 @@ impl GuestRegionMmapExt {
         len: usize,
     ) -> impl Iterator<Item = GuestMemorySlot<'_>> {
         self.slots().map(|(slot, _)| slot).filter(move |slot| {
-            if let Some(slot_end) = slot.guest_addr.checked_add(slot.slice.len() as u64) {
-                addr_in_range(slot.guest_addr, from, len) || addr_in_range(slot_end, from, len)
-            } else {
-                false
-            }
+            // Two intervals [a, b) and [c, d) intersect iff a < d && c < b.
+            // This correctly handles the containment case where the slot fully
+            // contains the range (or vice versa).
+            let slot_start = slot.guest_addr;
+            let Some(slot_end) = slot_start.checked_add(slot.slice.len() as u64) else {
+                return false;
+            };
+            let Some(range_end) = from.checked_add(len as u64) else {
+                return false;
+            };
+            slot_start < range_end && from < slot_end
         })
     }
 
     /// (un)plug a slot from an Hotpluggable memory region
     pub(crate) fn update_slot(
         &self,
-        vm: &Vm,
+        vm: &KvmVm,
         mem_slot: &GuestMemorySlot<'_>,
         plug: bool,
     ) -> Result<(), VmError> {
@@ -725,7 +735,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<Vec<u64>, MemoryError> {
-        let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+        let page_size = host_page_size();
         let total_len: usize = self
             .iter()
             .flat_map(|region| region.slots())
@@ -901,9 +911,10 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::arch::host_page_size;
     use crate::snapshot::Snapshot;
     use crate::test_utils::single_region_mem;
-    use crate::utils::{get_page_size, mib_to_bytes};
+    use crate::utils::mib_to_bytes;
     use crate::vstate::memory::test_utils::into_region_ext;
 
     #[test]
@@ -978,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_mark_dirty() {
-        let page_size = get_page_size().unwrap();
+        let page_size = host_page_size();
         let region_size = page_size * 3;
 
         let regions = vec![
@@ -1038,7 +1049,7 @@ mod tests {
 
     #[test]
     fn test_serde() {
-        let page_size = get_page_size().unwrap();
+        let page_size = host_page_size();
         let region_size = page_size * 3;
 
         // Test with a single region
@@ -1065,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_describe() {
-        let page_size: usize = get_page_size().unwrap();
+        let page_size: usize = host_page_size();
 
         // Two regions of one page each, with a one page gap between them.
         let mem_regions = [
@@ -1128,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_dump() {
-        let page_size = get_page_size().unwrap();
+        let page_size = host_page_size();
 
         // Two regions of two pages each, with a one page gap between them.
         let region_1_address = GuestAddress(0);
@@ -1180,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_dump_dirty() {
-        let page_size = get_page_size().unwrap();
+        let page_size = host_page_size();
 
         // Two regions of two pages each, with a one page gap between them.
         let region_1_address = GuestAddress(0);
@@ -1351,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_store_dirty_bitmap() {
-        let page_size = get_page_size().unwrap();
+        let page_size = host_page_size();
 
         // Two regions of three pages each, with a one page gap between them.
         let region_1_address = GuestAddress(0);
@@ -1497,5 +1508,343 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::IOError(_)
         );
+    }
+
+    /// Verifies that `slots_intersecting_range` returns the correct slots for
+    /// ranges at slot boundaries, interior to a slot, and spanning two slots.
+    #[test]
+    fn test_slots_intersecting_range() {
+        let page_size = host_page_size();
+        let slot_size = 4 * page_size;
+        let region_size = 2 * slot_size;
+        let base = GuestAddress(0);
+        let slot1_base = base.unchecked_add(slot_size as u64);
+
+        let mmap_region = anonymous(
+            std::iter::once((base, region_size)),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let region = GuestRegionMmapExt::hotpluggable_from_mmap_region(mmap_region, 0, slot_size);
+        assert_eq!(region.slot_cnt(), 2);
+
+        // (range_offset_in_pages, range_len_in_pages, expected_slot_addrs)
+        let cases: &[(usize, usize, &[GuestAddress])] = &[
+            // At slot 0 boundary
+            (0, 1, &[base]),
+            // Interior to slot 0
+            (1, 1, &[base]),
+            // Interior to slot 1
+            (5, 1, &[slot1_base]),
+            // Spanning slot 0 and slot 1
+            (3, 2, &[base, slot1_base]),
+            // Entire region
+            (0, 8, &[base, slot1_base]),
+            // Outside the region
+            (8, 1, &[]),
+            // Zero-length range
+            (0, 0, &[]),
+        ];
+
+        for &(offset_pages, len_pages, expected) in cases {
+            let from = base.unchecked_add((offset_pages * page_size) as u64);
+            let len = len_pages * page_size;
+            let found: Vec<_> = region.slots_intersecting_range(from, len).collect();
+            let addrs: Vec<_> = found.iter().map(|s| s.guest_addr).collect();
+            assert_eq!(
+                addrs, expected,
+                "offset={offset_pages} pages, len={len_pages} pages"
+            );
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    mod prop_tests {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+
+        use proptest::prelude::*;
+        use vmm_sys_util::tempfile::TempFile;
+
+        use super::*;
+
+        /// Naive dump_dirty over a full GuestMemoryMmap: iterates all
+        /// regions/slots, seeks over unplugged slots, and for plugged slots
+        /// writes dirty pages one at a time. Returns the number of dirty pages written.
+        fn dump_dirty_oracle(
+            mem: &GuestMemoryMmap,
+            writer: &mut File,
+            dirty_bitmap: &DirtyBitmap,
+        ) -> usize {
+            let page_size = host_page_size();
+            let mut dirty_count = 0;
+            for (slot, plugged) in mem.iter().flat_map(|r| r.slots()) {
+                if !plugged {
+                    writer
+                        .seek(SeekFrom::Current(slot.slice.len() as i64))
+                        .unwrap();
+                    continue;
+                }
+
+                let kvm_bitmap = dirty_bitmap.get(&slot.slot).unwrap();
+                let fc_bitmap = slot.slice.bitmap();
+                let num_pages = slot.slice.len() / page_size;
+
+                for page_index in 0..num_pages {
+                    let page_offset = page_index * page_size;
+                    let is_kvm_dirty =
+                        ((kvm_bitmap[page_index / 64] >> (page_index % 64)) & 1) != 0;
+                    let is_fc_dirty = fc_bitmap.dirty_at(page_offset);
+
+                    if is_kvm_dirty || is_fc_dirty {
+                        let slice = &slot.slice.subslice(page_offset, page_size).unwrap();
+                        writer.write_all_volatile(slice).unwrap();
+                        dirty_count += 1;
+                    } else {
+                        writer.seek(SeekFrom::Current(page_size as i64)).unwrap();
+                    }
+                }
+            }
+            dirty_count
+        }
+
+        /// Generate a KVM dirty bitmap for a slot of `num_pages` pages.
+        fn kvm_bitmap_for(num_pages: usize) -> impl Strategy<Value = Vec<u64>> {
+            let num_u64s = num_pages.div_ceil(64);
+            let last_chunk_valid_bits = num_pages % 64;
+
+            proptest::collection::vec(any::<u64>(), num_u64s).prop_map(move |mut bm| {
+                if last_chunk_valid_bits > 0 {
+                    let last = bm.len() - 1;
+                    bm[last] &= (1u64 << last_chunk_valid_bits) - 1;
+                }
+                bm
+            })
+        }
+
+        /// A region descriptor produced by the strategy.
+        #[derive(Debug, Clone)]
+        struct RegionSpec {
+            /// gap (in pages) from the previous region.
+            gap_pages: usize,
+            /// type of the region
+            region_type: GuestRegionType,
+            /// size (in pages) of the KVM slots in the region
+            pages_per_slot: usize,
+            /// array indicating whether each slot is plugged or not
+            plugged: Vec<bool>,
+            /// mock KVM dirty bitmaps
+            /// There is one per slot and each bit of the u64 is a single page
+            kvm_bitmaps: Vec<Vec<u64>>,
+            /// pages to be accessed by Firecracker during the test.
+            /// One bitmap per slot, where each bool is one page
+            fc_dirty_pages: Vec<Vec<bool>>,
+        }
+
+        /// Strategy for a single region: Dram (1 plugged slot) or
+        /// Hotpluggable (1-4 slots, each independently plugged/unplugged).
+        fn region_spec() -> impl Strategy<Value = RegionSpec> {
+            prop_oneof![
+                // Dram: 1 slot, always plugged
+                (0usize..=8, 1usize..=128).prop_flat_map(|(gap_pages, pages_per_slot)| {
+                    (
+                        kvm_bitmap_for(pages_per_slot),
+                        proptest::collection::vec(any::<bool>(), pages_per_slot),
+                    )
+                        .prop_map(move |(bm, fc)| RegionSpec {
+                            gap_pages,
+                            region_type: GuestRegionType::Dram,
+                            pages_per_slot,
+                            plugged: vec![true],
+                            kvm_bitmaps: vec![bm],
+                            fc_dirty_pages: vec![fc],
+                        })
+                }),
+                // Hotpluggable: 1-4 slots, each plugged or not
+                (0usize..=8, 1usize..=128, 1usize..=4).prop_flat_map(
+                    |(gap_pages, pages_per_slot, num_slots)| {
+                        (
+                            proptest::collection::vec(any::<bool>(), num_slots),
+                            proptest::collection::vec(kvm_bitmap_for(pages_per_slot), num_slots),
+                            proptest::collection::vec(
+                                proptest::collection::vec(any::<bool>(), pages_per_slot),
+                                num_slots,
+                            ),
+                        )
+                            .prop_map(
+                                move |(plugged, kvm_bitmaps, fc_dirty_pages)| RegionSpec {
+                                    gap_pages,
+                                    region_type: GuestRegionType::Hotpluggable,
+                                    pages_per_slot,
+                                    plugged,
+                                    kvm_bitmaps,
+                                    fc_dirty_pages,
+                                },
+                            )
+                    },
+                ),
+            ]
+        }
+
+        /// Build a GuestMemoryMmap and KVM dirty bitmap from region specs.
+        fn build_memory(specs: &[RegionSpec]) -> (GuestMemoryMmap, DirtyBitmap, usize) {
+            let page_size = host_page_size();
+            let mut slot_from = 0u32;
+            let mut regions = Vec::new();
+            let mut kvm_bitmap: DirtyBitmap = HashMap::new();
+            let mut total_size = 0usize;
+            let mut next_addr = 0u64;
+
+            for spec in specs {
+                next_addr += (spec.gap_pages * page_size) as u64;
+                let num_slots = spec.plugged.len();
+                let region_size = num_slots * spec.pages_per_slot * page_size;
+
+                let mmap_regions = anonymous(
+                    [(GuestAddress(next_addr), region_size)].into_iter(),
+                    true,
+                    HugePageConfig::None,
+                )
+                .unwrap();
+
+                let state = GuestMemoryRegionState {
+                    base_address: next_addr,
+                    size: region_size,
+                    region_type: spec.region_type,
+                    plugged: spec.plugged.clone(),
+                };
+
+                let region = GuestRegionMmapExt::from_state(
+                    mmap_regions.into_iter().next().unwrap(),
+                    &state,
+                    slot_from,
+                )
+                .unwrap();
+
+                for (i, bm) in spec.kvm_bitmaps.iter().enumerate() {
+                    kvm_bitmap.insert(slot_from + i as u32, bm.clone());
+                }
+
+                regions.push(region);
+                slot_from += num_slots as u32;
+                total_size += region_size;
+                next_addr += region_size as u64;
+            }
+
+            (
+                GuestMemoryMmap::from_regions(regions).unwrap(),
+                kvm_bitmap,
+                total_size,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
+
+            #[test]
+            fn dump_dirty_correctness(
+                region_specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let page_size = host_page_size();
+                let (guest_memory, kvm_bitmap, total_size) =
+                    build_memory(&region_specs);
+
+                // Fill backing memory with non-zero data via raw pointer so
+                // that KVM-only-dirty pages carry distinguishable content
+                // without triggering the firecracker bitmap.
+                for region in guest_memory.iter() {
+                    let ptr = region
+                        .get_host_address(MemoryRegionAddress(0))
+                        .unwrap();
+                    // SAFETY: ptr is valid for region.len() bytes.
+                    unsafe { std::ptr::write_bytes(ptr, 0xAB, u64_to_usize(region.len())) };
+                }
+
+                // Dirty selected pages in the firecracker bitmap.
+                for (region, spec) in guest_memory.iter().zip(region_specs.iter()) {
+                    for (slot_idx, (slot, plugged)) in region.slots().enumerate() {
+                        if !plugged {
+                            continue;
+                        }
+                        for (page, dirty) in spec.fc_dirty_pages[slot_idx].iter().enumerate() {
+                            if *dirty {
+                                let addr = slot.guest_addr.0 + (page * page_size) as u64;
+                                guest_memory.write(&[0xCD], GuestAddress(addr)).unwrap();
+                            }
+                        }
+                    }
+                }
+
+                // Run oracle first — dump_dirty calls reset_dirty() on
+                // success, which would clear the firecracker bitmap before
+                // the oracle implementation gets to read it.
+                let mut oracle_file = TempFile::new().unwrap().into_file();
+                oracle_file.set_len(total_size as u64).unwrap();
+                let dirty_count = dump_dirty_oracle(&guest_memory, &mut oracle_file, &kvm_bitmap);
+                let expected_blocks = (dirty_count * page_size) as u64 / 512;
+                let oracle_pos = oracle_file.stream_position().unwrap();
+
+                // sanity check the oracle implementation
+                prop_assert_eq!(oracle_pos, total_size as u64);
+                prop_assert_eq!(oracle_file.metadata().unwrap().blocks(), expected_blocks);
+
+                // Run the optimized implementation.
+                let mut opt_file = TempFile::new().unwrap().into_file();
+                opt_file.set_len(total_size as u64).unwrap();
+                guest_memory
+                    .dump_dirty(&mut opt_file, &kvm_bitmap)
+                    .unwrap();
+                let opt_pos = opt_file.stream_position().unwrap();
+
+                // check the writer actually moved the cursor to the end and wrote all dirty blocks
+                prop_assert_eq!(opt_pos, total_size as u64);
+                prop_assert_eq!(opt_file.metadata().unwrap().blocks(), expected_blocks);
+
+                // Read back and compare file contents.
+                opt_file.seek(SeekFrom::Start(0)).unwrap();
+                oracle_file.seek(SeekFrom::Start(0)).unwrap();
+                let mut opt_buf = vec![0u8; total_size];
+                let mut oracle_buf = vec![0u8; total_size];
+                opt_file.read_exact(&mut opt_buf).unwrap();
+                oracle_file.read_exact(&mut oracle_buf).unwrap();
+                prop_assert_eq!(&opt_buf, &oracle_buf);
+            }
+
+            #[test]
+            fn store_dirty_bitmap_correctness(
+                region_specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let page_size = host_page_size();
+                let (guest_memory, kvm_bitmap, _) = build_memory(&region_specs);
+
+                guest_memory.store_dirty_bitmap(&kvm_bitmap, page_size);
+
+                // Verify: every KVM-dirty page on a plugged slot is now
+                // dirty in the firecracker bitmap.
+                for (region, spec) in guest_memory.iter().zip(region_specs.iter()) {
+                    for (slot_idx, (slot, plugged)) in region.slots().enumerate() {
+                        if !plugged {
+                            continue;
+                        }
+                        let num_pages = slot.slice.len() / page_size;
+                        let bm = &spec.kvm_bitmaps[slot_idx];
+                        let fc = slot.slice.bitmap();
+                        for page in 0..num_pages {
+                            let kvm_dirty =
+                                ((bm[page / 64] >> (page % 64)) & 1) == 1;
+                            let fc_dirty = fc.dirty_at(page * page_size);
+                            // Bitmap starts clean, so after store_dirty_bitmap
+                            // the fc bitmap must exactly match the KVM bitmap.
+                            prop_assert_eq!(fc_dirty, kvm_dirty, "mismatch at page {}", page);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

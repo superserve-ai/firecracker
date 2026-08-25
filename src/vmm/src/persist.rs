@@ -135,8 +135,8 @@ pub enum MicrovmStateError {
     RestoreDevices(#[from] DevicePersistError),
     /// Cannot save Vcpu state: {0}
     SaveVcpuState(vstate::vcpu::VcpuError),
-    /// Cannot save Vm state: {0}
-    SaveVmState(vstate::vm::ArchVmError),
+    /// Cannot save KvmVm state: {0}
+    SaveVmState(vstate::vm::KvmVmError),
     /// Cannot signal Vcpu: {0}
     SignalVcpu(VcpuSendEventError),
     /// Vcpu is in unexpected state.
@@ -170,13 +170,10 @@ pub enum CreateSnapshotError {
     ),
 }
 
-/// Snapshot version. Kept at v1.15.0's 9.0.0: the overlay state is
-/// persisted out-of-band in a side-car file, so the bitcode payload of
-/// `vmstate.snap` is byte-identical to vanilla Firecracker. Bumping the
-/// minor here would make vanilla reject this binary's saves
-/// (`Snapshot::load` requires `minor <= ours`), creating a one-way door
-/// with no operational benefit.
-pub const SNAPSHOT_VERSION: Version = Version::new(9, 0, 0);
+/// Snapshot version. Tracks upstream's for this release: the overlay state
+/// remains out-of-band in a side-car file, so the bitcode payload stays
+/// byte-identical to vanilla Firecracker of the same version.
+pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -234,9 +231,12 @@ pub fn create_snapshot(
     )
     .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero", err))?;
 
-    let diff_dump = vmm
-        .vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+            "snapshot requires KVM".into(),
+        ))
+    })?;
+    let diff_dump = kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
     let md = std::fs::metadata(&params.mem_file_path)
         .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_stat", err))?;
@@ -287,7 +287,7 @@ pub fn create_snapshot(
     // do it here is that we don't mark pages as dirty during runtime
     // for queue objects.
     vmm.device_manager
-        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
     Ok(())
 }
@@ -668,6 +668,31 @@ pub fn restore_from_snapshot(
         }
     }
 
+    if let Some(vsock_override) = &params.vsock_override {
+        // There should only ever be at most one vsock device, therefore this
+        // should correctly find it and modify the path if such a device exists.
+        let device_state = microvm_state
+            .device_states
+            .mmio_state
+            .vsock_device
+            .as_mut()
+            .map(|device| &mut device.device_state)
+            .or_else(|| {
+                microvm_state
+                    .device_states
+                    .pci_state
+                    .vsock_device
+                    .as_mut()
+                    .map(|device| &mut device.device_state)
+            })
+            .ok_or(SnapshotStateFromFileError::UnknownVsockDevice)?;
+
+        device_state
+            .backend
+            .uds_path
+            .clone_from(&vsock_override.uds_path);
+    }
+
     let track_dirty_pages = params.track_dirty_pages;
 
     let vcpu_count = microvm_state
@@ -753,6 +778,7 @@ pub fn restore_from_snapshot(
         uffd_handler,
         seccomp_filters,
         vm_resources,
+        params.clock_realtime,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -768,6 +794,8 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Failed to read overlay side-car: {0}
     Io(std::io::Error),
+    /// Unknown Vsock Device.
+    UnknownVsockDevice,
 }
 
 fn snapshot_state_from_file(
@@ -1127,6 +1155,7 @@ mod tests {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname"),
             guest_mac: None,
+            mtu: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
         };
@@ -1176,9 +1205,9 @@ mod tests {
                 ..Default::default()
             },
             #[cfg(target_arch = "aarch64")]
-            vm_state: vmm.vm.save_state(&mpidrs).unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state(&mpidrs).unwrap(),
             #[cfg(target_arch = "x86_64")]
-            vm_state: vmm.vm.save_state().unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state().unwrap(),
         };
 
         let serialized_data = bitcode::serialize(&microvm_state).unwrap();

@@ -3,7 +3,6 @@
 
 use acpi_tables::fadt::{FADT_F_HW_REDUCED_ACPI, FADT_F_PWR_BUTTON, FADT_F_SLP_BUTTON};
 use acpi_tables::{Aml, Dsdt, Fadt, Madt, Mcfg, Rsdp, Sdt, Xsdt, aml};
-use log::{debug, error};
 use vm_allocator::AllocPolicy;
 
 use crate::Vcpu;
@@ -12,6 +11,7 @@ use crate::acpi::x86_64::{
 };
 use crate::arch::x86_64::layout;
 use crate::device_manager::DeviceManager;
+use crate::logger::{debug, error};
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
@@ -60,11 +60,10 @@ impl AcpiTableWriter<'_> {
     where
         S: Sdt,
     {
-        let addr = resource_allocator.allocate_system_memory(
-            table.len().try_into().unwrap(),
-            1,
-            AllocPolicy::FirstMatch,
-        )?;
+        let addr = resource_allocator
+            .system_memory
+            .allocate(table.len().try_into().unwrap(), 1, AllocPolicy::FirstMatch)?
+            .start();
 
         table
             .write_to_guest(self.mem, GuestAddress(addr))
@@ -247,9 +246,9 @@ mod tests {
         // A mocke Vmm object with 128MBs of memory
         let vmm = default_vmm();
         let mut writer = AcpiTableWriter {
-            mem: vmm.vm.guest_memory(),
+            mem: vmm.vm.as_kvm().unwrap().guest_memory(),
         };
-        let mut resource_allocator = vmm.vm.resource_allocator();
+        let mut resource_allocator = vmm.vm.as_kvm().unwrap().resource_allocator();
 
         // This should succeed
         let mut sdt = MockSdt(vec![0; 4096]);
@@ -309,7 +308,7 @@ mod tests {
     // change in the future.
     #[test]
     fn test_write_acpi_table_small_memory() {
-        let (_, vm) = setup_vm_with_memory(u64_to_usize(SYSTEM_MEM_START + SYSTEM_MEM_SIZE - 4096));
+        let vm = setup_vm_with_memory(u64_to_usize(SYSTEM_MEM_START + SYSTEM_MEM_SIZE - 4096));
         let mut writer = AcpiTableWriter {
             mem: vm.guest_memory(),
         };

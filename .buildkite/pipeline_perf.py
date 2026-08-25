@@ -36,9 +36,6 @@ perf_test = {
         "label": "network",
         "tests": "integration_tests/performance/test_network.py",
         "devtool_opts": "-c 1-10 -m 0",
-        # Triggers if delta is > 0.01ms (10µs) or default relative threshold (5%)
-        # only relevant for latency test, throughput test will always be magnitudes above this anyway
-        "ab_opts": "--absolute-strength 0.010",
     },
     "snapshot-latency": {
         "label": "snapshot-latency",
@@ -128,6 +125,10 @@ pipeline = BKPipeline(
     # use ag=1 instances to make sure no two performance tests are scheduled on the same instance
     agents={"ag": 1},
     retry=retry,
+    # Heavy post-failure dumps (full snapshot + chroot copy) are useful
+    # for triaging performance flakes that are hard to reproduce locally.
+    # Cheap dumps are always on; this flag turns the heavy block on.
+    env={"FC_TEST_DUMP_ON_FAILURE": "1"},
 )
 
 tests = [perf_test[test] for test in pipeline.args.test or perf_test.keys()]

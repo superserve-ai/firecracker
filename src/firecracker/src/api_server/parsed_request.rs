@@ -6,7 +6,8 @@ use std::fmt::Debug;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use serde::ser::Serialize;
 use serde_json::Value;
-use vmm::logger::{Level, error, info, log_enabled};
+use vmm::devices::virtio::device::VirtioDeviceType;
+use vmm::logger::{Level, error_unrestricted, info_unrestricted, log_enabled};
 use vmm::rpc_interface::{VmmAction, VmmActionError, VmmData};
 
 use super::ApiServer;
@@ -24,13 +25,14 @@ use super::request::machine_configuration::{
 use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
-use super::request::pmem::parse_put_pmem;
+use super::request::pmem::{parse_patch_pmem, parse_put_pmem};
 use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
     parse_get_memory_hotplug, parse_patch_memory_hotplug, parse_put_memory_hotplug,
 };
+use crate::api_server::request::hotplug::parse_unplug_device;
 use crate::api_server::request::serial::parse_put_serial;
 
 #[derive(Debug)]
@@ -71,7 +73,7 @@ impl TryFrom<&Request> for ParsedRequest {
             request_uri.as_str(),
             request.body.as_ref(),
         );
-        info!("The API server received a {description}.");
+        info_unrestricted!("The API server received a {description}.");
 
         // Split request uri by '/' by doing:
         // 1. Trim starting '/' characters
@@ -120,11 +122,22 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Patch, "network-interfaces", Some(body)) => {
                 parse_patch_net(body, path_tokens.next())
             }
+            (Method::Patch, "pmem", Some(body)) => parse_patch_pmem(body, path_tokens.next()),
             (Method::Patch, "vm", Some(body)) => parse_patch_vm_state(body),
             (Method::Patch, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
                 parse_patch_memory_hotplug(body)
             }
             (Method::Patch, _, None) => method_to_error(Method::Patch),
+            (Method::Delete, "drives", None) => {
+                parse_unplug_device(VirtioDeviceType::Block, path_tokens.next())
+            }
+            (Method::Delete, "pmem", None) => {
+                parse_unplug_device(VirtioDeviceType::Pmem, path_tokens.next())
+            }
+            (Method::Delete, "network-interfaces", None) => {
+                parse_unplug_device(VirtioDeviceType::Net, path_tokens.next())
+            }
+            (Method::Delete, _, Some(_)) => method_to_error(Method::Delete),
             (method, unknown_uri, _) => Err(RequestError::InvalidPathMethod(
                 unknown_uri.to_string(),
                 method,
@@ -153,14 +166,14 @@ impl ParsedRequest {
     where
         T: ?Sized + Serialize + Debug,
     {
-        info!("The request was executed successfully. Status code: 200 OK.");
+        info_unrestricted!("The request was executed successfully. Status code: 200 OK.");
         let mut response = Response::new(Version::Http11, StatusCode::OK);
         response.set_body(Body::new(serde_json::to_string(body_data).unwrap()));
         response
     }
 
     pub(crate) fn success_response_with_mmds_value(body_data: &Value) -> Response {
-        info!("The request was executed successfully. Status code: 200 OK.");
+        info_unrestricted!("The request was executed successfully. Status code: 200 OK.");
         let mut response = Response::new(Version::Http11, StatusCode::OK);
         let body_str = match body_data {
             Value::Null => "{}".to_string(),
@@ -176,7 +189,9 @@ impl ParsedRequest {
         match request_outcome {
             Ok(vmm_data) => match vmm_data {
                 VmmData::Empty => {
-                    info!("The request was executed successfully. Status code: 204 No Content.");
+                    info_unrestricted!(
+                        "The request was executed successfully. Status code: 204 No Content."
+                    );
                     Response::new(Version::Http11, StatusCode::NoContent)
                 }
                 VmmData::MachineConfiguration(machine_config) => {
@@ -200,14 +215,14 @@ impl ParsedRequest {
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
                     VmmActionError::MmdsLimitExceeded(_err) => {
-                        error!(
+                        error_unrestricted!(
                             "Received Error. Status code: 413 Payload too large. Message: {}",
                             vmm_action_error
                         );
                         Response::new(Version::Http11, StatusCode::PayloadTooLarge)
                     }
                     _ => {
-                        error!(
+                        error_unrestricted!(
                             "Received Error. Status code: 400 Bad Request. Message: {}",
                             vmm_action_error
                         );
@@ -280,6 +295,10 @@ pub(crate) fn method_to_error(method: Method) -> Result<ParsedRequest, RequestEr
         Method::Patch => Err(RequestError::Generic(
             StatusCode::BadRequest,
             "Empty PATCH request.".to_string(),
+        )),
+        Method::Delete => Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            "Empty Delete request.".to_string(),
         )),
     }
 }

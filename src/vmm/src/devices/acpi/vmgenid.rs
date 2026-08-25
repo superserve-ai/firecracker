@@ -6,13 +6,13 @@ use std::convert::Infallible;
 use acpi_tables::{Aml, aml};
 use aws_lc_rs::error::Unspecified as RandError;
 use aws_lc_rs::rand;
-use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use vm_memory::{GuestAddress, GuestMemoryError};
 use vm_superio::Trigger;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::super::legacy::EventFdTrigger;
+use crate::logger::debug;
 use crate::snapshot::Persist;
 use crate::vstate::memory::{Bytes, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
@@ -84,8 +84,10 @@ impl VmGenId {
             .map_err(VmGenIdError::AllocateGsi)?[0];
         // The generation ID needs to live in an 8-byte aligned buffer
         let addr = resource_allocator
-            .allocate_system_memory(VMGENID_MEM_SIZE, 8, vm_allocator::AllocPolicy::LastMatch)
-            .map_err(VmGenIdError::AllocateMemory)?;
+            .system_memory
+            .allocate(VMGENID_MEM_SIZE, 8, vm_allocator::AllocPolicy::LastMatch)
+            .map_err(VmGenIdError::AllocateMemory)?
+            .start();
 
         Self::from_parts(GuestAddress(addr), gsi)
     }
@@ -157,7 +159,7 @@ impl Aml for VmGenId {
         aml::Device::new(
             "_SB_.VGEN".try_into()?,
             vec![
-                &aml::Name::new("_HID".try_into()?, &"FCVMGID")?,
+                &aml::Name::new("_HID".try_into()?, &"VMGENCTR")?,
                 &aml::Name::new("_CID".try_into()?, &"VM_Gen_Counter")?,
                 &aml::Name::new("_DDN".try_into()?, &"VM_Gen_Counter")?,
                 &aml::Name::new(

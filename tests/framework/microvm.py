@@ -33,7 +33,8 @@ from tenacity import Retrying, retry, stop_after_attempt, wait_fixed
 import host_tools.cargo_build as build_tools
 import host_tools.network as net_tools
 from framework import utils
-from framework.defs import MAX_API_CALL_DURATION_MS
+from framework.defs import DEFAULT_BINARY_DIR, MAX_API_CALL_DURATION_MS
+from framework.guest import GuestDistro
 from framework.http_api import Api
 from framework.jailer import JailerContext
 from framework.microvm_helpers import MicrovmHelpers
@@ -100,12 +101,16 @@ class Snapshot:
     snapshot_type: SnapshotType
     meta: dict
 
-    def rebase_snapshot(self, base, use_snapshot_editor=False):
+    def rebase_snapshot(
+        self, base, use_snapshot_editor=False, binary_dir=DEFAULT_BINARY_DIR
+    ):
         """Rebases current incremental snapshot onto a specified base layer."""
         if not self.snapshot_type.needs_rebase:
             raise ValueError(f"Cannot rebase {self.snapshot_type}")
         if use_snapshot_editor:
-            build_tools.run_snap_editor_rebase(base.mem, self.mem)
+            build_tools.run_snap_editor_rebase(
+                base.mem, self.mem, binary_dir=binary_dir
+            )
         else:
             build_tools.run_rebase_snap_bin(base.mem, self.mem)
 
@@ -217,6 +222,7 @@ class Microvm:
 
         self.kernel_file = None
         self.rootfs_file = None
+        self.distro = None
         self.ssh_key = None
         self.initrd_file = None
         self.boot_args = None
@@ -331,30 +337,34 @@ class Microvm:
             or might_be_dead
         ), self.log_data
 
-        # pylint: disable=bare-except
-        try:
-            if self.firecracker_pid:
-                os.kill(self.firecracker_pid, signal.SIGKILL)
+        # Kill Firecracker and the screen wrapper independently so that one
+        # already being dead (ProcessLookupError) doesn't leak the other.
+        for pid_to_kill in (self.firecracker_pid, self.screen_pid):
+            if not pid_to_kill:
+                continue
+            try:
+                os.kill(pid_to_kill, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if not might_be_dead:
+                    msg = (
+                        "Failed to kill Firecracker Process. Did it already die (or did the UFFD handler process die and take it down)?"
+                        if self.uffd_handler
+                        else "Failed to kill Firecracker Process. Did it already die?"
+                    )
+                    self._dump_debug_information(msg)
+                    raise
 
-            if self.screen_pid:
-                os.kill(self.screen_pid, signal.SIGKILL)
-        except:
-            if not might_be_dead:
-                msg = (
-                    "Failed to kill Firecracker Process. Did it already die (or did the UFFD handler process die and take it down)?"
-                    if self.uffd_handler
-                    else "Failed to kill Firecracker Process. Did it already die?"
-                )
-
-                self._dump_debug_information(msg)
-
+        if self._spawned and self.firecracker_pid:
+            try:
+                utils.wait_process_termination(self.firecracker_pid)
+            except TimeoutError:
+                utils.dump_proc_state(self.firecracker_pid)
                 raise
 
         # if microvm was spawned then check if it gets killed
         if self._spawned:
-            # Wait until the Firecracker process is actually dead
-            utils.wait_process_termination(self.firecracker_pid)
-
             # The following logic guards us against the case where `firecracker_pid` for some
             # reason is the wrong PID, e.g. this is a regression test for
             # https://github.com/firecracker-microvm/firecracker/pull/4442/commits/d63eb7a65ffaaae0409d15ed55d99ecbd29bc572
@@ -380,6 +390,9 @@ class Microvm:
 
         if self.uffd_handler and self.uffd_handler.is_running():
             self.uffd_handler.kill()
+
+        if self.api:
+            self.api.session.close()
 
         # Mark the microVM as not spawned, so we avoid trying to kill twice.
         self._spawned = False
@@ -847,7 +860,7 @@ class Microvm:
         if boot_args is not None:
             self.boot_args = boot_args
         else:
-            self.boot_args = "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
+            self.boot_args = "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0 cryptomgr.notests"
             if not self.pci_enabled:
                 self.boot_args += " pci=off"
         boot_source_args = {
@@ -1058,6 +1071,7 @@ class Microvm:
             snapshot_type=snapshot_type,
             meta={
                 "kernel_file": str(self.kernel_file),
+                "rootfs_file": str(self.rootfs_file) if self.rootfs_file else None,
                 "vcpus_count": self.vcpus_count,
             },
         )
@@ -1079,6 +1093,8 @@ class Microvm:
         snapshot: Snapshot,
         resume: bool = False,
         rename_interfaces: dict = None,
+        vsock_override: str = None,
+        clock_realtime: bool = False,
         *,
         uffd_handler_name: str = None,
     ):
@@ -1119,6 +1135,9 @@ class Microvm:
             setattr(self, key, value)
         # Adjust things just in case
         self.kernel_file = Path(self.kernel_file)
+        if self.rootfs_file:
+            self.rootfs_file = Path(self.rootfs_file)
+            self.distro = GuestDistro.from_rootfs(self.rootfs_file)
 
         iface_overrides = []
         if rename_interfaces is not None:
@@ -1134,6 +1153,12 @@ class Microvm:
             # parameter. Once the release baseline has moved, this assignment
             # can be inline in the snapshot_load command below
             optional_kwargs["network_overrides"] = iface_overrides
+
+        if vsock_override is not None:
+            optional_kwargs["vsock_override"] = {"uds_path": vsock_override}
+
+        if clock_realtime:
+            optional_kwargs["clock_realtime"] = clock_realtime
 
         self.api.snapshot_load.put(
             mem_backend=mem_backend,
@@ -1294,15 +1319,21 @@ class MicroVMFactory:
                 rootfs_path = Path(vm.path) / rootfs.name
                 shutil.copyfile(rootfs, rootfs_path)
             vm.rootfs_file = rootfs_path
+            vm.distro = GuestDistro.from_rootfs(rootfs_path)
             vm.ssh_key = ssh_key
         return vm
 
-    def build_from_snapshot(self, snapshot: Snapshot, uffd_handler_name=None):
+    def build_from_snapshot(
+        self, snapshot: Snapshot, uffd_handler_name=None, clock_realtime=False
+    ):
         """Build a microvm from a snapshot"""
         vm = self.build()
         vm.spawn()
         vm.restore_from_snapshot(
-            snapshot, resume=True, uffd_handler_name=uffd_handler_name
+            snapshot,
+            resume=True,
+            uffd_handler_name=uffd_handler_name,
+            clock_realtime=clock_realtime,
         )
         return vm
 
@@ -1349,7 +1380,9 @@ class MicroVMFactory:
 
                 if current_snapshot.snapshot_type.needs_rebase:
                     next_snapshot = next_snapshot.rebase_snapshot(
-                        current_snapshot, use_snapshot_editor
+                        current_snapshot,
+                        use_snapshot_editor,
+                        binary_dir=microvm.fc_binary_path.parent,
                     )
 
                 last_snapshot = current_snapshot
@@ -1436,3 +1469,23 @@ class Serial:
                 assert False
 
         return rx_str
+
+    def drain_until_idle(self, idle_seconds=1):
+        """Read and discard serial output until the console is idle.
+
+        Returns once no new output has arrived for idle_seconds.
+        Used after snapshot restore to let kernel messages (e.g. crng reseeded)
+        finish before sending input, avoiding the input being swallowed while
+        the kernel holds the console lock.
+        """
+        last_activity = time.time()
+        start = time.time()
+        while True:
+            now = time.time()
+            if (now - start) >= self.RX_TIMEOUT_S:
+                break
+            ch = self.rx_char()
+            if ch:
+                last_activity = now
+            elif now - last_activity >= idle_seconds:
+                break

@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kvm_ioctls::VmFd;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::Vm;
-use crate::logger::{IncMetric, METRICS};
+use crate::logger::{IncMetric, METRICS, error};
+use crate::pci::PciSBDF;
 use crate::snapshot::Persist;
+use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 /// Errors related with Firecracker interrupts
@@ -35,8 +36,8 @@ pub struct MsixVectorConfig {
     pub low_addr: u32,
     /// Data to write to delivery message signaled interrupt.
     pub data: u32,
-    /// Unique ID of the device to delivery message signaled interrupt.
-    pub devid: u32,
+    /// Devid of the device to delivery message signaled interrupt.
+    pub devid: PciSBDF,
 }
 
 /// Type that describes an allocated interrupt
@@ -86,9 +87,9 @@ impl MsixVector {
 #[derive(Debug)]
 /// MSI interrupts created for a VirtIO device
 pub struct MsixVectorGroup {
-    /// Reference to the Vm object, which we'll need for interacting with the underlying KVM Vm
-    /// file descriptor
-    pub vm: Arc<Vm>,
+    /// Reference to the KvmVm object, which we'll need for interacting with the underlying KVM
+    /// KvmVm file descriptor
+    pub vm: Arc<KvmVm>,
     /// A list of all the MSI-X vectors
     pub vectors: Vec<MsixVector>,
 }
@@ -97,7 +98,7 @@ impl MsixVectorGroup {
     /// Returns the number of vectors in this group
     pub fn num_vectors(&self) -> u16 {
         // It is safe to unwrap here. We are creating `MsixVectorGroup` objects through the
-        // `Vm::create_msix_group` where the argument for the number of `vectors` is a `u16`.
+        // `KvmVm::create_msix_group` where the argument for the number of `vectors` is a `u16`.
         u16::try_from(self.vectors.len()).unwrap()
     }
 
@@ -172,9 +173,36 @@ impl MsixVectorGroup {
     }
 }
 
+impl Drop for MsixVectorGroup {
+    fn drop(&mut self) {
+        let vmfd = &self.vm.common.fd;
+
+        {
+            let mut interrupts = self.vm.common.interrupts.lock().expect("Poisoned lock");
+            for vector in &self.vectors {
+                if let Err(e) = vector.disable(vmfd) {
+                    error!("Failed to unregister irqfd for GSI {}: {e}", vector.gsi);
+                }
+                interrupts.remove(&vector.gsi);
+            }
+        }
+
+        let mut allocator = self
+            .vm
+            .common
+            .resource_allocator
+            .lock()
+            .expect("Poisoned lock");
+        for vector in &self.vectors {
+            // SAFETY: we allocated gsi from this allocator.
+            allocator.gsi_msi_allocator.free_id(vector.gsi).unwrap();
+        }
+    }
+}
+
 impl<'a> Persist<'a> for MsixVectorGroup {
     type State = Vec<u32>;
-    type ConstructorArgs = Arc<Vm>;
+    type ConstructorArgs = Arc<KvmVm>;
     type Error = InterruptError;
 
     fn save(&self) -> Self::State {

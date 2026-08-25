@@ -136,11 +136,11 @@ def uvm_resumed_memhp(
         "resumed-uffd-huge-pages",
     ],
 )
-def uvm_any_memhp(request, uvm_plain_6_1, rootfs, microvm_factory):
+def uvm_any_memhp(request, uvm_plain, rootfs, microvm_factory):
     """Fixture that yields a booted or resumed VM with memory hotplugging"""
     ctor, vhost_user, huge_pages, uffd_handler, snapshot_type = request.param
     yield ctor(
-        uvm_plain_6_1,
+        uvm_plain,
         rootfs,
         microvm_factory,
         vhost_user,
@@ -278,13 +278,11 @@ def test_virtio_mem_hotplug_hotunplug(uvm_any_memhp):
     ],
     ids=["all_different", "slot_sized_block", "single_slot", "single_block"],
 )
-def test_virtio_mem_configs(uvm_plain_6_1, memhp_config):
+def test_virtio_mem_configs(uvm_plain, memhp_config):
     """
     Check that the virtio mem device is working as expected for different configs
     """
-    uvm = uvm_booted_memhp(
-        uvm_plain_6_1, None, None, False, memhp_config, None, None, None
-    )
+    uvm = uvm_booted_memhp(uvm_plain, None, None, False, memhp_config, None, None, None)
     if not uvm.pci_enabled:
         pytest.skip(
             "Skip tests on MMIO transport to save time as we don't expect any difference."
@@ -309,16 +307,16 @@ def test_virtio_mem_configs(uvm_plain_6_1, memhp_config):
     validate_metrics(uvm)
 
 
-def test_snapshot_restore_persistence(uvm_plain_6_1, microvm_factory, snapshot_type):
+def test_snapshot_restore_persistence(uvm_plain, microvm_factory, snapshot_type):
     """
-    Check that hptplugged memory is persisted across snapshot/restore.
+    Check that hotplugged memory is persisted across snapshot/restore.
     """
-    if not uvm_plain_6_1.pci_enabled:
+    if not uvm_plain.pci_enabled:
         pytest.skip(
             "Skip tests on MMIO transport to save time as we don't expect any difference."
         )
     uvm = uvm_booted_memhp(
-        uvm_plain_6_1,
+        uvm_plain,
         None,
         microvm_factory,
         False,
@@ -349,23 +347,37 @@ def test_snapshot_restore_persistence(uvm_plain_6_1, microvm_factory, snapshot_t
     validate_metrics(restored_vm)
 
 
-def test_snapshot_restore_incremental(uvm_plain_6_1, microvm_factory):
+def test_snapshot_restore_incremental(uvm_plain, microvm_factory, snapshot_type):
     """
-    Check that hptplugged memory is persisted across snapshot/restore.
+    Check that hotplugged memory is persisted across snapshot/restore.
     """
-    if not uvm_plain_6_1.pci_enabled:
+    if not uvm_plain.pci_enabled:
         pytest.skip(
             "Skip tests on MMIO transport to save time as we don't expect any difference."
         )
 
     uvm = uvm_booted_memhp(
-        uvm_plain_6_1, None, microvm_factory, False, DEFAULT_CONFIG, None, None, None
+        uvm_plain,
+        None,
+        microvm_factory,
+        False,
+        DEFAULT_CONFIG,
+        None,
+        None,
+        snapshot_type,
     )
 
-    snapshot = uvm.snapshot_full()
+    hp_total_size_mib = uvm.api.memory_hotplug.get().json()["total_size_mib"]
+
+    snapshot = uvm.make_snapshot(snapshot_type)
 
     hotplug_count = 16
-    hp_mem_mib_per_cycle = 1024 // hotplug_count
+    hp_mem_mib_per_cycle = hp_total_size_mib // hotplug_count
+
+    # we're not using hugepages, so it's always 4KiB pages
+    guest_pages_per_mib = 1024 // 4
+    hp_mem_pages_per_cycle = hp_mem_mib_per_cycle * guest_pages_per_mib
+
     checksums = []
     for i, uvm in enumerate(
         microvm_factory.build_n_from_snapshot(
@@ -400,6 +412,16 @@ def test_snapshot_restore_incremental(uvm_plain_6_1, microvm_factory):
 
         _, checksum, _ = uvm.ssh.check_output(f"sha256sum /dev/shm/mem_hp_test_{i}")
         checksums.append(checksum)
+
+        # dirty a page in the middle of the hotplugged memory to verify differential snapshots
+        # This is to test also the case where the page and the slots are not consecutive with the
+        # one we're going to write to avoid issues like #5696.
+        file_to_dirty = i // 2
+        page_to_dirty = hp_mem_pages_per_cycle // 2
+        uvm.ssh.check_output(
+            f"dd if=/dev/shm/mem_hp_test_{file_to_dirty} of=/dev/shm/mem_hp_test_{file_to_dirty} "
+            f"bs=4K count=1 skip={page_to_dirty} seek={page_to_dirty} conv=notrunc"
+        )
 
         validate_metrics(uvm)
 
@@ -447,7 +469,7 @@ def timed_memory_hotplug(uvm, size, metrics, metric_prefix, fc_metric_name):
     [HugePagesConfig.NONE, HugePagesConfig.HUGETLBFS_2MB],
 )
 def test_memory_hotplug_latency(
-    microvm_factory, guest_kernel_linux_6_1, rootfs, hotplug_size, huge_pages, metrics
+    microvm_factory, guest_kernel_default, rootfs, hotplug_size, huge_pages, metrics
 ):
     """Test the latency of hotplugging memory"""
 
@@ -457,10 +479,8 @@ def test_memory_hotplug_latency(
             "slot_size_mib": 128,
             "block_size_mib": 2,
         }
-        uvm_plain_6_1 = microvm_factory.build(guest_kernel_linux_6_1, rootfs, pci=True)
-        uvm = uvm_booted_memhp(
-            uvm_plain_6_1, None, None, False, config, None, None, None
-        )
+        uvm_plain = microvm_factory.build(guest_kernel_default, rootfs, pci=True)
+        uvm = uvm_booted_memhp(uvm_plain, None, None, False, config, None, None, None)
 
         if i == 0:
             metrics.set_dimensions(
@@ -478,3 +498,4 @@ def test_memory_hotplug_latency(
         timed_memory_hotplug(uvm, hotplug_size, metrics, "hotplug", "plug_agg")
         timed_memory_hotplug(uvm, 0, metrics, "hotunplug", "unplug_agg")
         timed_memory_hotplug(uvm, hotplug_size, metrics, "hotplug_2nd", "plug_agg")
+        uvm.kill()

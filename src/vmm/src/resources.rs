@@ -16,6 +16,7 @@ use crate::mmds::data_store::{Mmds, MmdsVersion};
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::utils::mib_to_bytes;
 use crate::utils::net::ipv4addr::is_link_local_valid;
+use crate::vmm_config::TokenBucketConfig;
 use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
@@ -62,9 +63,9 @@ pub enum ResourcesError {
     /// Vsock device error: {0}
     VsockDevice(#[from] VsockConfigError),
     /// Entropy device error: {0}
-    EntropyDevice(#[from] EntropyDeviceError),
+    EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem device error: {0}
-    PmemDevice(#[from] PmemConfigError),
+    PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
@@ -119,7 +120,7 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
-    /// The pmem devices.
+    /// The pmem device configs.
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
@@ -135,9 +136,22 @@ pub struct VmResources {
     pub pci_enabled: bool,
     /// Where serial console output should be written to
     pub serial_out_path: Option<PathBuf>,
+    /// Optional rate limiter config for serial output.
+    pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
 }
 
 impl VmResources {
+    /// Returns a `TokenBucket` from the serial rate limiter config, if configured.
+    pub fn serial_rate_limiter(&self) -> Option<crate::rate_limiter::TokenBucket> {
+        self.serial_rate_limiter_cfg.as_ref().and_then(|cfg| {
+            crate::rate_limiter::TokenBucket::new(
+                cfg.size,
+                cfg.one_time_burst.unwrap_or(0),
+                cfg.refill_time,
+            )
+        })
+    }
+
     /// Configures Vmm resources as described by the `config_json` param.
     pub fn from_json(
         config_json: &str,
@@ -218,6 +232,7 @@ impl VmResources {
 
         if let Some(serial_cfg) = vmm_config.serial_config {
             resources.serial_out_path = serial_cfg.serial_out_path;
+            resources.serial_rate_limiter_cfg = serial_cfg.rate_limiter;
         }
 
         if let Some(memory_hotplug_config) = vmm_config.memory_hotplug {
@@ -534,7 +549,7 @@ impl From<&VmResources> for VmmConfig {
             network_interfaces: resources.net_builder.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
-            pmem_devices: resources.pmem.configs(),
+            pmem_devices: resources.pmem.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
@@ -583,6 +598,7 @@ mod tests {
                 .unwrap()
                 .to_string(),
             guest_mac: Some(MacAddr::from_str("01:23:45:67:89:0a").unwrap()),
+            mtu: None,
             rx_rate_limiter: Some(RateLimiterConfig::default()),
             tx_rate_limiter: Some(RateLimiterConfig::default()),
         }
@@ -652,6 +668,7 @@ mod tests {
             pmem: Default::default(),
             pci_enabled: false,
             serial_out_path: None,
+            serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
         }
     }
@@ -1666,8 +1683,8 @@ mod tests {
             path_on_host: tmp_file.as_path().to_str().unwrap().to_string(),
             ..Default::default()
         };
-        assert_eq!(vm_resources.pmem.devices.len(), 0);
+        assert_eq!(vm_resources.pmem.configs.len(), 0);
         vm_resources.build_pmem_device(cfg).unwrap();
-        assert_eq!(vm_resources.pmem.devices.len(), 1);
+        assert_eq!(vm_resources.pmem.configs.len(), 1);
     }
 }

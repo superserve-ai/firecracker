@@ -14,7 +14,6 @@ use std::{fmt, io, thread};
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::{c_int, c_void, siginfo_t};
-use log::{error, info, warn};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -23,12 +22,12 @@ pub use crate::arch::{KvmVcpu, KvmVcpuConfigureError, KvmVcpuError, Peripherals,
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
-use crate::logger::{IncMetric, METRICS};
+use crate::logger::{IncMetric, METRICS, error, info, warn};
 use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
-use crate::vstate::vm::Vm;
+use crate::vstate::vm::KvmVm;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub const VCPU_RTSIG_OFFSET: i32 = 0;
@@ -125,7 +124,7 @@ impl Vcpu {
     /// * `index` - Represents the 0-based CPU index between [0, max vcpus).
     /// * `vm` - The vm to which this vcpu will get attached.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
-    pub fn new(index: u8, vm: &Vm, exit_evt: EventFd) -> Result<Self, VcpuError> {
+    pub fn new(index: u8, vm: &KvmVm, exit_evt: EventFd) -> Result<Self, VcpuError> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
         let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
@@ -154,7 +153,7 @@ impl Vcpu {
     }
 
     /// Obtains a copy of the VcpuFd
-    pub fn copy_kvm_vcpu_fd(&self, vm: &Vm) -> Result<VcpuFd, CopyKvmFdError> {
+    pub fn copy_kvm_vcpu_fd(&self, vm: &KvmVm) -> Result<VcpuFd, CopyKvmFdError> {
         // SAFETY: We own this fd so it is considered safe to clone
         let r = unsafe { libc::dup(self.kvm_vcpu.fd.as_raw_fd()) };
         if r < 0 {
@@ -168,7 +167,7 @@ impl Vcpu {
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(
         mut self,
-        vm: &Vm,
+        vm: &KvmVm,
         seccomp_filter: Arc<BpfProgram>,
         barrier: Arc<Barrier>,
     ) -> Result<VcpuHandle, StartThreadedError> {
@@ -420,6 +419,7 @@ fn handle_kvm_exit(
     match emulation_result {
         Ok(run) => match run {
             VcpuExit::MmioRead(addr, data) => {
+                data.fill(0);
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
                     let _metric = METRICS.vcpu.exit_mmio_read_agg.record_latency_metrics();
                     if let Err(err) = mmio_bus.read(addr, data) {
@@ -668,10 +668,8 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::utils::signal::validate_signal_num;
     use crate::vstate::bus::BusDevice;
-    use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
     use crate::vstate::vcpu::VcpuError as EmulationError;
-    use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
     struct DummyDevice;
@@ -686,7 +684,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_handle_kvm_exit() {
-        let (_, _, mut vcpu) = setup_vcpu(0x1000);
+        let (_, mut vcpu) = setup_vcpu(0x1000);
         let res = handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(VcpuExit::Hlt));
         assert!(matches!(
             res,
@@ -827,16 +825,16 @@ pub(crate) mod tests {
 
     // Auxiliary function being used throughout the tests.
     #[allow(unused_mut)]
-    pub(crate) fn setup_vcpu(mem_size: usize) -> (Kvm, Vm, Vcpu) {
-        let (kvm, mut vm) = setup_vm_with_memory(mem_size);
+    pub(crate) fn setup_vcpu(mem_size: usize) -> (KvmVm, Vcpu) {
+        let mut vm = setup_vm_with_memory(mem_size);
 
-        let (mut vcpus, _) = vm.create_vcpus(1).unwrap();
+        let mut vcpus = vm.create_vcpus(1).unwrap();
         let mut vcpu = vcpus.remove(0);
 
         #[cfg(target_arch = "aarch64")]
         vcpu.kvm_vcpu.init(&[]).unwrap();
 
-        (kvm, vm, vcpu)
+        (vm, vcpu)
     }
 
     fn load_good_kernel(vm_memory: &GuestMemoryMmap) -> GuestAddress {
@@ -866,10 +864,10 @@ pub(crate) mod tests {
         entry_addr.kernel_load
     }
 
-    fn vcpu_configured_for_boot() -> (Vm, VcpuHandle, EventFd) {
+    fn vcpu_configured_for_boot() -> (KvmVm, VcpuHandle, EventFd) {
         // Need enough mem to boot linux.
         let mem_size = mib_to_bytes(64);
-        let (kvm, vm, mut vcpu) = setup_vcpu(mem_size);
+        let (vm, mut vcpu) = setup_vcpu(mem_size);
 
         let vcpu_exit_evt = vcpu.exit_evt.try_clone().unwrap();
 
@@ -890,7 +888,7 @@ pub(crate) mod tests {
                         vcpu_count: 1,
                         smt: false,
                         cpu_config: CpuConfiguration {
-                            cpuid: Cpuid::try_from(kvm.supported_cpuid.clone()).unwrap(),
+                            cpuid: Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap(),
                             msrs: BTreeMap::new(),
                         },
                     },
@@ -908,7 +906,7 @@ pub(crate) mod tests {
                     smt: false,
                     cpu_config: crate::cpu_config::aarch64::CpuConfiguration::default(),
                 },
-                &kvm.optional_capabilities(),
+                &vm.kvm().optional_capabilities(),
             )
             .expect("failed to configure vcpu");
 
@@ -929,7 +927,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_set_mmio_bus() {
-        let (_, _, mut vcpu) = setup_vcpu(0x1000);
+        let (_, mut vcpu) = setup_vcpu(0x1000);
         assert!(vcpu.kvm_vcpu.peripherals.mmio_bus.is_none());
         vcpu.set_mmio_bus(Arc::new(Bus::new()));
         assert!(vcpu.kvm_vcpu.peripherals.mmio_bus.is_some());
@@ -937,7 +935,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vcpu_kick() {
-        let (_, vm, mut vcpu) = setup_vcpu(0x1000);
+        let (vm, mut vcpu) = setup_vcpu(0x1000);
 
         let mut kvm_run =
             kvm_ioctls::KvmRunWrapper::mmap_from_fd(&vcpu.kvm_vcpu.fd, vm.fd().run_size())
@@ -999,7 +997,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_immediate_exit_shortcircuits_execution() {
-        let (_, _, mut vcpu) = setup_vcpu(0x1000);
+        let (_, mut vcpu) = setup_vcpu(0x1000);
 
         vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
         // Set a dummy value to be returned by the emulate call

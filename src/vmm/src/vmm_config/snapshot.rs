@@ -73,6 +73,13 @@ pub struct NetworkOverride {
     pub host_dev_name: String,
 }
 
+/// Allows for changing the host UDS of the vsock backend during snapshot restore
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub struct VsockOverride {
+    /// The path to the UDS that will be used for the vsock interface
+    pub uds_path: String,
+}
+
 /// Stores the configuration that will be used for loading a snapshot.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoadSnapshotParams {
@@ -88,6 +95,12 @@ pub struct LoadSnapshotParams {
     pub resume_vm: bool,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
+    /// When set, the vsock backend UDS path will be overridden
+    pub vsock_override: Option<VsockOverride>,
+    /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
+    /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
+    /// (default), kvmclock resumes from where it was at snapshot time.
+    pub clock_realtime: bool,
     /// Optional directory containing block device delta files for cloning.
     /// Each overlay device will look for `{drive_id}.delta` in this directory
     /// and apply it to a fresh overlay, enabling fast VM cloning.
@@ -121,6 +134,12 @@ pub struct LoadSnapshotConfig {
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
+    /// Whether or not to override the vsock backend UDS path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vsock_override: Option<VsockOverride>,
+    /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
+    #[serde(default)]
+    pub clock_realtime: bool,
     /// Optional directory containing block device delta files for cloning.
     #[serde(default)]
     pub block_delta_dir: Option<PathBuf>,

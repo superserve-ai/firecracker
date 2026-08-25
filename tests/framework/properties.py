@@ -6,6 +6,7 @@
 """
 Metadata we want to attach to tests for further analysis and troubleshooting
 """
+
 import os
 import platform
 import re
@@ -26,7 +27,7 @@ def get_os_version():
     """Get the OS version
 
     >>> get_os_version()
-    'Ubuntu 24.04.3 LTS'
+    'Ubuntu 24.04.4 LTS'
     """
 
     os_release = Path("/etc/os-release").read_text(encoding="ascii")

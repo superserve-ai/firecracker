@@ -17,6 +17,7 @@ on safety and security. Thanks go to:
 Contributors to the Firecracker repository:
 
 - Aaqa Ishtyaq <aaqaishtyaq@gmail.com>
+- Aaron Ang <aaron.angyd@gmail.com>
 - Aaron Hill <aa1ronham@gmail.com>
 - Aaron Lo <aaronlo0929@gmail.com>
 - Aaron O'Mullan <aaron.omullan@gmail.com>
@@ -40,6 +41,7 @@ Contributors to the Firecracker repository:
 - Alexandru Cihodaru <cihodar@amazon.com>
 - Alexandru-Cezar Sardan <alsardan@amazon.com>
 - Alin Dima <alindima@amazon.com>
+- Anastassios Nanos <ananos@nubificus.co.uk>
 - Anatoli Babenia <anatoli@rainforce.org>
 - Andrea Manzini <andrea.manzini@suse.com>
 - Andreea Florescu <fandree@amazon.com>
@@ -59,6 +61,7 @@ Contributors to the Firecracker repository:
 - Aussie Schnore <aussiev123@yahoo.com>
 - Austin Vazquez <macedonv@amazon.com>
 - Ayato Tokubi <tokubi.ayato@gmail.com>
+- Babis Chalios <bchalios@amazon.es>
 - Babis Chalios <mail@bchalios.io>
 - Bartosz Zbytniewski <bartosz.zbytniewski.dev@gmail.com>
 - Begley Brothers Inc <begleybrothers@gmail.com>
@@ -70,6 +73,7 @@ Contributors to the Firecracker repository:
 - Bogdan Ionita <bci@amazon.com>
 - Brandon Duffany <brandon@buildbuddy.io>
 - Brandon Pike <bpike@amazon.com>
+- Branislav Brzak <branislav.brzak@stealthium.io>
 - Caleb Albers <7110138+CalebAlbers@users.noreply.github.com>
 - Cam Mannett <camden.mannett@protonmail.ch>
 - Carlos López <carlos.lopez@suse.com>
@@ -134,6 +138,7 @@ Contributors to the Firecracker repository:
 - Iggy Jackson <iggy@theiggy.com>
 - ihciah <ihciah@gmail.com>
 - Ilias Stamatis <ilstam@amazon.com>
+- immanuwell <pchpr.00@list.ru>
 - Ioana Chirca <chioana@amazon.com>
 - Ishwor Gurung <me@ishworgurung.com>
 - Iulian Barbu <iul@amazon.com>
@@ -143,6 +148,7 @@ Contributors to the Firecracker repository:
 - James Curtis <jxcurtis@amazon.co.uk>
 - James Turnbull <james@lovedthanlost.net>
 - Javier Romero <xavinux@gmail.com>
+- Jay Chung <jaehoc@amazon.com>
 - Jeff Widman <jeff@jeffwidman.com>
 - Jerome Gravel-Niquet <jeromegn@gmail.com>
 - Jing Yang <k.jingyang@gmail.com>
@@ -183,6 +189,7 @@ Contributors to the Firecracker repository:
 - Manohar Castelino <manohar.r.castelino@intel.com>
 - Marc Brooker <mbrooker@amazon.com>
 - Marco Cali <xmarcalx@amazon.co.uk>
+- Marco Marangoni <mamarang@amazon.com>
 - Marco Vedovati <mvedovati@suse.com>
 - Markus Ziller <web+github@markusziller.de>
 - Masatoshi Higuchi <matt9ucci@gmail.com>
@@ -197,6 +204,7 @@ Contributors to the Firecracker repository:
 - Michael Saah <msaah@linode.com>
 - Mihai Stan <stanmihai17cs@gmail.com>
 - milahu <milahu@gmail.com>
+- MohibShaikh <mohibuddin9@gmail.com>
 - moricho <ikeda.morito@gmail.com>
 - Muki Kiboigo <muki@kiboigo.com>
 - Muskaan Singla <msinglaa@amazon.com>
@@ -207,6 +215,7 @@ Contributors to the Firecracker repository:
 - Nicolas Mesa <nicolasmesa@gmail.com>
 - NikeNano <niklas.sven.hansson@gmail.com>
 - Nikita Kalyazin <kalyazin@amazon.co.uk>
+- Nikita Kalyazin <nikita.kalyazin@e2b.dev>
 - Nikita Zakirov <zakironi@amazon.com>
 - Nikolay Edigaryev <edigaryev@gmail.com>
 - Noah Meyerhans <nmeyerha@amazon.com>
@@ -228,6 +237,7 @@ Contributors to the Firecracker repository:
 - Ram Sripracha <ramsri@amazon.com>
 - rares <raresgmihalcea@gmail.com>
 - razn <rezwele@gmail.com>
+- Remo Andreoli <andrremo@amazon.com>
 - Ria <juthi_paul@utexas.edu>
 - Riccardo Mancini <mancio@amazon.com>
 - Richard Case <richard@weave.works>
@@ -252,6 +262,7 @@ Contributors to the Firecracker repository:
 - Shion Yamashita <shioyama1118@gmail.com>
 - singwm <singwm@amazon.com>
 - sladynnunes <snunes@usc.edu>
+- snigenigmatic <kaustubhc.1105@gmail.com>
 - Sripracha <ramsri@amazon.com>
 - Stefan Nita <32079871+stefannita01@users.noreply.github.com>
 - StemCll <lydjotj6f@mozmail.com>
@@ -285,11 +296,12 @@ Contributors to the Firecracker repository:
 - xiekeyang <keyang.xie@gmail.com>
 - Ye Sijun <junnplus@gmail.com>
 - Yichen Zhang <jakezhang2020@gmail.com>
-- Yılmaz ŞEN <yilmazsen94@gmail.com>
 - YLyu <lyuyuan92@gmail.com>
 - YUAN LYU <lyuyuan92@gmail.com>
 - Yuval Kohavi <yuval.kohavi@gmail.com>
+- Yılmaz ŞEN <yilmazsen94@gmail.com>
 - Zhenyu Qi <qzydustin@hotmail.com>
+- Zhiheng Tao <junchuan.tzh@antgroup.com>
 - Zi Shen Lim <zlim.lnx@gmail.com>
 - Zicklag <zicklag@katharostech.com>
 - Дамјан Георгиевски <gdamjan@gmail.com>

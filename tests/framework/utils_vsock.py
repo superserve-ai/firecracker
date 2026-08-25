@@ -6,6 +6,7 @@ import hashlib
 import os.path
 import re
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from socket import AF_UNIX, SOCK_STREAM, socket
 from subprocess import Popen
@@ -38,7 +39,7 @@ class HostEchoWorker(Thread):
         self.blob_path = blob_path
         self.hash = None
         self.error = None
-        self.sock = _vsock_connect_to_guest(self.uds_path, ECHO_SERVER_PORT)
+        self.sock = vsock_connect_to_guest(self.uds_path, ECHO_SERVER_PORT)
 
     def run(self):
         """Thread code payload.
@@ -56,6 +57,14 @@ class HostEchoWorker(Thread):
     def close_uds(self):
         """Close vsock UDS connection."""
         self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.is_alive():
+            self.join()
+        self.close_uds()
 
     def _run(self):
         with open(self.blob_path, "rb") as blob_file:
@@ -96,6 +105,39 @@ def make_blob(dst_dir, size=BLOB_SIZE):
     return blob_path, blob_hash.hexdigest()
 
 
+def boot_vsock_vm(
+    vm,
+    *,
+    vcpu_count=None,
+    mem_size_mib=None,
+    log_level=None,
+    emit_metrics=False,
+    pin_threads=False,
+):
+    """Spawn, configure and start a microVM with a vsock device attached."""
+    spawn_kwargs = {}
+    if log_level is not None:
+        spawn_kwargs["log_level"] = log_level
+    if emit_metrics:
+        spawn_kwargs["emit_metrics"] = True
+    vm.spawn(**spawn_kwargs)
+
+    config_kwargs = {}
+    if vcpu_count is not None:
+        config_kwargs["vcpu_count"] = vcpu_count
+    if mem_size_mib is not None:
+        config_kwargs["mem_size_mib"] = mem_size_mib
+    vm.basic_config(**config_kwargs)
+
+    vm.add_net_iface()
+    vm.api.vsock.put(vsock_id="vsock0", guest_cid=3, uds_path="/" + VSOCK_UDS_PATH)
+    vm.start()
+    if pin_threads:
+        vm.pin_threads(0)
+
+    return vm
+
+
 def start_guest_echo_server(vm):
     """Start a vsock echo server in the microVM.
 
@@ -119,31 +161,33 @@ def check_host_connections(uds_path, blob_path, blob_hash):
     checked against `blob_hash`.
     """
 
-    workers = []
-    for _ in range(TEST_CONNECTION_COUNT):
-        worker = HostEchoWorker(uds_path, blob_path)
-        workers.append(worker)
-        worker.start()
+    with ExitStack() as stack:
+        workers = [
+            stack.enter_context(HostEchoWorker(uds_path, blob_path))
+            for _ in range(TEST_CONNECTION_COUNT)
+        ]
+        for wrk in workers:
+            wrk.start()
 
-    for wrk in workers:
-        wrk.join()
+        for wrk in workers:
+            wrk.join()
 
-    for wrk in workers:
-        assert wrk.hash == blob_hash
+        for wrk in workers:
+            assert wrk.hash == blob_hash
 
 
-def check_guest_connections(vm, server_port_path, blob_path, blob_hash):
-    """Test guest-initiated connections.
+@contextmanager
+def host_echo_server(vm, server_port_path):
+    """Run a host-side echo server reachable by the guest over vsock.
 
-    This will start an echo server on the host (in its own thread), then
-    start `TEST_CONNECTION_COUNT` workers inside the guest VM, all
-    communicating with the echo server.
+    Starts `socat` listening on the Unix socket `server_port_path`, links it
+    into the VM's jail so Firecracker can reach it, and raises the ssh
+    service's `pids.max` so guest workers can fork freely. Yields the socket
+    path and tears the server down on exit.
     """
-
     echo_server = Popen(
         ["socat", f"UNIX-LISTEN:{server_port_path},fork,backlog=5", "exec:'/bin/cat'"]
     )
-
     try:
         # Give socat a bit of time to create the socket
         for attempt in Retrying(
@@ -163,9 +207,26 @@ def check_guest_connections(vm, server_port_path, blob_path, blob_hash):
         # Needed to execute the bash script that tests for concurrent
         # vsock guest initiated connections.
         vm.ssh.check_output(
-            "echo 1024 > /sys/fs/cgroup/system.slice/ssh.service/pids.max"
+            f"echo 1024 > /sys/fs/cgroup/system.slice/{vm.distro.ssh_service}/pids.max"
         )
 
+        yield server_port_path
+    finally:
+        echo_server.terminate()
+        rc = echo_server.wait()
+        # socat exits with 128 + 15 (SIGTERM)
+        assert rc == 143
+
+
+def check_guest_connections(vm, server_port_path, blob_path, blob_hash):
+    """Test guest-initiated connections.
+
+    This will start an echo server on the host (in its own thread), then
+    start `TEST_CONNECTION_COUNT` workers inside the guest VM, all
+    communicating with the echo server.
+    """
+
+    with host_echo_server(vm, server_port_path):
         # Build the guest worker sub-command.
         # `vsock_helper` will read the blob file from STDIN and send the echo
         # server response to STDOUT. This response is then hashed, and the
@@ -190,11 +251,6 @@ def check_guest_connections(vm, server_port_path, blob_path, blob_hash):
         cmd += "for w in $workers; do wait $w || (wait; exit 1); done"
 
         vm.ssh.check_output(cmd)
-    finally:
-        echo_server.terminate()
-        rc = echo_server.wait()
-        # socat exits with 128 + 15 (SIGTERM)
-        assert rc == 143
 
 
 def make_host_port_path(uds_path, port):
@@ -202,16 +258,27 @@ def make_host_port_path(uds_path, port):
     return "{}_{}".format(uds_path, port)
 
 
-def _vsock_connect_to_guest(uds_path, port):
-    """Return a Unix socket, connected to the guest vsock port `port`."""
+def vsock_connect_to_guest(uds_path, port):
+    """Return a Unix socket, connected to the guest vsock port `port`.
+
+    The returned socket is a regular `socket.socket`, so callers can
+    pass it to `contextlib.ExitStack.enter_context` (or wrap it in a
+    `with` block) to get deterministic cleanup. On any failure during
+    the CONNECT/ACK handshake the socket is closed before raising, so
+    the caller never receives a half-open descriptor.
+    """
     sock = socket(AF_UNIX, SOCK_STREAM)
-    sock.connect(uds_path)
+    try:
+        sock.connect(uds_path)
 
-    buf = bytearray("CONNECT {}\n".format(port).encode("utf-8"))
-    sock.send(buf)
+        buf = bytearray("CONNECT {}\n".format(port).encode("utf-8"))
+        sock.send(buf)
 
-    ack_buf = sock.recv(32)
-    assert re.match("^OK [0-9]+\n$", ack_buf.decode("utf-8")) is not None
+        ack_buf = sock.recv(32)
+        assert re.match("^OK [0-9]+\n$", ack_buf.decode("utf-8")) is not None
+    except BaseException:
+        sock.close()
+        raise
 
     return sock
 
