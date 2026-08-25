@@ -876,6 +876,7 @@ fn test_guarded_snapshot_session_lifecycle() {
                 resume_vm: true,
                 network_overrides: vec![],
                 block_delta_dir: None,
+                clock_realtime: None,
                 tracking_session_id,
             }))
             .unwrap();

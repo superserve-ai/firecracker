@@ -1271,7 +1271,7 @@ definitions:
         readOnly: true
       error_kind:
         type: string
-        description:
+        description: >
           Stable machine-readable discriminator, present only for error classes
           clients must handle distinctly (fault_message is free-form and not a
           stable contract). Currently defined value —
