@@ -194,6 +194,16 @@ impl ApiServer {
     fn json_fault_message<T: AsRef<str> + serde::Serialize + Debug>(msg: T) -> String {
         json!({ "fault_message": msg }).to_string()
     }
+
+    /// A fault body carrying a stable machine-readable discriminator alongside
+    /// the human-readable message, for error classes clients must handle
+    /// distinctly (the free-form fault_message is not a stable contract).
+    fn json_fault_message_with_kind<T: AsRef<str> + serde::Serialize + Debug>(
+        msg: T,
+        error_kind: &str,
+    ) -> String {
+        json!({ "fault_message": msg, "error_kind": error_kind }).to_string()
+    }
 }
 
 #[cfg(test)]

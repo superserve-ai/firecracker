@@ -7,6 +7,7 @@ use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use serde::ser::Serialize;
 use serde_json::Value;
 use vmm::logger::{Level, error, info, log_enabled};
+use vmm::persist::CreateSnapshotError;
 use vmm::rpc_interface::{VmmAction, VmmActionError, VmmData};
 
 use super::ApiServer;
@@ -198,6 +199,25 @@ impl ParsedRequest {
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
             },
             Err(vmm_action_error) => {
+                // A guarded snapshot whose session token no longer matches is a
+                // distinct, retriable condition (the caller falls back to a Full
+                // snapshot); it carries a stable error_kind discriminator so
+                // clients never have to match the free-form fault message.
+                if let VmmActionError::CreateSnapshot(
+                    CreateSnapshotError::DirtyTrackingSessionMismatch,
+                ) = vmm_action_error
+                {
+                    error!(
+                        "Received Error. Status code: 400 Bad Request. Message: {}",
+                        vmm_action_error
+                    );
+                    let mut response = Response::new(Version::Http11, StatusCode::BadRequest);
+                    response.set_body(Body::new(ApiServer::json_fault_message_with_kind(
+                        vmm_action_error.to_string(),
+                        "DirtyTrackingSessionMismatch",
+                    )));
+                    return response;
+                }
                 let mut response = match vmm_action_error {
                     VmmActionError::MmdsLimitExceeded(_err) => {
                         error!(
@@ -641,6 +661,35 @@ pub mod tests {
 
         let expected_response = http_response(&json, 400);
         assert_eq!(buf.into_inner(), expected_response.as_bytes());
+    }
+
+    // The guarded-snapshot session mismatch is the one snapshot failure a
+    // client handles distinctly (fall back to a Full snapshot), so its
+    // response must carry the stable error_kind discriminator — and no other
+    // snapshot error may, or clients would fall back on failures that need to
+    // stay loud.
+    #[test]
+    fn test_convert_to_response_dirty_tracking_mismatch_discriminator() {
+        let error =
+            VmmActionError::CreateSnapshot(CreateSnapshotError::DirtyTrackingSessionMismatch);
+        let json = ApiServer::json_fault_message_with_kind(
+            error.to_string(),
+            "DirtyTrackingSessionMismatch",
+        );
+        assert!(json.contains("\"error_kind\":\"DirtyTrackingSessionMismatch\""));
+        let mut buf = Cursor::new(vec![0]);
+        let response = ParsedRequest::convert_to_response(&Err(error));
+        response.write_all(&mut buf).unwrap();
+        let expected_response = http_response(&json, 400);
+        assert_eq!(buf.into_inner(), expected_response.as_bytes());
+
+        // Any other snapshot-create failure keeps the plain fault body.
+        let other = VmmActionError::CreateSnapshot(CreateSnapshotError::FlattenRequiresDeltaDir);
+        let mut buf = Cursor::new(vec![0]);
+        let response = ParsedRequest::convert_to_response(&Err(other));
+        response.write_all(&mut buf).unwrap();
+        let body = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(!body.contains("error_kind"));
     }
 
     #[test]
