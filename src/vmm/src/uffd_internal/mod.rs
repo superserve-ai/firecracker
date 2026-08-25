@@ -15,9 +15,10 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use userfaultfd::{Error as UffdCrateError, Event, FeatureFlags, Uffd, UffdBuilder};
 
@@ -30,10 +31,37 @@ use crate::vstate::memory::{self, GuestMemoryState, GuestRegionMmap, MemoryError
 /// to notice that the VM is going away.
 const POLL_TIMEOUT_MS: i32 = 100;
 
+/// How often the watchdog samples the handler's progress markers.
+const WATCHDOG_TICK: Duration = Duration::from_millis(500);
+
+/// How long unresolved work may sit without progress before the watchdog
+/// reports it. Comfortably above a slow cold-fault copy, far below the
+/// orchestrator's readiness window, so a report always precedes the kill.
+const WATCHDOG_STALL_MS: u64 = 2_000;
+
+/// Minimum gap between watchdog reports for one handler, so a long stall
+/// yields a few useful lines rather than a flood.
+const WATCHDOG_REPORT_EVERY_MS: u64 = 5_000;
+
 /// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
 /// observability; not used for synchronization, hence `Ordering::Relaxed` throughout.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct Stats {
+    /// Time origin for the progress fields below; they hold millis since this.
+    origin: Instant,
+    /// Progress markers written by the handler thread and read by the watchdog.
+    /// The watchdog exists precisely because a handler blocked inside
+    /// `UFFDIO_COPY` cannot report on itself: only another thread can observe
+    /// that the copy started and never finished.
+    last_served_ms: AtomicU64,
+    last_read_ms: AtomicU64,
+    copy_started_ms: AtomicU64,
+    copy_offset: AtomicU64,
+    in_copy: AtomicBool,
+    deferred_depth: AtomicU64,
+    oldest_deferred_ms: AtomicU64,
+    prefetch_cursor: AtomicU64,
+    prefetch_total: AtomicU64,
     faults_served: AtomicU64,
     faults_deferred: AtomicU64,
     faults_failed_transient: AtomicU64,
@@ -74,7 +102,51 @@ pub struct StatsSnapshot {
     pub recorded_offsets: u64,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_served_ms: AtomicU64::new(0),
+            last_read_ms: AtomicU64::new(0),
+            copy_started_ms: AtomicU64::new(0),
+            copy_offset: AtomicU64::new(0),
+            in_copy: AtomicBool::new(false),
+            deferred_depth: AtomicU64::new(0),
+            oldest_deferred_ms: AtomicU64::new(0),
+            prefetch_cursor: AtomicU64::new(0),
+            prefetch_total: AtomicU64::new(0),
+            faults_served: AtomicU64::new(0),
+            faults_deferred: AtomicU64::new(0),
+            faults_failed_transient: AtomicU64::new(0),
+            prefetch_served: AtomicU64::new(0),
+            prefetch_eexist: AtomicU64::new(0),
+            prefetch_eagain: AtomicU64::new(0),
+            prefetch_failed: AtomicU64::new(0),
+            recorded_offsets: AtomicU64::new(0),
+        }
+    }
+}
+
 impl Stats {
+    /// Millis since the handler started. The single time base for every
+    /// progress field, so the watchdog can compare them without a clock call
+    /// per read.
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+
+    /// Marks a `UFFDIO_COPY` as in flight. Paired with [`Stats::copy_done`];
+    /// between the two, a watchdog sample attributes the stall to this copy.
+    fn copy_begin(&self, offset: u64) {
+        self.copy_started_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.copy_offset.store(offset, Ordering::Relaxed);
+        self.in_copy.store(true, Ordering::Relaxed);
+    }
+
+    fn copy_done(&self) {
+        self.in_copy.store(false, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             faults_served: self.faults_served.load(Ordering::Relaxed),
@@ -325,6 +397,20 @@ pub fn setup(
     let (drain_tx, drain_rx) = mpsc::sync_channel::<mpsc::SyncSender<()>>(0);
     let stats = Arc::new(Stats::default());
     let stats_for_thread = Arc::clone(&stats);
+    // The watchdog observes the handler from outside so a handler blocked
+    // inside a copy is still reportable; `alive` stops it when the handler
+    // returns, by any path including a panic.
+    let handler_alive = Arc::new(AtomicBool::new(true));
+    let watchdog_alive = Arc::clone(&handler_alive);
+    let watchdog_stats = Arc::clone(&stats);
+    if let Err(e) = thread::Builder::new()
+        .name("uffd-watchdog".into())
+        .spawn(move || watchdog(watchdog_stats, watchdog_alive))
+    {
+        // Non-fatal: the handler serves faults with or without an observer.
+        log::warn!("uffd-internal: watchdog thread unavailable: {e}");
+    }
+    let stats_for_exit = Arc::clone(&stats);
     let thread = thread::Builder::new()
         .name("uffd-internal".into())
         .spawn(move || {
@@ -348,6 +434,24 @@ pub fn setup(
                 log::error!("uffd-internal: handler thread panicked");
                 HandlerExit::Unexpected
             });
+            handler_alive.store(false, Ordering::Relaxed);
+            // The counters' one guaranteed consumer: without this they are
+            // maintained for the process's whole life and never read.
+            let snap = stats_for_exit.snapshot();
+            log::info!(
+                "uffd-internal: handler exit clean={:?} served={} deferred={} failed_transient={} \
+                 prefetch_served={} prefetch_eagain={} prefetch_eexist={} prefetch_failed={} \
+                 deferred_depth_at_exit={}",
+                clean,
+                snap.faults_served,
+                snap.faults_deferred,
+                snap.faults_failed_transient,
+                snap.prefetch_served,
+                snap.prefetch_eagain,
+                snap.prefetch_eexist,
+                snap.prefetch_failed,
+                stats_for_exit.deferred_depth.load(Ordering::Relaxed),
+            );
             if clean == HandlerExit::Unexpected {
                 // Handler gone while the guest may still fault. Log always; abort only
                 // when gated on, so the VM dies visibly instead of hanging silently.
@@ -773,6 +877,70 @@ enum HandlerExit {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Watches the handler's progress markers from a SEPARATE thread and reports
+/// unresolved work that has stopped moving.
+///
+/// This cannot be folded into the handler loop. The failure it exists to catch
+/// is a handler blocked inside `UFFDIO_COPY` — a thread in that state cannot
+/// log, increment, or otherwise describe itself, so the stall is invisible
+/// from the inside. Only an outside observer can attribute it, which is the
+/// whole point: the report names the copy that never returned, or the deferral
+/// that never cleared, at the moment the guest is hung rather than after the
+/// process is gone.
+///
+/// Read-only with respect to handler state: it loads atomics and writes log
+/// lines, and can never itself delay fault serving.
+fn watchdog(stats: Arc<Stats>, alive: Arc<AtomicBool>) {
+    let mut last_report_ms = 0u64;
+    while alive.load(Ordering::Relaxed) {
+        thread::sleep(WATCHDOG_TICK);
+        if !alive.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = stats.now_ms();
+
+        let in_copy = stats.in_copy.load(Ordering::Relaxed);
+        let copy_age = now.saturating_sub(stats.copy_started_ms.load(Ordering::Relaxed));
+        let depth = stats.deferred_depth.load(Ordering::Relaxed);
+        let oldest = stats.oldest_deferred_ms.load(Ordering::Relaxed);
+        let deferred_age = if oldest == 0 { 0 } else { now.saturating_sub(oldest) };
+
+        let stuck_copy = in_copy && copy_age >= WATCHDOG_STALL_MS;
+        let stuck_deferral = depth > 0 && deferred_age >= WATCHDOG_STALL_MS;
+        if !stuck_copy && !stuck_deferral {
+            continue;
+        }
+        if now.saturating_sub(last_report_ms) < WATCHDOG_REPORT_EVERY_MS {
+            continue;
+        }
+        last_report_ms = now;
+
+        let snap = stats.snapshot();
+        log::error!(
+            "uffd-internal: fault handling stalled in_copy={} copy_age_ms={} copy_offset={:#x} \
+             deferred_depth={} deferred_age_ms={} last_served_ago_ms={} last_read_ago_ms={} \
+             prefetch={}/{} served={} deferred={} failed_transient={} \
+             prefetch_served={} prefetch_eagain={} prefetch_eexist={} prefetch_failed={}",
+            in_copy,
+            if in_copy { copy_age } else { 0 },
+            stats.copy_offset.load(Ordering::Relaxed),
+            depth,
+            deferred_age,
+            now.saturating_sub(stats.last_served_ms.load(Ordering::Relaxed)),
+            now.saturating_sub(stats.last_read_ms.load(Ordering::Relaxed)),
+            stats.prefetch_cursor.load(Ordering::Relaxed),
+            stats.prefetch_total.load(Ordering::Relaxed),
+            snap.faults_served,
+            snap.faults_deferred,
+            snap.faults_failed_transient,
+            snap.prefetch_served,
+            snap.prefetch_eagain,
+            snap.prefetch_eexist,
+            snap.prefetch_failed,
+        );
+    }
+}
+
 fn run(
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
@@ -795,6 +963,15 @@ fn run(
     // of them; retried at the top of each iteration so the REMOVE drains first.
     let mut deferred: Vec<u64> = Vec::new();
     let mut prefetch_cursor = 0usize;
+    stats
+        .prefetch_total
+        .store(prefetch_offsets.len() as u64, Ordering::Relaxed);
+    log::info!(
+        "uffd-internal: handler start regions={} page_size={} prefetch_entries={}",
+        mappings.len(),
+        page_size,
+        prefetch_offsets.len()
+    );
     let pollfd = libc::pollfd {
         fd: uffd.as_raw_fd(),
         events: libc::POLLIN,
@@ -853,17 +1030,16 @@ fn run(
             return HandlerExit::Unexpected;
         }
 
-        retry_deferred(
-            &uffd,
-            &mappings,
-            &backing,
-            page_size,
-            &mut deferred,
-            recorder.as_mut(),
-            &stats,
-        );
-
         if n == 0 {
+            retry_deferred(
+                &uffd,
+                &mappings,
+                &backing,
+                page_size,
+                &mut deferred,
+                recorder.as_mut(),
+                &stats,
+            );
             if prefetch_cursor < prefetch_offsets.len() {
                 prefetch_one(
                     &uffd,
@@ -874,10 +1050,16 @@ fn run(
                     &stats,
                 );
                 prefetch_cursor += 1;
+                stats
+                    .prefetch_cursor
+                    .store(prefetch_cursor as u64, Ordering::Relaxed);
             }
             continue;
         }
 
+        // Drain every queued event FIRST, then retry deferrals. A deferral
+        // exists because a REMOVE was queued ahead of the copy, so retrying
+        // before that REMOVE is read just re-earns the same EAGAIN.
         loop {
             match uffd.read_event() {
                 Ok(Some(ev)) => handle_event(
@@ -909,6 +1091,16 @@ fn run(
                 }
             }
         }
+
+        retry_deferred(
+            &uffd,
+            &mappings,
+            &backing,
+            page_size,
+            &mut deferred,
+            recorder.as_mut(),
+            &stats,
+        );
     }
 }
 
@@ -923,13 +1115,18 @@ fn retry_deferred(
     stats: &Stats,
 ) {
     if deferred.is_empty() {
+        stats.deferred_depth.store(0, Ordering::Relaxed);
         return;
+    }
+    if stats.oldest_deferred_ms.load(Ordering::Relaxed) == 0 {
+        stats.oldest_deferred_ms.store(stats.now_ms(), Ordering::Relaxed);
     }
     let mut still_deferred = Vec::with_capacity(deferred.len());
     for addr in deferred.drain(..) {
-        match serve_pagefault(uffd, mappings, backing, page_size, addr) {
+        match serve_pagefault(uffd, mappings, backing, page_size, addr, stats) {
             ServeOutcome::Served => {
                 stats.faults_served.fetch_add(1, Ordering::Relaxed);
+                stats.last_served_ms.store(stats.now_ms(), Ordering::Relaxed);
                 record_fault(recorder.as_deref_mut(), mappings, page_size, addr, stats);
             }
             ServeOutcome::Deferred => {
@@ -937,11 +1134,28 @@ fn retry_deferred(
                 still_deferred.push(addr);
             }
             ServeOutcome::FailedTransient => {
+                // Re-queued, NOT dropped: the vCPU that took this fault is
+                // parked until some attempt succeeds, so discarding the
+                // address hangs the guest for good. Retries cost one ioctl
+                // per poll cycle and stop as soon as one lands.
                 stats.faults_failed_transient.fetch_add(1, Ordering::Relaxed);
+                still_deferred.push(addr);
             }
         }
     }
+    stats
+        .deferred_depth
+        .store(deferred_len_of(&still_deferred), Ordering::Relaxed);
+    if still_deferred.is_empty() {
+        // Cleared: the next deferral starts a fresh age, so a later stall is
+        // not reported with a stale timestamp.
+        stats.oldest_deferred_ms.store(0, Ordering::Relaxed);
+    }
     *deferred = still_deferred;
+}
+
+fn deferred_len_of(v: &[u64]) -> u64 {
+    v.len() as u64
 }
 
 /// Drain every UFFD event the kernel currently has queued, retrying any deferred
@@ -1011,10 +1225,12 @@ fn handle_event(
 ) {
     match ev {
         Event::Pagefault { addr, .. } => {
+            stats.last_read_ms.store(stats.now_ms(), Ordering::Relaxed);
             let addr_u64 = addr as u64;
-            match serve_pagefault(uffd, mappings, backing, page_size, addr_u64) {
+            match serve_pagefault(uffd, mappings, backing, page_size, addr_u64, stats) {
                 ServeOutcome::Served => {
                     stats.faults_served.fetch_add(1, Ordering::Relaxed);
+                    stats.last_served_ms.store(stats.now_ms(), Ordering::Relaxed);
                     record_fault(recorder, mappings, page_size, addr_u64, stats);
                 }
                 ServeOutcome::Deferred => {
@@ -1022,7 +1238,9 @@ fn handle_event(
                     deferred.push(addr_u64);
                 }
                 ServeOutcome::FailedTransient => {
+                    // Re-queued rather than dropped — see `retry_deferred`.
                     stats.faults_failed_transient.fetch_add(1, Ordering::Relaxed);
+                    deferred.push(addr_u64);
                 }
             }
         }
@@ -1079,7 +1297,12 @@ fn prefetch_one(
     let src = backing.src_ptr(region.offset + page_offset_in_region) as *const libc::c_void;
     // SAFETY: same constraints as in `serve_pagefault` — src within snapshot mmap, dst
     // within a region registered with this UFFD.
+    // Marked in flight like a demand copy: a prefetch copy that blocks on its
+    // source page holds the ONLY fault-serving thread, so the watchdog must be
+    // able to attribute a stall to it.
+    stats.copy_begin(region.offset + page_offset_in_region);
     let res = unsafe { uffd.copy(src, dst, page_size, true) };
+    stats.copy_done();
     match res {
         Ok(_) => {
             stats.prefetch_served.fetch_add(1, Ordering::Relaxed);
@@ -1124,6 +1347,7 @@ fn serve_pagefault(
     backing: &Backing,
     page_size: usize,
     addr: u64,
+    stats: &Stats,
 ) -> ServeOutcome {
     let page_addr = addr & !((page_size as u64) - 1);
     let region = match mappings
@@ -1145,7 +1369,9 @@ fn serve_pagefault(
     // SAFETY: `src` is within the snapshot mmap; `dst` is within a region registered with
     // this UFFD; both ranges are exactly `page_size` bytes long. Setting the wake bit
     // lets the faulting vCPU resume after the kernel installs the page.
+    stats.copy_begin(region.offset + offset);
     let res = unsafe { uffd.copy(src, dst, page_size, true) };
+    stats.copy_done();
     match res {
         Ok(_) => ServeOutcome::Served,
         Err(UffdCrateError::PartiallyCopied(bytes))
@@ -1269,6 +1495,60 @@ pub fn config_from_paths(
         access_log_path: access_log_path.map(Path::to_path_buf),
         record_to: record_to.map(Path::to_path_buf),
         abort_on_handler_death,
+    }
+}
+
+#[cfg(test)]
+mod stall_observability_tests {
+    use super::*;
+
+    /// A copy that never returns must be attributable from OUTSIDE the handler
+    /// thread — the whole reason the watchdog exists.
+    #[test]
+    fn in_flight_copy_is_observable_by_another_thread() {
+        let stats = Arc::new(Stats::default());
+        stats.copy_begin(0x4000);
+        let seen = {
+            let s = Arc::clone(&stats);
+            std::thread::spawn(move || {
+                (
+                    s.in_copy.load(Ordering::Relaxed),
+                    s.copy_offset.load(Ordering::Relaxed),
+                )
+            })
+            .join()
+            .unwrap()
+        };
+        assert_eq!(seen, (true, 0x4000), "watchdog cannot see the in-flight copy");
+        stats.copy_done();
+        assert!(!stats.in_copy.load(Ordering::Relaxed));
+    }
+
+    /// Deferral age must reset once the queue drains, or a later unrelated
+    /// deferral is reported with a stale (and alarming) age.
+    #[test]
+    fn deferral_age_resets_when_queue_clears() {
+        let stats = Stats::default();
+        stats.oldest_deferred_ms.store(5, Ordering::Relaxed);
+        stats.deferred_depth.store(3, Ordering::Relaxed);
+        // Mirrors retry_deferred's bookkeeping when everything drains.
+        stats.deferred_depth.store(0, Ordering::Relaxed);
+        stats.oldest_deferred_ms.store(0, Ordering::Relaxed);
+        assert_eq!(stats.oldest_deferred_ms.load(Ordering::Relaxed), 0);
+    }
+
+    /// The exit path is the counters' only guaranteed consumer; a snapshot
+    /// must carry every counter the stall report reads.
+    #[test]
+    fn snapshot_carries_the_stall_counters() {
+        let stats = Stats::default();
+        stats.faults_served.fetch_add(7, Ordering::Relaxed);
+        stats.faults_failed_transient.fetch_add(2, Ordering::Relaxed);
+        stats.prefetch_eagain.fetch_add(5, Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.faults_served, 7);
+        assert_eq!(snap.faults_failed_transient, 2);
+        assert_eq!(snap.prefetch_eagain, 5);
     }
 }
 
@@ -1634,7 +1914,7 @@ mod tests {
         for pg in 0..npages {
             let addr = mem as u64 + (pg * ps) as u64;
             assert_eq!(
-                serve_pagefault(&uffd, &mappings, &backing, ps, addr),
+                serve_pagefault(&uffd, &mappings, &backing, ps, addr, &Stats::default()),
                 ServeOutcome::Served,
                 "serve page {pg}"
             );
