@@ -95,14 +95,23 @@ jobs:
   test:
     name: Unit tests
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    # Not containerised, unlike the build: these tests need /dev/kvm and
+    # /dev/net/tun, which the runner host has but a container is not given.
+    # The glibc ceiling is a property of the shipped binary, not of the tests.
     steps:
+      - name: Grant access to /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm /dev/net/tun
+
       - name: Install build dependencies
         run: |
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            build-essential ca-certificates clang curl git libclang-dev \
-            libseccomp-dev linux-libc-dev pkg-config
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential clang libclang-dev libseccomp-dev pkg-config
 
       - uses: actions/checkout@v4
 
@@ -112,45 +121,8 @@ jobs:
             | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Non-failing probe: most vmm lib tests and every microVM-booting test
-      # need /dev/kvm, so until a runner provides it the steps below cover only
-      # the hardware-free subset.
-      - name: Probe hardware available to this runner
-        run: |
-          echo "kvm:  $(test -e /dev/kvm && ls -l /dev/kvm || echo absent)"
-          echo "tun:  $(test -e /dev/net/tun && ls -l /dev/net/tun || echo absent)"
-          echo "kernel: $(uname -r)"
+      - name: Library tests
+        run: cargo test -p vmm --lib
 
       - name: API server and request-parsing tests
         run: cargo test --bin firecracker
-
-      - name: Overlay block engine tests
-        run: cargo test -p vmm --lib overlay
-
-      - name: Delta (clone) tests
-        run: cargo test -p vmm --lib delta
-
-      - name: In-process UFFD handler tests
-        run: cargo test -p vmm --lib uffd_internal
-
-  # TEMPORARY probe: does the runner HOST expose /dev/kvm? The containerised
-  # probe above cannot tell us, since container jobs get no devices unless
-  # they are passed explicitly.
-  host-probe:
-    name: Host hardware probe
-    runs-on: ubuntu-latest
-    steps:
-      - name: Probe
-        run: |
-          echo "kvm: $(test -e /dev/kvm && ls -l /dev/kvm || echo absent)"
-          echo "tun: $(test -e /dev/net/tun && ls -l /dev/net/tun || echo absent)"
-          echo "kernel: $(uname -r)"
-          echo "groups: $(id)"
-          echo "--- after the standard permission fix ---"
-          sudo apt-get install -y -qq acl >/dev/null 2>&1 || true
-          if [ -e /dev/kvm ]; then
-            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
-            sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-            ls -l /dev/kvm
-            test -r /dev/kvm && test -w /dev/kvm && echo "kvm READABLE+WRITABLE" || echo "kvm NOT accessible"
-          fi
