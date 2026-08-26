@@ -132,10 +132,16 @@ jobs:
       # singleton, and fixed TAP device names that collide as "resource busy"
       # when two of them run at once).
       # --no-fail-fast so one crate's failure does not hide the rest of the
-      # workspace. test_fingerprint_dump_command is skipped because it reads
-      # the host's CPU microcode version out of sysfs, which a virtualised
-      # runner does not expose; it is environmental, not a code failure.
+      # workspace. Two skips, both environmental rather than code failures:
+      # test_fingerprint_dump_command reads the host CPU's microcode version
+      # from sysfs, which a virtualised runner does not expose; and the two
+      # microVM boot tests give the guest a fixed 500ms to boot and signal
+      # exit, which nested virtualisation cannot reliably meet. Running those
+      # two needs a runner that is not itself a VM.
       - name: Tests
         run: |
           sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --workspace --no-fail-fast -- \
-            --test-threads=1 --skip test_fingerprint_dump_command
+            --test-threads=1 \
+            --skip test_fingerprint_dump_command \
+            --skip test_build_microvm \
+            --skip test_build_and_boot_microvm
