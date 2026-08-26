@@ -74,12 +74,17 @@ jobs:
             exit 1
           fi
 
-      - name: Record artifact identity
+      - name: Package artifact
         run: |
           set -euo pipefail
           bin=build/cargo_target/release/firecracker
-          sha256sum "$bin" | tee firecracker.sha256
           file "$bin"
+          # The digest of the BINARY, which is what an install is verified
+          # against on the target — not the digest of the archive.
+          (cd "$(dirname "$bin")" && sha256sum firecracker) | tee firecracker.sha256
+          # Archived because upload-artifact does not preserve permissions:
+          # a bare uploaded binary comes back mode 0644, not executable.
+          tar -czf firecracker.tar.gz -C "$(dirname "$bin")" firecracker
 
       # Publishing the digest makes installing "fetch and verify" rather than
       # a rebuild whose bytes nobody can predict.
@@ -87,7 +92,7 @@ jobs:
         with:
           name: firecracker-${{ github.sha }}
           path: |
-            build/cargo_target/release/firecracker
+            firecracker.tar.gz
             firecracker.sha256
           if-no-files-found: error
           retention-days: 30
@@ -126,8 +131,5 @@ jobs:
       # Serially, too: several tests share process-global state (the metrics
       # singleton, and fixed TAP device names that collide as "resource busy"
       # when two of them run at once).
-      - name: Library tests
-        run: sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test -p vmm --lib -- --test-threads=1
-
-      - name: API server and request-parsing tests
-        run: sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --bin firecracker
+      - name: Tests
+        run: sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --workspace -- --test-threads=1
