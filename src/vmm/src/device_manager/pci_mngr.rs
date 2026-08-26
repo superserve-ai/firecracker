@@ -793,7 +793,8 @@ mod tests {
       "path_on_host": "{}",
       "rate_limiter": null,
       "io_engine": "Sync",
-      "socket": null
+      "socket": null,
+      "base_path": null
     }}
   ],
   "boot-source": {{

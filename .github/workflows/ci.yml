@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [feat/block-overlay-cow-v1.15]
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Bare container images make the runner fall back to `sh`, where
+# `set -o pipefail` is not supported.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build + glibc ceiling
+    runs-on: ubuntu-latest
+    # The container base, not a cargo flag, sets the glibc a binary is linked
+    # against — and it can only run where glibc is at least that new. Build on
+    # the oldest supported target (22.04 / glibc 2.35), not the runner default.
+    container: ubuntu:22.04
+    steps:
+      # Before checkout: the bare image has no git or CA certs, without which
+      # checkout silently degrades to a tarball download.
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            binutils build-essential ca-certificates clang curl file git libclang-dev \
+            libseccomp-dev linux-libc-dev pkg-config
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release -p firecracker
+
+      # A binary over the ceiling builds and tests clean here and is simply
+      # unloadable on an older target, so nothing else in CI would catch it.
+      - name: Verify glibc symbol ceiling
+        run: |
+          set -euo pipefail
+          bin=build/cargo_target/release/firecracker
+          ceiling=GLIBC_2.34
+          max=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "highest glibc symbol required: $max (ceiling $ceiling)"
+          if [ "$(printf '%s\n%s\n' "$max" "$ceiling" | sort -V | tail -1)" != "$ceiling" ]; then
+            echo "::error::binary requires $max, above the $ceiling ceiling — a glibc 2.35 target would refuse to load it"
+            exit 1
+          fi
+
+      # Supervisors gate features on advertised capabilities, so dropping one
+      # degrades a deployment quietly rather than failing at install time.
+      - name: Verify version and advertised capabilities
+        run: |
+          set -euo pipefail
+          bin=build/cargo_target/release/firecracker
+          "$bin" --version
+          if ! "$bin" --version | grep -qE '^[[:space:]]*capability: serial-console-cap[[:space:]]*$'; then
+            echo "::error::binary does not advertise serial-console-cap — a supervisor gating on it would refuse this binary"
+            exit 1
+          fi
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          bin=build/cargo_target/release/firecracker
+          file "$bin"
+          # The digest of the BINARY, which is what an install is verified
+          # against on the target — not the digest of the archive.
+          (cd "$(dirname "$bin")" && sha256sum firecracker) | tee firecracker.sha256
+          # Archived because upload-artifact does not preserve permissions:
+          # a bare uploaded binary comes back mode 0644, not executable.
+          tar -czf firecracker.tar.gz -C "$(dirname "$bin")" firecracker
+
+      # Publishing the digest makes installing "fetch and verify" rather than
+      # a rebuild whose bytes nobody can predict.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firecracker-${{ github.sha }}
+          path: |
+            firecracker.tar.gz
+            firecracker.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    # Not containerised, unlike the build: these tests need /dev/kvm and
+    # /dev/net/tun, which the runner host has but a container is not given.
+    # The glibc ceiling is a property of the shipped binary, not of the tests.
+    steps:
+      - name: Grant access to /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm /dev/net/tun
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential clang libclang-dev libseccomp-dev pkg-config
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Run as root: creating a TAP interface needs CAP_NET_ADMIN, which the
+      # unprivileged runner user lacks even with /dev/net/tun readable.
+      # Serially, too: several tests share process-global state (the metrics
+      # singleton, and fixed TAP device names that collide as "resource busy"
+      # when two of them run at once).
+      # --no-fail-fast so one crate's failure does not hide the rest of the
+      # workspace. Two skips, both environmental rather than code failures:
+      # test_fingerprint_dump_command reads the host CPU's microcode version
+      # from sysfs, which a virtualised runner does not expose; and the two
+      # microVM boot tests give the guest a fixed 500ms to boot and signal
+      # exit, which nested virtualisation cannot reliably meet. Running those
+      # two needs a runner that is not itself a VM.
+      - name: Tests
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --workspace --no-fail-fast -- \
+            --test-threads=1 \
+            --skip test_fingerprint_dump_command \
+            --skip test_build_microvm \
+            --skip test_build_and_boot_microvm
