@@ -13,8 +13,8 @@ concurrency:
 permissions:
   contents: read
 
-# The bare container images below have no default shell configured, so the
-# runner falls back to `sh`; name bash explicitly or `set -o pipefail` fails.
+# Bare container images make the runner fall back to `sh`, where
+# `set -o pipefail` is not supported.
 defaults:
   run:
     shell: bash
@@ -23,16 +23,13 @@ jobs:
   build:
     name: Build + glibc ceiling
     runs-on: ubuntu-latest
-    # The build runs in a 22.04 container because the oldest supported
-    # deployment target is Ubuntu 22.04 (glibc 2.35), and a binary is only
-    # loadable by a glibc at least as new as the one it was linked against.
-    # Building anywhere newer (a 24.04 runner, or a newer-base build container)
-    # yields GLIBC_2.38+ symbols whose loader refuses them outright. The
-    # container base is what sets the ceiling — there is no cargo flag for it.
+    # The container base, not a cargo flag, sets the glibc a binary is linked
+    # against — and it can only run where glibc is at least that new. Build on
+    # the oldest supported target (22.04 / glibc 2.35), not the runner default.
     container: ubuntu:22.04
     steps:
-      # Before checkout: the image is bare, and checkout needs git+CA certs to
-      # clone rather than silently falling back to a tarball download.
+      # Before checkout: the bare image has no git or CA certs, without which
+      # checkout silently degrades to a tarball download.
       - name: Install build dependencies
         run: |
           apt-get update -qq
@@ -51,10 +48,8 @@ jobs:
       - name: Build
         run: cargo build --release -p firecracker
 
-      # The check that makes this workflow worth having: a binary over the
-      # ceiling builds and tests fine here and is simply unloadable on an older
-      # target. Catching it in CI replaces catching it by hand with a loader
-      # pre-check on each machine during a rollout.
+      # A binary over the ceiling builds and tests clean here and is simply
+      # unloadable on an older target, so nothing else in CI would catch it.
       - name: Verify glibc symbol ceiling
         run: |
           set -euo pipefail
@@ -67,9 +62,8 @@ jobs:
             exit 1
           fi
 
-      # A supervising daemon may gate features on an advertised capability,
-      # so a binary that silently stops advertising one degrades the
-      # deployment instead of failing loudly at install time.
+      # Supervisors gate features on advertised capabilities, so dropping one
+      # degrades a deployment quietly rather than failing at install time.
       - name: Verify version and advertised capabilities
         run: |
           set -euo pipefail
@@ -87,9 +81,8 @@ jobs:
           sha256sum "$bin" | tee firecracker.sha256
           file "$bin"
 
-      # Every run publishes the binary and its digest, so installing becomes
-      # "fetch this artifact, check this digest" rather than a rebuild whose
-      # bytes nobody can predict.
+      # Publishing the digest makes installing "fetch and verify" rather than
+      # a rebuild whose bytes nobody can predict.
       - uses: actions/upload-artifact@v4
         with:
           name: firecracker-${{ github.sha }}
@@ -119,11 +112,9 @@ jobs:
             | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Informational only, and deliberately non-failing: it reports whether
-      # this runner could host the hardware-dependent suites (most of the vmm
-      # lib tests, and every microVM-booting integration test, need /dev/kvm;
-      # the block engine additionally needs io_uring). Until that question is
-      # settled the steps below run only the subset that needs no hardware.
+      # Non-failing probe: most vmm lib tests and every microVM-booting test
+      # need /dev/kvm, so until a runner provides it the steps below cover only
+      # the hardware-free subset.
       - name: Probe hardware available to this runner
         run: |
           echo "kvm:  $(test -e /dev/kvm && ls -l /dev/kvm || echo absent)"
