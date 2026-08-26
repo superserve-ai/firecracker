@@ -13,6 +13,12 @@ concurrency:
 permissions:
   contents: read
 
+# The bare container images below have no default shell configured, so the
+# runner falls back to `sh`; name bash explicitly or `set -o pipefail` fails.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: Build + glibc ceiling
