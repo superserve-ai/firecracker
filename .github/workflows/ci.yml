@@ -132,3 +132,25 @@ jobs:
 
       - name: In-process UFFD handler tests
         run: cargo test -p vmm --lib uffd_internal
+
+  # TEMPORARY probe: does the runner HOST expose /dev/kvm? The containerised
+  # probe above cannot tell us, since container jobs get no devices unless
+  # they are passed explicitly.
+  host-probe:
+    name: Host hardware probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe
+        run: |
+          echo "kvm: $(test -e /dev/kvm && ls -l /dev/kvm || echo absent)"
+          echo "tun: $(test -e /dev/net/tun && ls -l /dev/net/tun || echo absent)"
+          echo "kernel: $(uname -r)"
+          echo "groups: $(id)"
+          echo "--- after the standard permission fix ---"
+          sudo apt-get install -y -qq acl >/dev/null 2>&1 || true
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+            ls -l /dev/kvm
+            test -r /dev/kvm && test -w /dev/kvm && echo "kvm READABLE+WRITABLE" || echo "kvm NOT accessible"
+          fi
