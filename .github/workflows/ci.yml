@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [feat/block-overlay-cow-v1.15]
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build + glibc ceiling
+    runs-on: ubuntu-latest
+    # The build runs in a 22.04 container because the oldest supported
+    # deployment target is Ubuntu 22.04 (glibc 2.35), and a binary is only
+    # loadable by a glibc at least as new as the one it was linked against.
+    # Building anywhere newer (a 24.04 runner, or a newer-base build container)
+    # yields GLIBC_2.38+ symbols whose loader refuses them outright. The
+    # container base is what sets the ceiling — there is no cargo flag for it.
+    container: ubuntu:22.04
+    steps:
+      # Before checkout: the image is bare, and checkout needs git+CA certs to
+      # clone rather than silently falling back to a tarball download.
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            binutils build-essential ca-certificates clang curl file git libclang-dev \
+            libseccomp-dev linux-libc-dev pkg-config
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release -p firecracker
+
+      # The check that makes this workflow worth having: a binary over the
+      # ceiling builds and tests fine here and is simply unloadable on an older
+      # target. Catching it in CI replaces catching it by hand with a loader
+      # pre-check on each machine during a rollout.
+      - name: Verify glibc symbol ceiling
+        run: |
+          set -euo pipefail
+          bin=build/cargo_target/release/firecracker
+          ceiling=GLIBC_2.34
+          max=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "highest glibc symbol required: $max (ceiling $ceiling)"
+          if [ "$(printf '%s\n%s\n' "$max" "$ceiling" | sort -V | tail -1)" != "$ceiling" ]; then
+            echo "::error::binary requires $max, above the $ceiling ceiling — a glibc 2.35 target would refuse to load it"
+            exit 1
+          fi
+
+      # A supervising daemon may gate features on an advertised capability,
+      # so a binary that silently stops advertising one degrades the
+      # deployment instead of failing loudly at install time.
+      - name: Verify version and advertised capabilities
+        run: |
+          set -euo pipefail
+          bin=build/cargo_target/release/firecracker
+          "$bin" --version
+          if ! "$bin" --version | grep -qE '^[[:space:]]*capability: serial-console-cap[[:space:]]*$'; then
+            echo "::error::binary does not advertise serial-console-cap — a supervisor gating on it would refuse this binary"
+            exit 1
+          fi
+
+      - name: Record artifact identity
+        run: |
+          set -euo pipefail
+          bin=build/cargo_target/release/firecracker
+          sha256sum "$bin" | tee firecracker.sha256
+          file "$bin"
+
+      # Every run publishes the binary and its digest, so installing becomes
+      # "fetch this artifact, check this digest" rather than a rebuild whose
+      # bytes nobody can predict.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firecracker-${{ github.sha }}
+          path: |
+            build/cargo_target/release/firecracker
+            firecracker.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential ca-certificates clang curl git libclang-dev \
+            libseccomp-dev linux-libc-dev pkg-config
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Informational only, and deliberately non-failing: it reports whether
+      # this runner could host the hardware-dependent suites (most of the vmm
+      # lib tests, and every microVM-booting integration test, need /dev/kvm;
+      # the block engine additionally needs io_uring). Until that question is
+      # settled the steps below run only the subset that needs no hardware.
+      - name: Probe hardware available to this runner
+        run: |
+          echo "kvm:  $(test -e /dev/kvm && ls -l /dev/kvm || echo absent)"
+          echo "tun:  $(test -e /dev/net/tun && ls -l /dev/net/tun || echo absent)"
+          echo "kernel: $(uname -r)"
+
+      - name: API server and request-parsing tests
+        run: cargo test --bin firecracker
+
+      - name: Overlay block engine tests
+        run: cargo test -p vmm --lib overlay
+
+      - name: Delta (clone) tests
+        run: cargo test -p vmm --lib delta
+
+      - name: In-process UFFD handler tests
+        run: cargo test -p vmm --lib uffd_internal
