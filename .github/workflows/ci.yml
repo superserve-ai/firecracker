@@ -123,8 +123,11 @@ jobs:
 
       # Run as root: creating a TAP interface needs CAP_NET_ADMIN, which the
       # unprivileged runner user lacks even with /dev/net/tun readable.
+      # Serially, too: several tests share process-global state (the metrics
+      # singleton, and fixed TAP device names that collide as "resource busy"
+      # when two of them run at once).
       - name: Library tests
-        run: sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test -p vmm --lib
+        run: sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test -p vmm --lib -- --test-threads=1
 
       - name: API server and request-parsing tests
         run: sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --bin firecracker
