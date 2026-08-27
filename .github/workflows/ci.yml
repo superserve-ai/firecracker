@@ -209,18 +209,21 @@ jobs:
           $(cat firecracker.sha256)" \
             firecracker.tar.gz firecracker.sha256
 
-      # Publishing is several API calls; confirm what actually landed names
-      # the commit we built, and withdraw it if not.
-      - name: Verify the published release
+      # Re-check the ref itself after publishing, closing the window between
+      # the pre-flight check and the release being created. It has to be the
+      # ref: a release's target_commitish is creation metadata, ignored for an
+      # existing tag, so it does not resolve the tag and would never equal a
+      # commit sha. Withdraw the release if the tag no longer agrees; the tag
+      # is left alone, since it is what the next attempt must be judged
+      # against.
+      - name: Verify the release still matches the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          published=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --json targetCommitish --jq .targetCommitish)
-          if [ "$published" != "$GITHUB_SHA" ]; then
-            echo "::error::published release names $published, not the built commit $GITHUB_SHA — withdrawing it"
+          if ! ./tools/verify-release-provenance.sh \
+              "$GITHUB_REF_NAME" "$GITHUB_SHA" feat/block-overlay-cow-v1.15; then
+            echo "::error::$GITHUB_REF_NAME no longer resolves to $GITHUB_SHA — withdrawing the release"
             gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes
             exit 1
           fi
-          echo "release $GITHUB_REF_NAME names $GITHUB_SHA"
