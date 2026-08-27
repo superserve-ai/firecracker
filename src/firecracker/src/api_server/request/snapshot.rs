@@ -202,7 +202,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: false,
+            clock_realtime: true,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -238,7 +238,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: false,
+            clock_realtime: true,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -274,7 +274,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: false,
+            clock_realtime: true,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -319,7 +319,7 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             block_delta_dir: None,
-            clock_realtime: false,
+            clock_realtime: true,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -352,7 +352,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: false,
+            clock_realtime: true,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(
