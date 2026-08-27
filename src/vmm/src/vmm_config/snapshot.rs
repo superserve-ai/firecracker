@@ -134,17 +134,10 @@ pub struct LoadSnapshotConfig {
     pub clock_realtime: bool,
 }
 
-/// Default for [`LoadSnapshotConfig::clock_realtime`].
-///
-/// Upstream defaults this to `false`, so an omitted field means kvmclock resumes from the
-/// value it held at snapshot time. This fork defaults it to `true` — the behaviour that
-/// predates the fix — because the binary and the API client that drives it are deployed
-/// through independent pipelines: a host can run a newer binary than its caller. An
-/// omitted field must therefore preserve the semantics the caller was built against, and
-/// callers opt into the corrected behaviour explicitly once they can also correct the
-/// guest's wall clock on resume.
-///
-/// Keep this divergence when syncing upstream.
+/// Defaults to `true`, diverging from upstream's `false`: the binary and the client that
+/// drives it are deployed independently, so an omitted field must keep the pre-fix
+/// behaviour rather than silently leave the guest's wall clock behind. Callers opt into
+/// the corrected behaviour explicitly. Keep this divergence when syncing upstream.
 fn default_clock_realtime() -> bool {
     true
 }
