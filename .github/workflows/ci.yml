@@ -143,6 +143,11 @@ jobs:
       # microVM boot tests give the guest a fixed 500ms to boot and signal
       # exit, which nested virtualisation cannot reliably meet. Running those
       # two needs a runner that is not itself a VM.
+      # The release job only runs for tags, so its provenance checks would
+      # otherwise never execute before a real publish.
+      - name: Release provenance checks
+        run: ./tools/test-verify-release-provenance.sh
+
       - name: Tests
         run: |
           sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --workspace --no-fail-fast -- \
@@ -169,37 +174,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify release provenance
-        env:
-          MAINTAINED_BRANCH: feat/block-overlay-cow-v1.15
-        run: |
-          set -euo pipefail
-
-          # The tag can be deleted or force-moved while the build and tests
-          # run. Re-read it from the remote and require it to still resolve to
-          # the commit that produced the artifact — otherwise the release would
-          # carry one commit's binary under another commit's tag, which is
-          # exactly the provenance the digest is supposed to guarantee.
-          git fetch --force --quiet origin \
-            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
-          tag_commit=$(git rev-list -n 1 "$GITHUB_REF_NAME")
-          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
-            echo "::error::$GITHUB_REF_NAME now points at $tag_commit but the artifact was built from $GITHUB_SHA — refusing to publish"
-            exit 1
-          fi
-
-          # A tag can also point at any commit, including one on a branch that
-          # was never reviewed or merged.
-          git fetch --quiet origin "$MAINTAINED_BRANCH"
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$MAINTAINED_BRANCH"; then
-            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of $MAINTAINED_BRANCH — refusing to publish a release from unmerged code"
-            exit 1
-          fi
-          echo "$GITHUB_REF_NAME resolves to $GITHUB_SHA and is reachable from $MAINTAINED_BRANCH"
-
       - uses: actions/download-artifact@v4
         with:
           name: firecracker-${{ github.sha }}
+
+      # Checked as late as possible, after the artifact is in hand, so the
+      # window between verifying and publishing is as small as it can be.
+      # Release tags are immutable by ruleset, so this is the check that
+      # notices if that protection is ever missing.
+      - name: Verify release provenance
+        run: |
+          ./tools/verify-release-provenance.sh \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" feat/block-overlay-cow-v1.15
 
       - name: Create release
         env:
@@ -222,3 +208,19 @@ jobs:
 
           $(cat firecracker.sha256)" \
             firecracker.tar.gz firecracker.sha256
+
+      # Publishing is several API calls; confirm what actually landed names
+      # the commit we built, and withdraw it if not.
+      - name: Verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          published=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json targetCommitish --jq .targetCommitish)
+          if [ "$published" != "$GITHUB_SHA" ]; then
+            echo "::error::published release names $published, not the built commit $GITHUB_SHA — withdrawing it"
+            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes
+            exit 1
+          fi
+          echo "release $GITHUB_REF_NAME names $GITHUB_SHA"
