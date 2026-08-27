@@ -192,9 +192,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # --generate-notes lists the pull requests merged since the previous
+          # release, so the page says what is in the build rather than only
+          # which bytes it is. --notes is prepended to that, keeping the digest
+          # at the top.
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
+            --generate-notes \
             --notes "sha256 of the binary inside firecracker.tar.gz:
 
           $(cat firecracker.sha256)" \
