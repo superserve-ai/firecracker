@@ -163,25 +163,39 @@ jobs:
     permissions:
       contents: write
     steps:
-      # A tag can point at any commit, including one on a branch that was
-      # never reviewed or merged. Since this artifact is what deployments
-      # install, refuse to publish one that is not reachable from the
-      # maintained branch.
+      # Full history: the provenance checks below need the tag and the
+      # maintained branch, not just the tagged commit.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Verify the tag is on the maintained branch
+      - name: Verify release provenance
         env:
           MAINTAINED_BRANCH: feat/block-overlay-cow-v1.15
         run: |
           set -euo pipefail
+
+          # The tag can be deleted or force-moved while the build and tests
+          # run. Re-read it from the remote and require it to still resolve to
+          # the commit that produced the artifact — otherwise the release would
+          # carry one commit's binary under another commit's tag, which is
+          # exactly the provenance the digest is supposed to guarantee.
+          git fetch --force --quiet origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          tag_commit=$(git rev-list -n 1 "$GITHUB_REF_NAME")
+          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::$GITHUB_REF_NAME now points at $tag_commit but the artifact was built from $GITHUB_SHA — refusing to publish"
+            exit 1
+          fi
+
+          # A tag can also point at any commit, including one on a branch that
+          # was never reviewed or merged.
           git fetch --quiet origin "$MAINTAINED_BRANCH"
           if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$MAINTAINED_BRANCH"; then
             echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of $MAINTAINED_BRANCH — refusing to publish a release from unmerged code"
             exit 1
           fi
-          echo "$GITHUB_REF_NAME is reachable from $MAINTAINED_BRANCH"
+          echo "$GITHUB_REF_NAME resolves to $GITHUB_SHA and is reachable from $MAINTAINED_BRANCH"
 
       - uses: actions/download-artifact@v4
         with:
@@ -196,8 +210,12 @@ jobs:
           # release, so the page says what is in the build rather than only
           # which bytes it is. --notes is prepended to that, keeping the digest
           # at the top.
+          # --verify-tag: without it, a tag deleted mid-run makes gh create a
+          # fresh one from the default branch and publish this artifact under
+          # it.
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             --notes "sha256 of the binary inside firecracker.tar.gz:
