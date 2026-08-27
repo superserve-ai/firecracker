@@ -453,6 +453,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
+            clock_realtime: false,
         }))
         .expect("restore from flattened snapshot must succeed");
 
@@ -561,6 +562,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
+            clock_realtime: false,
         }))
         .expect("restore from flat snapshot");
     let restored_vmm = preboot.built_vmm.take().unwrap();
