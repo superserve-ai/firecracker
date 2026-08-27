@@ -499,6 +499,10 @@ clock on the guest at restore time (host Linux >= 5.16 is required to support
 this feature). Note that this may cause issues within the guest as the clock
 will appear to suddenly jump.
 
+In this fork `clock_realtime` defaults to `true`, so omitting it preserves the
+behaviour that predates the option. Callers that can correct the guest's wall
+clock after restore should send `clock_realtime: false` explicitly.
+
 ## Provisioning host disk space for snapshots
 
 Depending on VM memory size, snapshots can consume a lot of disk space.

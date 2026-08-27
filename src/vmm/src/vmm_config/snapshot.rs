@@ -129,8 +129,24 @@ pub struct LoadSnapshotConfig {
     #[serde(default)]
     pub block_delta_dir: Option<PathBuf>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
-    #[serde(default)]
+    /// Defaults to `true` here; see [`default_clock_realtime`].
+    #[serde(default = "default_clock_realtime")]
     pub clock_realtime: bool,
+}
+
+/// Default for [`LoadSnapshotConfig::clock_realtime`].
+///
+/// Upstream defaults this to `false`, so an omitted field means kvmclock resumes from the
+/// value it held at snapshot time. This fork defaults it to `true` — the behaviour that
+/// predates the fix — because the binary and the API client that drives it are deployed
+/// through independent pipelines: a host can run a newer binary than its caller. An
+/// omitted field must therefore preserve the semantics the caller was built against, and
+/// callers opt into the corrected behaviour explicitly once they can also correct the
+/// guest's wall clock on resume.
+///
+/// Keep this divergence when syncing upstream.
+fn default_clock_realtime() -> bool {
+    true
 }
 
 /// Stores the configuration used for managing snapshot memory.
