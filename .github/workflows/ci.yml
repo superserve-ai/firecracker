@@ -163,6 +163,26 @@ jobs:
     permissions:
       contents: write
     steps:
+      # A tag can point at any commit, including one on a branch that was
+      # never reviewed or merged. Since this artifact is what deployments
+      # install, refuse to publish one that is not reachable from the
+      # maintained branch.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is on the maintained branch
+        env:
+          MAINTAINED_BRANCH: feat/block-overlay-cow-v1.15
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "$MAINTAINED_BRANCH"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$MAINTAINED_BRANCH"; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of $MAINTAINED_BRANCH — refusing to publish a release from unmerged code"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME is reachable from $MAINTAINED_BRANCH"
+
       - uses: actions/download-artifact@v4
         with:
           name: firecracker-${{ github.sha }}
