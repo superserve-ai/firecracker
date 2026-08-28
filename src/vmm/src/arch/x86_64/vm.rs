@@ -5,7 +5,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
+    KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+    KVM_IRQCHIP_PIC_SLAVE,
     KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2,
 };
 use kvm_ioctls::Cap;
@@ -188,7 +189,11 @@ impl ArchVm {
     pub fn save_state(&self) -> Result<VmState, ArchVmError> {
         let pitstate = self.fd().get_pit2().map_err(ArchVmError::VmGetPit2)?;
 
-        let clock = self.fd().get_clock().map_err(ArchVmError::VmGetClock)?;
+        let mut clock = self.fd().get_clock().map_err(ArchVmError::VmGetClock)?;
+        // KVM_SET_CLOCK rejects this bit, and kernels before 5.16 reject any nonzero flags —
+        // so a snapshot carrying it cannot be restored by a binary that forwards flags
+        // verbatim. Strip it at save time to keep snapshots readable across binary versions.
+        clock.flags &= !KVM_CLOCK_TSC_STABLE;
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -267,7 +272,8 @@ impl fmt::Debug for VmState {
 #[cfg(test)]
 mod tests {
     use kvm_bindings::{
-        KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
+        KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+    KVM_IRQCHIP_PIC_SLAVE,
         KVM_PIT_SPEAKER_DUMMY,
     };
     use kvm_ioctls::Cap;
@@ -295,6 +301,9 @@ mod tests {
         assert_eq!(vm_state.pic_master.chip_id, KVM_IRQCHIP_PIC_MASTER);
         assert_eq!(vm_state.pic_slave.chip_id, KVM_IRQCHIP_PIC_SLAVE);
         assert_eq!(vm_state.ioapic.chip_id, KVM_IRQCHIP_IOAPIC);
+        // Saved state must never carry TSC_STABLE: an older binary restoring this snapshot
+        // forwards the flags unchanged, and KVM_SET_CLOCK would reject them.
+        assert_eq!(vm_state.clock.flags & KVM_CLOCK_TSC_STABLE, 0);
 
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
