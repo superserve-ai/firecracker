@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
     KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
-    KVM_IRQCHIP_PIC_SLAVE,
-    KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2,
+    KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip,
+    kvm_pit_config, kvm_pit_state2,
 };
 use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
@@ -190,9 +190,10 @@ impl ArchVm {
         let pitstate = self.fd().get_pit2().map_err(ArchVmError::VmGetPit2)?;
 
         let mut clock = self.fd().get_clock().map_err(ArchVmError::VmGetClock)?;
-        // KVM_SET_CLOCK rejects this bit, and kernels before 5.16 reject any nonzero flags —
-        // so a snapshot carrying it cannot be restored by a binary that forwards flags
-        // verbatim. Strip it at save time to keep snapshots readable across binary versions.
+        // Kernels before 5.16 reject any nonzero KVM_SET_CLOCK flags; later ones accept this
+        // bit but ignore it. A snapshot carrying it therefore cannot be restored on such a
+        // host by a binary that forwards flags verbatim, so strip it at save time to keep
+        // snapshots readable across binary versions.
         clock.flags &= !KVM_CLOCK_TSC_STABLE;
 
         let mut pic_master = kvm_irqchip {
@@ -273,8 +274,7 @@ impl fmt::Debug for VmState {
 mod tests {
     use kvm_bindings::{
         KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
-    KVM_IRQCHIP_PIC_SLAVE,
-        KVM_PIT_SPEAKER_DUMMY,
+        KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY,
     };
     use kvm_ioctls::Cap;
     use std::time::SystemTime;
