@@ -304,7 +304,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: false,
+            clock_realtime: None,
         }))
         .unwrap();
 
@@ -453,7 +453,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
-            clock_realtime: false,
+            clock_realtime: None,
         }))
         .expect("restore from flattened snapshot must succeed");
 
@@ -562,7 +562,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
-            clock_realtime: false,
+            clock_realtime: None,
         }))
         .expect("restore from flat snapshot");
     let restored_vmm = preboot.built_vmm.take().unwrap();
@@ -885,7 +885,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
         block_delta_dir: None,
-        clock_realtime: false,
+        clock_realtime: None,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(

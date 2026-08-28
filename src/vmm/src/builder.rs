@@ -444,7 +444,7 @@ pub fn build_microvm_from_snapshot(
     uffd_handler: Option<crate::uffd_internal::Handler>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
-    clock_realtime: bool,
+    clock_realtime: Option<bool>,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -486,7 +486,10 @@ pub fn build_microvm_from_snapshot(
 
     #[cfg(target_arch = "aarch64")]
     {
-        if clock_realtime {
+        // Only an explicit request fails here: an omitted field must keep restoring as it
+        // always has on this architecture, and `Some(false)` is a no-op since aarch64 never
+        // advanced the clock.
+        if clock_realtime == Some(true) {
             return Err(BuildMicrovmFromSnapshotError::UnsupportedClockRealtime);
         }
         let mpidrs = construct_kvm_mpidrs(&microvm_state.vcpu_states);

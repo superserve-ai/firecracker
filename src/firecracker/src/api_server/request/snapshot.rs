@@ -137,6 +137,32 @@ mod tests {
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
 
     #[test]
+    fn test_parse_put_snapshot_clock_realtime_tristate() {
+        // Omitted, `false` and `true` are three distinct requests: omission restores the
+        // snapshot's own clock flags, which is what callers got before the field existed.
+        fn parse(extra: &str) -> Option<bool> {
+            let body = format!(
+                r#"{{
+                    "snapshot_path": "foo",
+                    "mem_backend": {{
+                        "backend_path": "bar",
+                        "backend_type": "File"
+                    }}{extra}
+                }}"#
+            );
+            let parsed = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+            match vmm_action_from_request(parsed) {
+                VmmAction::LoadSnapshot(cfg) => cfg.clock_realtime,
+                _ => panic!("expected LoadSnapshot"),
+            }
+        }
+
+        assert_eq!(parse(""), None);
+        assert_eq!(parse(r#", "clock_realtime": false"#), Some(false));
+        assert_eq!(parse(r#", "clock_realtime": true"#), Some(true));
+    }
+
+    #[test]
     fn test_parse_put_snapshot() {
         use std::path::PathBuf;
 
@@ -202,7 +228,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: true,
+            clock_realtime: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -238,7 +264,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: true,
+            clock_realtime: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -274,7 +300,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: true,
+            clock_realtime: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -319,7 +345,7 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             block_delta_dir: None,
-            clock_realtime: true,
+            clock_realtime: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -352,7 +378,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             block_delta_dir: None,
-            clock_realtime: true,
+            clock_realtime: None,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(

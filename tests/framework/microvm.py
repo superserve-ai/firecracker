@@ -1079,7 +1079,7 @@ class Microvm:
         snapshot: Snapshot,
         resume: bool = False,
         rename_interfaces: dict = None,
-        clock_realtime: bool = False,
+        clock_realtime: bool | None = None,
         *,
         uffd_handler_name: str = None,
     ):
@@ -1136,7 +1136,9 @@ class Microvm:
             # can be inline in the snapshot_load command below
             optional_kwargs["network_overrides"] = iface_overrides
 
-        if clock_realtime:
+        # Serialize both explicit values: `False` is a real request (freeze monotonic),
+        # distinct from omitting the field (restore the snapshot's own clock flags).
+        if clock_realtime is not None:
             optional_kwargs["clock_realtime"] = clock_realtime
 
         self.api.snapshot_load.put(
@@ -1302,7 +1304,7 @@ class MicroVMFactory:
         return vm
 
     def build_from_snapshot(
-        self, snapshot: Snapshot, uffd_handler_name=None, clock_realtime=False
+        self, snapshot: Snapshot, uffd_handler_name=None, clock_realtime=None
     ):
         """Build a microvm from a snapshot"""
         vm = self.build()

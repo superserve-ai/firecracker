@@ -132,21 +132,25 @@ impl ArchVm {
     pub fn restore_state(
         &mut self,
         state: &VmState,
-        clock_realtime: bool,
+        clock_realtime: Option<bool>,
     ) -> Result<(), ArchVmError> {
         self.fd()
             .set_pit2(&state.pitstate)
             .map_err(ArchVmError::SetPit2)?;
         let mut clock = state.clock;
-        clock.flags = if clock_realtime {
-            // clock_realtime needs to be present in the snapshot
-            if clock.flags & KVM_CLOCK_REALTIME == 0 {
-                return Err(ArchVmError::ClockRealtimeNotInState);
+        match clock_realtime {
+            // Restore the flags the snapshot carries. Pre-dates the option and is the only
+            // choice valid for every snapshot, including ones taken without KVM_CLOCK_REALTIME.
+            None => {}
+            Some(true) => {
+                // clock_realtime needs to be present in the snapshot
+                if clock.flags & KVM_CLOCK_REALTIME == 0 {
+                    return Err(ArchVmError::ClockRealtimeNotInState);
+                }
+                clock.flags = KVM_CLOCK_REALTIME;
             }
-            KVM_CLOCK_REALTIME
-        } else {
-            0
-        };
+            Some(false) => clock.flags = 0,
+        }
         self.fd().set_clock(&clock).map_err(ArchVmError::SetClock)?;
         self.fd()
             .set_irqchip(&state.pic_master)
@@ -292,7 +296,7 @@ mod tests {
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        vm.restore_state(&vm_state, false).unwrap();
+        vm.restore_state(&vm_state, Some(false)).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -311,7 +315,7 @@ mod tests {
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        let res = vm.restore_state(&vm_state, true);
+        let res = vm.restore_state(&vm_state, Some(true));
         assert!(res == Err(ArchVmError::ClockRealtimeNotInState));
 
         // mock a state with realtime information
@@ -326,12 +330,27 @@ mod tests {
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        let res = vm.restore_state(&vm_state, true);
+        let res = vm.restore_state(&vm_state, Some(true));
         if clock_realtime_supported {
             res.unwrap()
         } else {
             assert!(matches!(res, Err(ArchVmError::SetClock(err)) if err.errno() == libc::EINVAL))
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vm_restore_state_omitted_clock_realtime_keeps_snapshot_flags() {
+        // A snapshot taken without KVM_CLOCK_REALTIME restored fine before the option existed;
+        // omitting the field must keep restoring it rather than demanding the flag.
+        let (_, vm) = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        let mut vm_state = vm.save_state().unwrap();
+        vm_state.clock.flags &= !KVM_CLOCK_REALTIME;
+
+        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        vm.restore_state(&vm_state, None).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -349,18 +368,18 @@ mod tests {
         // Try to restore an invalid PIC Master chip ID
         let orig_master_chip_id = vm_state.pic_master.chip_id;
         vm_state.pic_master.chip_id = KVM_NR_IRQCHIPS;
-        vm.restore_state(&vm_state, false).unwrap_err();
+        vm.restore_state(&vm_state, Some(false)).unwrap_err();
         vm_state.pic_master.chip_id = orig_master_chip_id;
 
         // Try to restore an invalid PIC Slave chip ID
         let orig_slave_chip_id = vm_state.pic_slave.chip_id;
         vm_state.pic_slave.chip_id = KVM_NR_IRQCHIPS;
-        vm.restore_state(&vm_state, false).unwrap_err();
+        vm.restore_state(&vm_state, Some(false)).unwrap_err();
         vm_state.pic_slave.chip_id = orig_slave_chip_id;
 
         // Try to restore an invalid IOPIC chip ID
         vm_state.ioapic.chip_id = KVM_NR_IRQCHIPS;
-        vm.restore_state(&vm_state, false).unwrap_err();
+        vm.restore_state(&vm_state, Some(false)).unwrap_err();
     }
 
     #[cfg(target_arch = "x86_64")]
