@@ -493,6 +493,19 @@ resumed with the guest OS wall-clock continuing from the moment of the snapshot
 creation. For this reason, the wall-clock should be updated to the current time,
 on the guest-side. More details on how you could do this can be found at a
 [related FAQ](../../FAQ.md#my-guest-wall-clock-is-drifting-how-can-i-fix-it).
+When using `kvm-clock` as clock source on `x86_64`, it's possible to optionally
+set the `clock_realtime: true` in the `LoadSnapshot` request to advance the
+clock on the guest at restore time (host Linux >= 5.16 is required to support
+this feature). Note that this may cause issues within the guest as the clock
+will appear to suddenly jump.
+
+In this fork `clock_realtime` is three-valued. Omitting it restores the clock
+flags the snapshot itself carries — the behaviour that predates the option, and
+the only one valid for every snapshot, including those taken without
+`KVM_CLOCK_REALTIME` and those restored on aarch64. Send `false` explicitly to
+freeze guest monotonic time across the snapshot; callers that do so are
+responsible for correcting the guest's wall clock after restore. Upstream instead
+treats an omitted field as `false`.
 
 ## Provisioning host disk space for snapshots
 
