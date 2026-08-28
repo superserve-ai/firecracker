@@ -45,7 +45,9 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Build capabilities advertised by `--version` (one `capability: <name>`
 /// line each). serial-console-cap: the serial device bounds guest console
 /// output per boot, so a supervisor may route it to a plain file safely.
-const CAPABILITIES: &[&str] = &["serial-console-cap"];
+/// clock-realtime-flag: `LoadSnapshot` accepts `clock_realtime`, so a
+/// supervisor may choose whether a restore advances the guest clock.
+const CAPABILITIES: &[&str] = &["serial-console-cap", "clock-realtime-flag"];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
