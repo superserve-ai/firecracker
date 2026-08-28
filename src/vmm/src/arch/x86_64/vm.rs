@@ -139,9 +139,12 @@ impl ArchVm {
             .map_err(ArchVmError::SetPit2)?;
         let mut clock = state.clock;
         match clock_realtime {
-            // Restore the flags the snapshot carries. Pre-dates the option and is the only
+            // Restore the behaviour the snapshot carries. Pre-dates the option and is the only
             // choice valid for every snapshot, including ones taken without KVM_CLOCK_REALTIME.
-            None => {}
+            // Mask to the behaviour-bearing bit: KVM_GET_CLOCK may also report
+            // KVM_CLOCK_TSC_STABLE, which KVM_SET_CLOCK rejects on kernels that predate 5.16,
+            // so forwarding it verbatim would fail a restore that used to succeed.
+            None => clock.flags &= KVM_CLOCK_REALTIME,
             Some(true) => {
                 // clock_realtime needs to be present in the snapshot
                 if clock.flags & KVM_CLOCK_REALTIME == 0 {

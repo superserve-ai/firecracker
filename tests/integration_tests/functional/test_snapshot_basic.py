@@ -611,7 +611,7 @@ def read_guest_clocksource(vm):
 
 
 @pytest.mark.parametrize("clocksource", CLOCK_SOURCES)
-@pytest.mark.parametrize("clock_realtime", [False, True])
+@pytest.mark.parametrize("clock_realtime", [None, False, True])
 def test_clocksource_snapshot_restore(
     uvm_plain_any, microvm_factory, clocksource, clock_realtime
 ):
@@ -622,6 +622,17 @@ def test_clocksource_snapshot_restore(
         pytest.skip(f"Clocksource {clocksource} doesn't support clock_realtime flag")
     if clock_realtime and global_props.host_linux_version_tpl < (5, 16):
         pytest.skip("clock_realtime is not supported on Linux < 5.16")
+
+    # Omitting the field restores whatever the snapshot carries, so the expected
+    # behaviour is derived rather than requested: kvm-clock snapshots taken on a host
+    # that reports KVM_CLOCK_REALTIME jump, everything else resumes.
+    if clock_realtime is None:
+        expect_jump = clocksource == "kvm-clock" and global_props.host_linux_version_tpl >= (
+            5,
+            16,
+        )
+    else:
+        expect_jump = clock_realtime
 
     boot_args = (
         "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
@@ -685,5 +696,5 @@ def test_clocksource_snapshot_restore(
         f"Behavior:       {jumped_str}\n"
     )
     assert (
-        jumped == clock_realtime
-    ), f"Clock {jumped_str} but clock_realtime was {"not" if clock_realtime else ""} set."
+        jumped == expect_jump
+    ), f"Clock {jumped_str} but clock_realtime was {clock_realtime!r}."

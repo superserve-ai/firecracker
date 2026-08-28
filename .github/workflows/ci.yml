@@ -69,10 +69,12 @@ jobs:
           set -euo pipefail
           bin=build/cargo_target/release/firecracker
           "$bin" --version
-          if ! "$bin" --version | grep -qE '^[[:space:]]*capability: serial-console-cap[[:space:]]*$'; then
-            echo "::error::binary does not advertise serial-console-cap — a supervisor gating on it would refuse this binary"
-            exit 1
-          fi
+          for cap in serial-console-cap clock-realtime-flag; do
+            if ! "$bin" --version | grep -qE "^[[:space:]]*capability: ${cap}[[:space:]]*$"; then
+              echo "::error::binary does not advertise ${cap} — a supervisor gating on it would refuse this binary"
+              exit 1
+            fi
+          done
 
       - name: Package artifact
         run: |
