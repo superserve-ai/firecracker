@@ -393,6 +393,6 @@ mod tests {
         let serialized_data = bitcode::serialize(&state).unwrap();
         let restored_state: VmState = bitcode::deserialize(&serialized_data).unwrap();
 
-        vm.restore_state(&restored_state, false).unwrap();
+        vm.restore_state(&restored_state, None).unwrap();
     }
 }
