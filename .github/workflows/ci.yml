@@ -4,11 +4,15 @@ on:
   pull_request:
   push:
     branches: [feat/block-overlay-cow-v1.15]
+    # A version tag additionally publishes the built binary as a release,
+    # which is what a deployment installs from.
+    tags: ['v*']
 
-# A new push supersedes an in-flight run for the same ref.
+# A new push supersedes an in-flight run for the same ref — except for a tag,
+# whose run publishes a release and must not be cancelled midway.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
@@ -97,6 +101,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -138,6 +143,11 @@ jobs:
       # microVM boot tests give the guest a fixed 500ms to boot and signal
       # exit, which nested virtualisation cannot reliably meet. Running those
       # two needs a runner that is not itself a VM.
+      # The release job only runs for tags, so its provenance checks would
+      # otherwise never execute before a real publish.
+      - name: Release provenance checks
+        run: ./tools/test-verify-release-provenance.sh
+
       - name: Tests
         run: |
           sudo -E env "PATH=$PATH" "HOME=$HOME" cargo test --workspace --no-fail-fast -- \
@@ -145,3 +155,75 @@ jobs:
             --skip test_fingerprint_dump_command \
             --skip test_build_microvm \
             --skip test_build_and_boot_microvm
+
+  # Run artifacts expire and are awkward to fetch from elsewhere, so a tagged
+  # build also publishes a release: a permanent, versioned URL a deployment can
+  # install from and verify against. Separate job because the build container
+  # has no gh CLI, and because publishing should wait on the tests.
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Full history: the provenance checks below need the tag and the
+      # maintained branch, not just the tagged commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firecracker-${{ github.sha }}
+
+      # Checked as late as possible, after the artifact is in hand, so the
+      # window between verifying and publishing is as small as it can be.
+      # Release tags are immutable by ruleset, so this is the check that
+      # notices if that protection is ever missing.
+      - name: Verify release provenance
+        run: |
+          ./tools/verify-release-provenance.sh \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" feat/block-overlay-cow-v1.15
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # --generate-notes lists the pull requests merged since the previous
+          # release, so the page says what is in the build rather than only
+          # which bytes it is. --notes is prepended to that, keeping the digest
+          # at the top.
+          # --verify-tag: without it, a tag deleted mid-run makes gh create a
+          # fresh one from the default branch and publish this artifact under
+          # it.
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "sha256 of the binary inside firecracker.tar.gz:
+
+          $(cat firecracker.sha256)" \
+            firecracker.tar.gz firecracker.sha256
+
+      # Re-check the ref itself after publishing, closing the window between
+      # the pre-flight check and the release being created. It has to be the
+      # ref: a release's target_commitish is creation metadata, ignored for an
+      # existing tag, so it does not resolve the tag and would never equal a
+      # commit sha. Withdraw the release if the tag no longer agrees; the tag
+      # is left alone, since it is what the next attempt must be judged
+      # against.
+      - name: Verify the release still matches the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! ./tools/verify-release-provenance.sh \
+              "$GITHUB_REF_NAME" "$GITHUB_SHA" feat/block-overlay-cow-v1.15; then
+            echo "::error::$GITHUB_REF_NAME no longer resolves to $GITHUB_SHA — withdrawing the release"
+            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes
+            exit 1
+          fi
