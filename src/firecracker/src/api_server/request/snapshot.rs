@@ -83,6 +83,17 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     if let Some(id) = &snapshot_config.expected_session_id {
         validate_session_id("expected_session_id", id)?;
     }
+    // A half-specified token is a client bug, and it must not surface as a
+    // session mismatch — a client would read that as "baseline gone" and
+    // silently fall back to a Full snapshot.
+    if snapshot_config.expected_session_id.is_some()
+        != snapshot_config.expected_generation.is_some()
+    {
+        return Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            "expected_session_id and expected_generation must be supplied together".to_string(),
+        ));
+    }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -138,12 +149,23 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         }
     };
 
+    #[allow(deprecated)]
+    let track_dirty_pages =
+        snapshot_config.enable_diff_snapshots || snapshot_config.track_dirty_pages;
+    // A session id only exists to describe an armed dirty bitmap; accepting
+    // one on an untracked load would hand the caller a token that nothing
+    // will ever validate.
+    if snapshot_config.tracking_session_id.is_some() && !track_dirty_pages {
+        return Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            "tracking_session_id requires track_dirty_pages".to_string(),
+        ));
+    }
+
     let snapshot_params = LoadSnapshotParams {
         snapshot_path: snapshot_config.snapshot_path,
         mem_backend,
-        #[allow(deprecated)]
-        track_dirty_pages: snapshot_config.enable_diff_snapshots
-            || snapshot_config.track_dirty_pages,
+        track_dirty_pages,
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         block_delta_dir: snapshot_config.block_delta_dir,
@@ -198,13 +220,14 @@ mod tests {
     #[test]
     fn test_parse_put_snapshot_session_fields() {
         // Both endpoints accept a well-formed token and reject the same
-        // malformed shapes.
-        fn load(extra: &str) -> Result<Option<String>, RequestError> {
+        // malformed shapes; malformed combinations are plain 400s, never a
+        // session mismatch.
+        fn load_with(tracked: bool, extra: &str) -> Result<Option<String>, RequestError> {
             let body = format!(
                 r#"{{
                     "snapshot_path": "foo",
                     "mem_backend": {{"backend_path": "bar", "backend_type": "File"}},
-                    "track_dirty_pages": true{extra}
+                    "track_dirty_pages": {tracked}{extra}
                 }}"#
             );
             parse_put_snapshot(&Body::new(body), Some("load")).map(|parsed| {
@@ -214,6 +237,7 @@ mod tests {
                 }
             })
         }
+        let load = |extra: &str| load_with(true, extra);
         let hex = "0123456789abcdef0123456789abcdef";
         assert_eq!(
             load(&format!(r#", "tracking_session_id": "{hex}""#)).unwrap(),
@@ -225,6 +249,18 @@ mod tests {
         let max = "a".repeat(TRACKING_SESSION_ID_MAX_LEN);
         assert!(load(&format!(r#", "tracking_session_id": "{max}""#)).is_ok());
         load(&format!(r#", "tracking_session_id": "{max}a""#)).unwrap_err();
+        // A session id on an untracked load is rejected, not silently dropped;
+        // the deprecated enable_diff_snapshots still counts as tracking.
+        load_with(false, &format!(r#", "tracking_session_id": "{hex}""#)).unwrap_err();
+        assert_eq!(load_with(false, "").unwrap(), None);
+        assert_eq!(
+            load_with(
+                false,
+                &format!(r#", "enable_diff_snapshots": true, "tracking_session_id": "{hex}""#)
+            )
+            .unwrap(),
+            Some(hex.to_string())
+        );
 
         fn create(extra: &str) -> Result<(Option<String>, Option<u64>), RequestError> {
             let body = format!(
@@ -247,8 +283,17 @@ mod tests {
             (Some(hex.to_string()), Some(3))
         );
         assert_eq!(create("").unwrap(), (None, None));
-        create(r#", "expected_session_id": """#).unwrap_err();
-        create(r#", "expected_session_id": "bad/slash""#).unwrap_err();
+        create(&format!(
+            r#", "expected_session_id": "", "expected_generation": 0"#
+        ))
+        .unwrap_err();
+        create(&format!(
+            r#", "expected_session_id": "bad/slash", "expected_generation": 0"#
+        ))
+        .unwrap_err();
+        // Half a token is a client bug and must be a 400, not a mismatch.
+        create(&format!(r#", "expected_session_id": "{hex}""#)).unwrap_err();
+        create(r#", "expected_generation": 0"#).unwrap_err();
     }
 
     #[test]
