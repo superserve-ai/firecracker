@@ -83,9 +83,8 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     if let Some(id) = &snapshot_config.expected_session_id {
         validate_session_id("expected_session_id", id)?;
     }
-    // A half-specified token is a client bug, and it must not surface as a
-    // session mismatch — a client would read that as "baseline gone" and
-    // silently fall back to a Full snapshot.
+    // Half a token is a client bug; reject it here so it never reads as a
+    // session mismatch, which clients treat as "baseline gone".
     if snapshot_config.expected_session_id.is_some()
         != snapshot_config.expected_generation.is_some()
     {
@@ -152,9 +151,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     #[allow(deprecated)]
     let track_dirty_pages =
         snapshot_config.enable_diff_snapshots || snapshot_config.track_dirty_pages;
-    // A session id only exists to describe an armed dirty bitmap; accepting
-    // one on an untracked load would hand the caller a token that nothing
-    // will ever validate.
+    // Without tracking there is no bitmap for a session id to describe.
     if snapshot_config.tracking_session_id.is_some() && !track_dirty_pages {
         return Err(RequestError::Generic(
             StatusCode::BadRequest,
@@ -219,9 +216,7 @@ mod tests {
 
     #[test]
     fn test_parse_put_snapshot_session_fields() {
-        // Both endpoints accept a well-formed token and reject the same
-        // malformed shapes; malformed combinations are plain 400s, never a
-        // session mismatch.
+        // Malformed shapes and combinations are 400s, never a session mismatch.
         fn load_with(tracked: bool, extra: &str) -> Result<Option<String>, RequestError> {
             let body = format!(
                 r#"{{
@@ -249,8 +244,7 @@ mod tests {
         let max = "a".repeat(TRACKING_SESSION_ID_MAX_LEN);
         assert!(load(&format!(r#", "tracking_session_id": "{max}""#)).is_ok());
         load(&format!(r#", "tracking_session_id": "{max}a""#)).unwrap_err();
-        // A session id on an untracked load is rejected, not silently dropped;
-        // the deprecated enable_diff_snapshots still counts as tracking.
+        // Untracked load: rejected, not dropped. enable_diff_snapshots still counts.
         load_with(false, &format!(r#", "tracking_session_id": "{hex}""#)).unwrap_err();
         assert_eq!(load_with(false, "").unwrap(), None);
         assert_eq!(
@@ -291,7 +285,7 @@ mod tests {
             r#", "expected_session_id": "bad/slash", "expected_generation": 0"#
         ))
         .unwrap_err();
-        // Half a token is a client bug and must be a 400, not a mismatch.
+        // Half a token is a 400, not a mismatch.
         create(&format!(r#", "expected_session_id": "{hex}""#)).unwrap_err();
         create(r#", "expected_generation": 0"#).unwrap_err();
     }
