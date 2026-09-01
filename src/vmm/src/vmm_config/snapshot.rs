@@ -113,7 +113,11 @@ pub struct LoadSnapshotParams {
     pub clock_realtime: Option<bool>,
     /// Caller-chosen dirty-tracking session id. Only meaningful with
     /// `track_dirty_pages`; installs a `(session_id, generation=0)` token that
-    /// guarded snapshot requests can later compare against.
+    /// guarded snapshot requests can later compare against. Must be fresh per
+    /// load: every process re-arms at generation 0, so a reused id would let a
+    /// token persisted from an earlier process validate against a bitmap it
+    /// never described. The API layer enforces the shape (non-empty, bounded,
+    /// `[A-Za-z0-9_-]`); freshness is the caller's contract.
     pub tracking_session_id: Option<String>,
 }
 

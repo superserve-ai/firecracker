@@ -47,7 +47,16 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// output per boot, so a supervisor may route it to a plain file safely.
 /// clock-realtime-flag: `LoadSnapshot` accepts `clock_realtime`, so a
 /// supervisor may choose whether a restore advances the guest clock.
-const CAPABILITIES: &[&str] = &["serial-console-cap", "clock-realtime-flag"];
+/// dirty-tracking-session: `LoadSnapshot` accepts `tracking_session_id` and
+/// `CreateSnapshot` accepts `expected_session_id`/`expected_generation`, so a
+/// supervisor can prove a dirty bitmap is still the baseline it armed. Both
+/// request bodies deny unknown fields, so a supervisor must probe for this
+/// before sending them to a binary that may predate the protocol.
+const CAPABILITIES: &[&str] = &[
+    "serial-console-cap",
+    "clock-realtime-flag",
+    "dirty-tracking-session",
+];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]

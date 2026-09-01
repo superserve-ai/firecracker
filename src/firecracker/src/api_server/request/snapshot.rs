@@ -22,6 +22,36 @@ pub const MISSING_FIELD: &str =
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
+/// Upper bound on a dirty-tracking session id: room for a UUID or a hex
+/// nonce, and a bound at all so the token cloned on the restore path is
+/// never a caller-sized allocation.
+pub const TRACKING_SESSION_ID_MAX_LEN: usize = 128;
+
+/// A session id must be a non-empty, bounded token of `[A-Za-z0-9_-]`. The
+/// protocol only holds if the id is fresh per load — a replacement process
+/// re-arms at generation 0, so a recurring id (a stable sandbox name, an
+/// empty string) would let a stale persisted token validate against a bitmap
+/// it never described. A shape check cannot prove freshness, but it rejects
+/// the values that make reuse likely, and applying the same rule on both
+/// endpoints turns a malformed expected token into a loud 400 instead of a
+/// silent mismatch that reads as "baseline gone".
+fn validate_session_id(field: &str, id: &str) -> Result<(), RequestError> {
+    let well_formed = !id.is_empty()
+        && id.len() <= TRACKING_SESSION_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if well_formed {
+        return Ok(());
+    }
+    Err(RequestError::Generic(
+        StatusCode::BadRequest,
+        format!(
+            "{field} must be 1..={TRACKING_SESSION_ID_MAX_LEN} characters of [A-Za-z0-9_-], \
+             unique per snapshot load"
+        ),
+    ))
+}
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -54,6 +84,9 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+    if let Some(id) = &snapshot_config.expected_session_id {
+        validate_session_id("expected_session_id", id)?;
+    }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -61,6 +94,9 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
 
 fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<LoadSnapshotConfig>(body.raw())?;
+    if let Some(id) = &snapshot_config.tracking_session_id {
+        validate_session_id("tracking_session_id", id)?;
+    }
 
     match (&snapshot_config.mem_backend, &snapshot_config.mem_file_path) {
         // Ensure `mem_file_path` and `mem_backend` fields are not present at the same time.
@@ -161,6 +197,63 @@ mod tests {
         assert_eq!(parse(""), None);
         assert_eq!(parse(r#", "clock_realtime": false"#), Some(false));
         assert_eq!(parse(r#", "clock_realtime": true"#), Some(true));
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_session_fields() {
+        // A well-formed token passes through both endpoints untouched. The
+        // shape rule is shared, so a malformed expected token is a 400 rather
+        // than a silent mismatch that would read as "baseline gone".
+        fn load(extra: &str) -> Result<Option<String>, RequestError> {
+            let body = format!(
+                r#"{{
+                    "snapshot_path": "foo",
+                    "mem_backend": {{"backend_path": "bar", "backend_type": "File"}},
+                    "track_dirty_pages": true{extra}
+                }}"#
+            );
+            parse_put_snapshot(&Body::new(body), Some("load")).map(|parsed| {
+                match vmm_action_from_request(parsed) {
+                    VmmAction::LoadSnapshot(cfg) => cfg.tracking_session_id,
+                    _ => panic!("expected LoadSnapshot"),
+                }
+            })
+        }
+        let hex = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            load(&format!(r#", "tracking_session_id": "{hex}""#)).unwrap(),
+            Some(hex.to_string())
+        );
+        assert_eq!(load("").unwrap(), None);
+        load(r#", "tracking_session_id": """#).unwrap_err();
+        load(r#", "tracking_session_id": "has space""#).unwrap_err();
+        let max = "a".repeat(TRACKING_SESSION_ID_MAX_LEN);
+        assert!(load(&format!(r#", "tracking_session_id": "{max}""#)).is_ok());
+        load(&format!(r#", "tracking_session_id": "{max}a""#)).unwrap_err();
+
+        fn create(extra: &str) -> Result<(Option<String>, Option<u64>), RequestError> {
+            let body = format!(
+                r#"{{"snapshot_path": "foo", "mem_file_path": "bar", "snapshot_type": "Diff"{extra}}}"#
+            );
+            parse_put_snapshot(&Body::new(body), Some("create")).map(|parsed| {
+                match vmm_action_from_request(parsed) {
+                    VmmAction::CreateSnapshot(cfg) => {
+                        (cfg.expected_session_id, cfg.expected_generation)
+                    }
+                    _ => panic!("expected CreateSnapshot"),
+                }
+            })
+        }
+        assert_eq!(
+            create(&format!(
+                r#", "expected_session_id": "{hex}", "expected_generation": 3"#
+            ))
+            .unwrap(),
+            (Some(hex.to_string()), Some(3))
+        );
+        assert_eq!(create("").unwrap(), (None, None));
+        create(r#", "expected_session_id": """#).unwrap_err();
+        create(r#", "expected_session_id": "bad/slash""#).unwrap_err();
     }
 
     #[test]
