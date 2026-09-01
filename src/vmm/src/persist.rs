@@ -172,13 +172,12 @@ pub enum CreateSnapshotError {
     DirtyTrackingSessionMismatch,
 }
 
-/// Validates a guarded snapshot request's expected token against the live
-/// dirty-tracking session, then invalidates the current generation. A request
-/// carrying an expected token must match the live session exactly (id and
-/// generation) or it is rejected before the dirty bitmap or any output file
-/// is touched; requests without a token are never rejected, but still consume
-/// the generation. On counter overflow the session is dropped rather than
-/// wrapped, so later guarded requests mismatch — the safe direction.
+/// Compares a guarded request's expected token against the live session, then
+/// consumes the current generation. A token must match exactly (id and
+/// generation) or the request is rejected before any side effect; a request
+/// without a token is never rejected but still consumes. On counter overflow
+/// the session is dropped rather than wrapped, so later guarded requests
+/// mismatch — the safe direction.
 fn consume_dirty_tracking_generation(
     live: &mut Option<(String, u64)>,
     expected_session_id: Option<&str>,

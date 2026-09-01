@@ -48,10 +48,9 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// clock-realtime-flag: `LoadSnapshot` accepts `clock_realtime`, so a
 /// supervisor may choose whether a restore advances the guest clock.
 /// dirty-tracking-session: `LoadSnapshot` accepts `tracking_session_id` and
-/// `CreateSnapshot` accepts `expected_session_id`/`expected_generation`, so a
-/// supervisor can prove a dirty bitmap is still the baseline it armed. Both
-/// request bodies deny unknown fields, so a supervisor must probe for this
-/// before sending them to a binary that may predate the protocol.
+/// `CreateSnapshot` accepts `expected_session_id`/`expected_generation`. Both
+/// bodies deny unknown fields, so a supervisor must probe for this before
+/// sending them.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",

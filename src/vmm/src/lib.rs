@@ -334,12 +334,9 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
-    // Dirty-tracking session token: (session_id, generation). Installed when a
-    // snapshot load arms dirty tracking with a caller-provided session id;
-    // generation starts at 0 and increments on every snapshot attempt (any
-    // snapshot type consumes or resets the KVM dirty bitmap, including
-    // attempts that fail midway). Guarded snapshot requests compare their
-    // expected token against this before touching the bitmap.
+    // Dirty-tracking session token `(session_id, generation)`, installed by a
+    // snapshot load that arms tracking with a session id. See
+    // `persist::consume_dirty_tracking_generation` for the generation rules.
     dirty_tracking_session: Option<(String, u64)>,
 }
 

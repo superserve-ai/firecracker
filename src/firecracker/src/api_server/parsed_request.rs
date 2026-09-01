@@ -199,10 +199,9 @@ impl ParsedRequest {
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
             },
             Err(vmm_action_error) => {
-                // A guarded snapshot whose session token no longer matches is a
-                // distinct, retriable condition (the caller falls back to a Full
-                // snapshot); it carries a stable error_kind discriminator so
-                // clients never have to match the free-form fault message.
+                // A session mismatch is the one snapshot failure a client handles
+                // distinctly (retry as Full), so it carries a stable error_kind
+                // rather than relying on the free-form fault message.
                 if let VmmActionError::CreateSnapshot(
                     CreateSnapshotError::DirtyTrackingSessionMismatch,
                 ) = vmm_action_error
@@ -663,11 +662,9 @@ pub mod tests {
         assert_eq!(buf.into_inner(), expected_response.as_bytes());
     }
 
-    // The guarded-snapshot session mismatch is the one snapshot failure a
-    // client handles distinctly (fall back to a Full snapshot), so its
-    // response must carry the stable error_kind discriminator — and no other
-    // snapshot error may, or clients would fall back on failures that need to
-    // stay loud.
+    // Only the session mismatch carries the error_kind discriminator; any
+    // other snapshot error must not, or clients would fall back on failures
+    // that need to stay loud.
     #[test]
     fn test_convert_to_response_dirty_tracking_mismatch_discriminator() {
         let error =

@@ -1700,7 +1700,7 @@ definitions:
           guarded snapshot requests (expected_session_id/expected_generation on
           PUT /snapshot/create) can later compare against. MUST be freshly
           generated for every load (a random nonce or UUID), never a stable
-          identifier such as a VM or sandbox name - every new process re-arms
+          identifier such as a VM name - every new process re-arms
           at generation 0, so a reused id would let a token persisted from an
           earlier process validate against a dirty bitmap it never described.
           Support is advertised by the dirty-tracking-session capability in

@@ -65,9 +65,7 @@ pub struct CreateSnapshotParams {
     /// (together with `expected_generation`), the snapshot is created only if
     /// the token matches the live session installed at snapshot-load time; a
     /// mismatch is rejected before the dirty bitmap or any output file is
-    /// touched. Lets an orchestrator prove the dirty bitmap still describes
-    /// the baseline it armed — e.g. across its own restart — instead of
-    /// trusting cached state.
+    /// touched.
     #[serde(default)]
     pub expected_session_id: Option<String>,
     /// Expected dirty-bitmap generation accompanying `expected_session_id`.
@@ -115,9 +113,9 @@ pub struct LoadSnapshotParams {
     /// `track_dirty_pages`; installs a `(session_id, generation=0)` token that
     /// guarded snapshot requests can later compare against. Must be fresh per
     /// load: every process re-arms at generation 0, so a reused id would let a
-    /// token persisted from an earlier process validate against a bitmap it
-    /// never described. The API layer enforces the shape (non-empty, bounded,
-    /// `[A-Za-z0-9_-]`); freshness is the caller's contract.
+    /// token from an earlier process validate against a bitmap it never
+    /// described. The API layer checks only the shape; freshness is the
+    /// caller's contract.
     pub tracking_session_id: Option<String>,
 }
 

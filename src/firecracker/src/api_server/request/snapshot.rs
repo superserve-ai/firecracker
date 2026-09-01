@@ -23,18 +23,14 @@ pub const MISSING_FIELD: &str =
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
 /// Upper bound on a dirty-tracking session id: room for a UUID or a hex
-/// nonce, and a bound at all so the token cloned on the restore path is
-/// never a caller-sized allocation.
+/// nonce, bounded so the token is never a caller-sized allocation.
 pub const TRACKING_SESSION_ID_MAX_LEN: usize = 128;
 
 /// A session id must be a non-empty, bounded token of `[A-Za-z0-9_-]`. The
-/// protocol only holds if the id is fresh per load — a replacement process
-/// re-arms at generation 0, so a recurring id (a stable sandbox name, an
-/// empty string) would let a stale persisted token validate against a bitmap
-/// it never described. A shape check cannot prove freshness, but it rejects
-/// the values that make reuse likely, and applying the same rule on both
-/// endpoints turns a malformed expected token into a loud 400 instead of a
-/// silent mismatch that reads as "baseline gone".
+/// shape cannot prove the id is fresh per load, but it rejects the empty and
+/// structured values that make reuse likely, and the same rule on both
+/// endpoints makes a malformed expected token a 400 rather than a silent
+/// mismatch.
 fn validate_session_id(field: &str, id: &str) -> Result<(), RequestError> {
     let well_formed = !id.is_empty()
         && id.len() <= TRACKING_SESSION_ID_MAX_LEN
@@ -201,9 +197,8 @@ mod tests {
 
     #[test]
     fn test_parse_put_snapshot_session_fields() {
-        // A well-formed token passes through both endpoints untouched. The
-        // shape rule is shared, so a malformed expected token is a 400 rather
-        // than a silent mismatch that would read as "baseline gone".
+        // Both endpoints accept a well-formed token and reject the same
+        // malformed shapes.
         fn load(extra: &str) -> Result<Option<String>, RequestError> {
             let body = format!(
                 r#"{{
