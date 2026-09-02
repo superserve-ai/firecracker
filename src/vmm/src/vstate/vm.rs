@@ -74,6 +74,10 @@ pub struct VmCommon {
     pub resource_allocator: Mutex<ResourceAllocator>,
     /// MMIO bus
     pub mmio_bus: Arc<Bus>,
+    /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
+    /// to exercise partial-failure handling. 0 means never fail.
+    #[cfg(test)]
+    fail_set_user_memory_region_in: AtomicU32,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -153,6 +157,8 @@ impl Vm {
             interrupts: Mutex::new(HashMap::with_capacity(GSI_MSI_END as usize + 1)),
             resource_allocator: Mutex::new(ResourceAllocator::new()),
             mmio_bus: Arc::new(Bus::new()),
+            #[cfg(test)]
+            fail_set_user_memory_region_in: AtomicU32::new(0),
         })
     }
 
@@ -193,12 +199,32 @@ impl Vm {
         &self,
         region: kvm_userspace_memory_region,
     ) -> Result<(), VmError> {
+        #[cfg(test)]
+        if self.common.fail_set_user_memory_region_in.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |n| (n > 0).then(|| n - 1),
+        ) == Ok(1)
+        {
+            return Err(VmError::SetUserMemoryRegion(kvm_ioctls::Error::new(
+                libc::ENOMEM,
+            )));
+        }
         // SAFETY: Safe because the fd is a valid KVM file descriptor.
         unsafe {
             self.fd()
                 .set_user_memory_region(region)
                 .map_err(VmError::SetUserMemoryRegion)
         }
+    }
+
+    /// Test-only: arm the fault injector so the `n`th subsequent call to
+    /// [`Self::set_user_memory_region`] fails (n == 1 fails the very next call).
+    #[cfg(test)]
+    pub(crate) fn fail_next_set_user_memory_region(&self, n: u32) {
+        self.common
+            .fail_set_user_memory_region_in
+            .store(n, Ordering::Relaxed);
     }
 
     fn register_memory_region(&mut self, region: Arc<GuestRegionMmapExt>) -> Result<(), VmError> {
