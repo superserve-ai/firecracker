@@ -22,6 +22,32 @@ pub const MISSING_FIELD: &str =
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
+/// Upper bound on a dirty-tracking session id: room for a UUID or a hex
+/// nonce, bounded so the token is never a caller-sized allocation.
+pub const TRACKING_SESSION_ID_MAX_LEN: usize = 128;
+
+/// A session id must be a non-empty, bounded token of `[A-Za-z0-9_-]`. The
+/// shape cannot prove the id is fresh per load, but it rejects the empty and
+/// structured values that make reuse likely, and the same rule on both
+/// endpoints makes a malformed expected token a 400 rather than a silent
+/// mismatch.
+fn validate_session_id(field: &str, id: &str) -> Result<(), RequestError> {
+    let well_formed = !id.is_empty()
+        && id.len() <= TRACKING_SESSION_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if well_formed {
+        return Ok(());
+    }
+    Err(RequestError::Generic(
+        StatusCode::BadRequest,
+        format!(
+            "{field} must be 1..={TRACKING_SESSION_ID_MAX_LEN} characters of [A-Za-z0-9_-], \
+             unique per snapshot load"
+        ),
+    ))
+}
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -54,6 +80,19 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+    if let Some(id) = &snapshot_config.expected_session_id {
+        validate_session_id("expected_session_id", id)?;
+    }
+    // Half a token is a client bug; reject it here so it never reads as a
+    // session mismatch, which clients treat as "baseline gone".
+    if snapshot_config.expected_session_id.is_some()
+        != snapshot_config.expected_generation.is_some()
+    {
+        return Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            "expected_session_id and expected_generation must be supplied together".to_string(),
+        ));
+    }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -61,6 +100,9 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
 
 fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<LoadSnapshotConfig>(body.raw())?;
+    if let Some(id) = &snapshot_config.tracking_session_id {
+        validate_session_id("tracking_session_id", id)?;
+    }
 
     match (&snapshot_config.mem_backend, &snapshot_config.mem_file_path) {
         // Ensure `mem_file_path` and `mem_backend` fields are not present at the same time.
@@ -106,16 +148,26 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         }
     };
 
+    #[allow(deprecated)]
+    let track_dirty_pages =
+        snapshot_config.enable_diff_snapshots || snapshot_config.track_dirty_pages;
+    // Without tracking there is no bitmap for a session id to describe.
+    if snapshot_config.tracking_session_id.is_some() && !track_dirty_pages {
+        return Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            "tracking_session_id requires track_dirty_pages".to_string(),
+        ));
+    }
+
     let snapshot_params = LoadSnapshotParams {
         snapshot_path: snapshot_config.snapshot_path,
         mem_backend,
-        #[allow(deprecated)]
-        track_dirty_pages: snapshot_config.enable_diff_snapshots
-            || snapshot_config.track_dirty_pages,
+        track_dirty_pages,
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         block_delta_dir: snapshot_config.block_delta_dir,
         clock_realtime: snapshot_config.clock_realtime,
+        tracking_session_id: snapshot_config.tracking_session_id,
     };
 
     // Construct the `ParsedRequest` object.
@@ -163,6 +215,82 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_put_snapshot_session_fields() {
+        // Malformed shapes and combinations are 400s, never a session mismatch.
+        fn load_with(tracked: bool, extra: &str) -> Result<Option<String>, RequestError> {
+            let body = format!(
+                r#"{{
+                    "snapshot_path": "foo",
+                    "mem_backend": {{"backend_path": "bar", "backend_type": "File"}},
+                    "track_dirty_pages": {tracked}{extra}
+                }}"#
+            );
+            parse_put_snapshot(&Body::new(body), Some("load")).map(|parsed| {
+                match vmm_action_from_request(parsed) {
+                    VmmAction::LoadSnapshot(cfg) => cfg.tracking_session_id,
+                    _ => panic!("expected LoadSnapshot"),
+                }
+            })
+        }
+        let load = |extra: &str| load_with(true, extra);
+        let hex = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            load(&format!(r#", "tracking_session_id": "{hex}""#)).unwrap(),
+            Some(hex.to_string())
+        );
+        assert_eq!(load("").unwrap(), None);
+        load(r#", "tracking_session_id": """#).unwrap_err();
+        load(r#", "tracking_session_id": "has space""#).unwrap_err();
+        let max = "a".repeat(TRACKING_SESSION_ID_MAX_LEN);
+        assert!(load(&format!(r#", "tracking_session_id": "{max}""#)).is_ok());
+        load(&format!(r#", "tracking_session_id": "{max}a""#)).unwrap_err();
+        // Untracked load: rejected, not dropped. enable_diff_snapshots still counts.
+        load_with(false, &format!(r#", "tracking_session_id": "{hex}""#)).unwrap_err();
+        assert_eq!(load_with(false, "").unwrap(), None);
+        assert_eq!(
+            load_with(
+                false,
+                &format!(r#", "enable_diff_snapshots": true, "tracking_session_id": "{hex}""#)
+            )
+            .unwrap(),
+            Some(hex.to_string())
+        );
+
+        fn create(extra: &str) -> Result<(Option<String>, Option<u64>), RequestError> {
+            let body = format!(
+                r#"{{"snapshot_path": "foo", "mem_file_path": "bar", "snapshot_type": "Diff"{extra}}}"#
+            );
+            parse_put_snapshot(&Body::new(body), Some("create")).map(|parsed| {
+                match vmm_action_from_request(parsed) {
+                    VmmAction::CreateSnapshot(cfg) => {
+                        (cfg.expected_session_id, cfg.expected_generation)
+                    }
+                    _ => panic!("expected CreateSnapshot"),
+                }
+            })
+        }
+        assert_eq!(
+            create(&format!(
+                r#", "expected_session_id": "{hex}", "expected_generation": 3"#
+            ))
+            .unwrap(),
+            (Some(hex.to_string()), Some(3))
+        );
+        assert_eq!(create("").unwrap(), (None, None));
+        create(&format!(
+            r#", "expected_session_id": "", "expected_generation": 0"#
+        ))
+        .unwrap_err();
+        create(&format!(
+            r#", "expected_session_id": "bad/slash", "expected_generation": 0"#
+        ))
+        .unwrap_err();
+        // Half a token is a 400, not a mismatch.
+        create(&format!(r#", "expected_session_id": "{hex}""#)).unwrap_err();
+        create(r#", "expected_generation": 0"#).unwrap_err();
+    }
+
+    #[test]
     fn test_parse_put_snapshot() {
         use std::path::PathBuf;
 
@@ -179,6 +307,8 @@ mod tests {
             mem_file_path: PathBuf::from("bar"),
             block_delta_dir: None,
             flatten: false,
+            expected_session_id: None,
+            expected_generation: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -195,6 +325,8 @@ mod tests {
             mem_file_path: PathBuf::from("bar"),
             block_delta_dir: None,
             flatten: false,
+            expected_session_id: None,
+            expected_generation: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -229,6 +361,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -265,6 +398,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -301,6 +435,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -346,6 +481,7 @@ mod tests {
             }],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -379,6 +515,7 @@ mod tests {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(

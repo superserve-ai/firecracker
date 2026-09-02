@@ -15,6 +15,7 @@ use vmm::persist::{CreateSnapshotError, MicrovmState, MicrovmStateError, VmInfo,
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+    VmmData,
 };
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
@@ -233,6 +234,8 @@ fn verify_create_snapshot(
         mem_file_path: memory_file.as_path().to_path_buf(),
         block_delta_dir: None,
         flatten: false,
+        expected_session_id: None,
+        expected_generation: None,
     };
 
     controller
@@ -305,6 +308,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
+            tracking_session_id: None,
         }))
         .unwrap();
 
@@ -402,6 +406,8 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         mem_file_path: memory_file.as_path().to_path_buf(),
         block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
         flatten: true,
+        expected_session_id: None,
+        expected_generation: None,
     };
     controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -454,6 +460,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             clock_realtime: None,
+            tracking_session_id: None,
         }))
         .expect("restore from flattened snapshot must succeed");
 
@@ -510,6 +517,8 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             mem_file_path: memory_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
+            expected_session_id: None,
+            expected_generation: None,
         }))
         .expect("flatten snapshot");
 
@@ -563,6 +572,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             network_overrides: vec![],
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             clock_realtime: None,
+            tracking_session_id: None,
         }))
         .expect("restore from flat snapshot");
     let restored_vmm = preboot.built_vmm.take().unwrap();
@@ -597,6 +607,8 @@ fn flatten_snapshot_expect_overlay_err(
             mem_file_path: mem_path,
             block_delta_dir: Some(delta_dir),
             flatten: true,
+            expected_session_id: None,
+            expected_generation: None,
         }))
         .expect_err("expected overlay error from flatten");
     match err {
@@ -760,6 +772,8 @@ fn test_flatten_skips_non_overlay_device() {
             mem_file_path: mem_file.as_path().to_path_buf(),
             block_delta_dir: Some(std::path::PathBuf::from(&delta_dir)),
             flatten: true,
+            expected_session_id: None,
+            expected_generation: None,
         }))
         .expect("flatten must succeed even with a non-overlay drive in the mix");
 
@@ -790,6 +804,8 @@ fn test_create_snapshot_flatten_requires_delta_dir() {
         mem_file_path: std::path::PathBuf::from("/this/should/never/be/written.mem"),
         block_delta_dir: None,
         flatten: true,
+        expected_session_id: None,
+        expected_generation: None,
     };
     let err = controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -821,6 +837,195 @@ fn test_create_and_load_snapshot() {
             }
         }
     }
+}
+
+
+// Protocol state-machine coverage for guarded dirty-tracking sessions: a
+// tracked load installs (session, 0); only the exact live token is accepted;
+// rejected requests touch no output file; and EVERY snapshot attempt —
+// guarded or not, Full or Diff — consumes the current generation.
+#[test]
+fn test_guarded_snapshot_session_lifecycle() {
+    // A full snapshot to restore from.
+    let (snapshot_file, memory_file) = verify_create_snapshot(false, false, false);
+
+    let restore = |tracking_session_id: Option<String>,
+                   snapshot_file: &TempFile,
+                   memory_file: &TempFile| {
+        let mut event_manager = EventManager::new().unwrap();
+        let empty_seccomp_filters = get_empty_filters();
+        let mut vm_resources = VmResources::default();
+        let mut preboot_api_controller = PrebootApiController::new(
+            &empty_seccomp_filters,
+            InstanceInfo::default(),
+            &mut vm_resources,
+            &mut event_manager,
+        );
+        preboot_api_controller
+            .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_backend: MemBackendConfig {
+                    base_path: None,
+                    backend_path: memory_file.as_path().to_path_buf(),
+                    backend_type: MemBackendType::File,
+                    abort_on_handler_death: false,
+                    access_log_path: None,
+                    record_to: None,
+                },
+                track_dirty_pages: true,
+                resume_vm: true,
+                network_overrides: vec![],
+                block_delta_dir: None,
+                clock_realtime: None,
+                tracking_session_id,
+            }))
+            .unwrap();
+        preboot_api_controller.built_vmm.take().unwrap()
+    };
+    let diff_request = |expected_session_id: Option<&str>,
+                        expected_generation: Option<u64>,
+                        snap: &TempFile,
+                        mem: &TempFile| {
+        VmmAction::CreateSnapshot(CreateSnapshotParams {
+            snapshot_type: SnapshotType::Diff,
+            snapshot_path: snap.as_path().to_path_buf(),
+            mem_file_path: mem.as_path().to_path_buf(),
+            block_delta_dir: None,
+            flatten: false,
+            expected_session_id: expected_session_id.map(String::from),
+            expected_generation,
+        })
+    };
+    fn assert_mismatch(res: Result<VmmData, VmmActionError>) {
+        match res {
+            Err(VmmActionError::CreateSnapshot(
+                CreateSnapshotError::DirtyTrackingSessionMismatch,
+            )) => {}
+            other => panic!("expected DirtyTrackingSessionMismatch, got {other:?}"),
+        }
+    }
+
+    // A tracked load with a session id installs (session-a, generation 0).
+    let vmm = restore(
+        Some("session-a".to_string()),
+        &snapshot_file,
+        &memory_file,
+    );
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    thread::sleep(Duration::from_millis(200));
+    controller.handle_request(VmmAction::Pause).unwrap();
+
+    // Stale, wrong, and partial tokens are rejected before any output file is
+    // touched.
+    let untouched_snap = TempFile::new().unwrap();
+    let untouched_mem = TempFile::new().unwrap();
+    assert_mismatch(controller.handle_request(diff_request(
+        Some("session-a"),
+        Some(7),
+        &untouched_snap,
+        &untouched_mem,
+    )));
+    assert_mismatch(controller.handle_request(diff_request(
+        Some("someone-else"),
+        Some(0),
+        &untouched_snap,
+        &untouched_mem,
+    )));
+    assert_mismatch(controller.handle_request(diff_request(
+        Some("session-a"),
+        None,
+        &untouched_snap,
+        &untouched_mem,
+    )));
+
+    // The exact live token is accepted.
+    let diff1_snap = TempFile::new().unwrap();
+    let diff1_mem = TempFile::new().unwrap();
+    controller
+        .handle_request(diff_request(
+            Some("session-a"),
+            Some(0),
+            &diff1_snap,
+            &diff1_mem,
+        ))
+        .unwrap();
+
+    // That attempt consumed generation 0: a replay is rejected, the successor
+    // generation is accepted.
+    assert_mismatch(controller.handle_request(diff_request(
+        Some("session-a"),
+        Some(0),
+        &untouched_snap,
+        &untouched_mem,
+    )));
+    let diff2_snap = TempFile::new().unwrap();
+    let diff2_mem = TempFile::new().unwrap();
+    controller
+        .handle_request(diff_request(
+            Some("session-a"),
+            Some(1),
+            &diff2_snap,
+            &diff2_mem,
+        ))
+        .unwrap();
+
+    // An UNGUARDED Full snapshot consumes the generation too (any snapshot
+    // resets or reads the dirty bitmap), so the pre-Full generation dies with
+    // it and the successor is the one accepted.
+    let full_snap = TempFile::new().unwrap();
+    let full_mem = TempFile::new().unwrap();
+    controller
+        .handle_request(VmmAction::CreateSnapshot(CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: full_snap.as_path().to_path_buf(),
+            mem_file_path: full_mem.as_path().to_path_buf(),
+            block_delta_dir: None,
+            flatten: false,
+            expected_session_id: None,
+            expected_generation: None,
+        }))
+        .unwrap();
+    assert_mismatch(controller.handle_request(diff_request(
+        Some("session-a"),
+        Some(2),
+        &untouched_snap,
+        &untouched_mem,
+    )));
+    let diff3_snap = TempFile::new().unwrap();
+    let diff3_mem = TempFile::new().unwrap();
+    controller
+        .handle_request(diff_request(
+            Some("session-a"),
+            Some(3),
+            &diff3_snap,
+            &diff3_mem,
+        ))
+        .unwrap();
+
+    // Every rejection above happened before the output files were opened.
+    assert_eq!(untouched_snap.as_file().metadata().unwrap().len(), 0);
+    assert_eq!(untouched_mem.as_file().metadata().unwrap().len(), 0);
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    // A tracked load WITHOUT a session id installs nothing: guarded requests
+    // are rejected, unguarded diffs still work.
+    let vmm = restore(None, &full_snap, &full_mem);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    thread::sleep(Duration::from_millis(200));
+    controller.handle_request(VmmAction::Pause).unwrap();
+    assert_mismatch(controller.handle_request(diff_request(
+        Some("session-a"),
+        Some(0),
+        &untouched_snap,
+        &untouched_mem,
+    )));
+    let unguarded_snap = TempFile::new().unwrap();
+    let unguarded_mem = TempFile::new().unwrap();
+    controller
+        .handle_request(diff_request(None, None, &unguarded_snap, &unguarded_mem))
+        .unwrap();
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
 #[test]
@@ -886,6 +1091,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         network_overrides: vec![],
         block_delta_dir: None,
         clock_realtime: None,
+        tracking_session_id: None,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(
