@@ -52,6 +52,8 @@ pub enum OverlayIoError {
     FlattenBaseSync(std::io::Error),
     /// Flatten: base size mismatch: expected {expected}, actual {actual}
     FlattenBaseSizeMismatch { expected: u64, actual: u64 },
+    /// Materializing the block map into the overlay file failed: {0}
+    Materialize(std::io::Error),
 }
 
 #[derive(Debug)]
@@ -68,7 +70,9 @@ impl OverlayFileEngine {
     /// Create a new overlay engine from a read-only base file and a writable overlay file.
     ///
     /// The overlay file must have the same logical size as the base file (sparse is fine).
-    /// If `bitmap` is `None`, a fresh empty bitmap is created.
+    /// If `bitmap` is `None`, it is derived from the overlay file's allocated
+    /// extents, so an overlay that already holds guest-written blocks, such as
+    /// one restored from a backup, is read rather than shadowed by the base.
     pub fn from_files(
         base: File,
         overlay: File,
@@ -78,7 +82,8 @@ impl OverlayFileEngine {
     ) -> Result<Self, OverlayIoError> {
         let bitmap = match bitmap {
             Some(bm) => bm,
-            None => DirtyBitmap::new(disk_size, block_size).map_err(OverlayIoError::Bitmap)?,
+            None => DirtyBitmap::from_overlay_extents(&overlay, disk_size, block_size)
+                .map_err(OverlayIoError::Bitmap)?,
         };
 
         Ok(Self {
@@ -86,6 +91,76 @@ impl OverlayFileEngine {
             overlay,
             bitmap,
         })
+    }
+
+    /// Make the overlay file agree with the bitmap, so the map can be derived
+    /// from the file alone from now on: a block the map marks that the file
+    /// holds as a hole is allocated as zeros, and a block the map does not
+    /// mark that the file holds is punched back to a hole. The file is then
+    /// read back and must derive exactly this map; a filesystem that turns
+    /// written zeros back into holes fails here rather than later. Returns
+    /// how many blocks changed.
+    pub fn materialize_bitmap_into_file(&mut self) -> Result<u64, OverlayIoError> {
+        use std::os::unix::fs::FileExt;
+        use std::os::unix::io::AsRawFd;
+        let block_size = self.bitmap.block_size();
+        // The file's own length: the last block may be shorter than a block.
+        let disk_size = self
+            .overlay
+            .metadata()
+            .map_err(OverlayIoError::Materialize)?
+            .len();
+        let on_disk = DirtyBitmap::from_overlay_extents(&self.overlay, disk_size, block_size)
+            .map_err(OverlayIoError::Bitmap)?;
+        let zeros = vec![0u8; block_size as usize];
+        let mut changed = 0u64;
+        for block in 0..self.bitmap.total_blocks() {
+            let offset = block * u64::from(block_size);
+            let len = u64::from(block_size).min(disk_size.saturating_sub(offset));
+            if len == 0 {
+                break;
+            }
+            match (self.bitmap.is_set(block), on_disk.is_set(block)) {
+                (true, false) => {
+                    self.overlay
+                        .write_all_at(&zeros[..len as usize], offset)
+                        .map_err(OverlayIoError::Materialize)?;
+                    changed += 1;
+                }
+                (false, true) => {
+                    // SAFETY: fallocate with FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE is
+                    // safe on a valid fd with valid offset/len.
+                    let ret = unsafe {
+                        libc::fallocate(
+                            self.overlay.as_raw_fd(),
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                            offset as i64,
+                            len as i64,
+                        )
+                    };
+                    if ret != 0 {
+                        return Err(OverlayIoError::Materialize(std::io::Error::last_os_error()));
+                    }
+                    changed += 1;
+                }
+                _ => {}
+            }
+        }
+        if changed > 0 {
+            self.overlay
+                .sync_all()
+                .map_err(OverlayIoError::Materialize)?;
+        }
+        let after = DirtyBitmap::from_overlay_extents(&self.overlay, disk_size, block_size)
+            .map_err(OverlayIoError::Bitmap)?;
+        for block in 0..self.bitmap.total_blocks() {
+            if self.bitmap.is_set(block) != after.is_set(block) {
+                return Err(OverlayIoError::Bitmap(
+                    DirtyBitmapError::MaterializeMismatch { block },
+                ));
+            }
+        }
+        Ok(changed)
     }
 
     /// Update the overlay file handle.
@@ -135,24 +210,15 @@ impl OverlayFileEngine {
         &mut self.overlay
     }
 
-    /// Discard blocks in the overlay: clear bitmap bits and punch holes in the overlay file.
+    /// Discard blocks in the overlay: punch holes in the overlay file and clear
+    /// their bitmap bits. The bits follow the punch, so the file's extents and
+    /// the map never disagree: a block whose punch failed stays marked, and a
+    /// later boot that derives the map from the file sees the same thing.
     pub fn discard(&mut self, offset: u64, len: u64) -> Result<(), OverlayIoError> {
         if len == 0 {
             return Ok(());
         }
 
-        // Clear bitmap bits for the discarded range.
-        let block_size = u64::from(self.bitmap.block_size());
-        let start_block = offset / block_size;
-        let end_offset = offset.saturating_add(len).saturating_sub(1);
-        let end_block = end_offset / block_size;
-        let clamped_end = end_block.min(self.bitmap.total_blocks() - 1);
-
-        for block in start_block..=clamped_end {
-            self.bitmap.unset(block);
-        }
-
-        // Punch a hole in the overlay file to reclaim host disk space.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
@@ -168,12 +234,22 @@ impl OverlayFileEngine {
                 )
             };
             if ret != 0 {
-                // Non-fatal: bitmap is already cleared so reads stay correct, we just
-                // don't reclaim host space. Log so silent leakage on filesystems
-                // without PUNCH_HOLE support (NFS, tmpfs, ext3) shows up.
+                // Non-fatal for the guest, which only asked us to reclaim; the
+                // blocks keep their contents and their bits. Log so silent
+                // leakage on filesystems without PUNCH_HOLE support shows up.
                 let err = std::io::Error::last_os_error();
                 warn!("overlay discard: hole punch failed offset={offset} len={len}: {err}");
+                return Ok(());
             }
+        }
+
+        // Only blocks the punch emptied entirely become clean; a block the
+        // range only partly covers keeps the rest of its data and its bit.
+        let block_size = u64::from(self.bitmap.block_size());
+        let first_full = offset.div_ceil(block_size);
+        let end_full = offset.saturating_add(len) / block_size;
+        for block in first_full..end_full.min(self.bitmap.total_blocks()) {
+            self.bitmap.unset(block);
         }
 
         Ok(())
@@ -536,6 +612,41 @@ mod tests {
     }
 
     #[test]
+    fn test_open_without_bitmap_reads_the_overlays_written_blocks() {
+        use std::os::unix::fs::FileExt;
+        const BLOCK: u64 = DEFAULT_BLOCK_SIZE as u64;
+        let base_data = vec![0xAA_u8; FILE_LEN as usize];
+        let base = create_base_file(&base_data);
+        // A restored overlay: sparse, with only the guest-written blocks present.
+        let overlay = create_overlay_file(FILE_LEN);
+        overlay
+            .write_all_at(&vec![0xBB_u8; BLOCK as usize], BLOCK)
+            .unwrap();
+        overlay
+            .write_all_at(&vec![0xCC_u8; BLOCK as usize], 3 * BLOCK)
+            .unwrap();
+        overlay.sync_all().unwrap();
+
+        let mut engine =
+            OverlayFileEngine::from_files(base, overlay, FILE_LEN, DEFAULT_BLOCK_SIZE, None)
+                .unwrap();
+        assert_eq!(engine.bitmap().dirty_count(), 2);
+
+        let mem = create_mem();
+        let mut buf = vec![0u8; BLOCK as usize];
+        for (block, want) in [(0u64, 0xAA_u8), (1, 0xBB), (2, 0xAA), (3, 0xCC)] {
+            engine
+                .read(block * BLOCK, &mem, GuestAddress(0), DEFAULT_BLOCK_SIZE)
+                .unwrap();
+            mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+            assert!(
+                buf.iter().all(|&b| b == want),
+                "block {block} must read {want:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn test_write_then_read_from_overlay() {
         let base_data = vec![0xAA_u8; FILE_LEN as usize];
         let mut engine = create_engine(&base_data);
@@ -879,7 +990,12 @@ mod tests {
         let base_tmp = TempFile::new().unwrap();
         std::fs::write(base_tmp.as_path(), vec![0xAA_u8; SIZE]).unwrap();
         let overlay_tmp = TempFile::new().unwrap();
-        std::fs::write(overlay_tmp.as_path(), vec![0u8; SIZE]).unwrap();
+        // A never-written overlay is all holes; allocated zeros would count as
+        // guest writes.
+        std::fs::File::create(overlay_tmp.as_path())
+            .unwrap()
+            .set_len(SIZE as u64)
+            .unwrap();
 
         let base = File::open(base_tmp.as_path()).unwrap();
         let overlay = std::fs::OpenOptions::new()

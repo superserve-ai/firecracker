@@ -11,10 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::linux::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use std::path::Path;
 
 use block_io::FileEngine;
 use block_io::dirty_bitmap::DEFAULT_BLOCK_SIZE;
@@ -116,10 +114,28 @@ impl DiskProperties {
     }
 
     /// Create a new overlay file engine with a read-only base and a writable overlay.
+    /// The side-car a snapshot saves beside its vmstate, kept beside the
+    /// overlay instead, restores the exact block map on a fresh boot.
+    pub fn overlay_bitmap_sidecar_path(overlay_path: &str) -> String {
+        format!("{overlay_path}.bitmap")
+    }
+
+    /// Unlink a side-car and make the unlink durable: one that resurfaced
+    /// after a crash would be materialized over the guest's newer writes.
+    fn remove_bitmap_sidecar(sidecar: &str) -> Result<(), VirtioBlockError> {
+        match std::fs::remove_file(sidecar) {
+            Ok(()) => crate::uffd_internal::sync_parent_dir(Path::new(sidecar)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+        .map_err(|e| VirtioBlockError::BackingFile(e, sidecar.to_string()))
+    }
+
     pub fn new_overlay(
         base_image_path: String,
         overlay_path: String,
         block_size: u32,
+        drive_id: &str,
     ) -> Result<Self, VirtioBlockError> {
         let mut base_file = OpenOptions::new()
             .read(true)
@@ -141,23 +157,87 @@ impl DiskProperties {
             .map_err(VirtioBlockError::GetFileMetadata)?
             .len();
 
-        if overlay_size == 0 {
-            // Fresh overlay — set length to match base.
+        // A saved block map beside the overlay is authoritative. The boot
+        // that loads it first makes the file agree with it, then removes it,
+        // so every later boot can derive the same map from the file alone.
+        // Without one the engine derives the map from the overlay's allocated
+        // extents; an overlay this call just created is known empty.
+        let fresh = overlay_size == 0;
+        let sidecar = Self::overlay_bitmap_sidecar_path(&overlay_path);
+        let saved = if fresh {
+            // Whatever side-car sits beside a recreated overlay describes a
+            // file that no longer exists. It goes before the overlay grows:
+            // a boot that fails here leaves the file empty, so a retry still
+            // sees a fresh overlay rather than one to pair with the stale map.
+            Self::remove_bitmap_sidecar(&sidecar)?;
             overlay_file
                 .set_len(disk_size)
                 .map_err(|x| VirtioBlockError::BackingFile(x, overlay_path.clone()))?;
-        } else if overlay_size != disk_size {
-            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(
-                block_io::OverlayIoError::SizeMismatch {
-                    base_size: disk_size,
-                    overlay_size,
-                },
-            )));
-        }
-
-        let overlay_engine =
-            block_io::OverlayFileEngine::from_files(base_file, overlay_file, disk_size, block_size, None)
+            None
+        } else {
+            if overlay_size != disk_size {
+                return Err(VirtioBlockError::FileEngine(
+                    block_io::BlockIoError::Overlay(block_io::OverlayIoError::SizeMismatch {
+                        base_size: disk_size,
+                        overlay_size,
+                    }),
+                ));
+            }
+            crate::persist::overlay_state_from_sidecar(Path::new(&sidecar), drive_id)
+                .map_err(|x| VirtioBlockError::BackingFile(x, sidecar.clone()))?
+        };
+        let bitmap = match saved {
+            None if fresh => Some(
+                block_io::dirty_bitmap::DirtyBitmap::new(disk_size, block_size).map_err(|e| {
+                    VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(
+                        block_io::OverlayIoError::Bitmap(e),
+                    ))
+                })?,
+            ),
+            Some(state) => {
+                let want_blocks = disk_size.div_ceil(u64::from(block_size));
+                if state.block_size != block_size || state.total_blocks != want_blocks {
+                    return Err(VirtioBlockError::BackingFile(
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "saved block map is {} blocks of {} bytes, disk needs \
+                                 {want_blocks} of {block_size}",
+                                state.total_blocks, state.block_size
+                            ),
+                        ),
+                        sidecar,
+                    ));
+                }
+                let bm = block_io::dirty_bitmap::DirtyBitmap::deserialize(
+                    &state.dirty_bitmap,
+                    state.block_size,
+                    state.total_blocks,
+                )
+                .map_err(|e| {
+                    VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(
+                        block_io::OverlayIoError::Bitmap(e),
+                    ))
+                })?;
+                Some(bm)
+            }
+            None => None,
+        };
+        let from_sidecar = !fresh && bitmap.is_some();
+        let mut overlay_engine = block_io::OverlayFileEngine::from_files(
+            base_file,
+            overlay_file,
+            disk_size,
+            block_size,
+            bitmap,
+        )
+        .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(e)))?;
+        if from_sidecar {
+            overlay_engine
+                .materialize_bitmap_into_file()
                 .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Overlay(e)))?;
+            Self::remove_bitmap_sidecar(&sidecar)?;
+        }
 
         Ok(Self {
             file_path: overlay_path,
@@ -494,7 +574,12 @@ impl VirtioBlock {
                 .as_ref()
                 .ok_or(VirtioBlockError::Config)?
                 .clone();
-            DiskProperties::new_overlay(base_path, config.path_on_host.clone(), DEFAULT_BLOCK_SIZE)?
+            DiskProperties::new_overlay(
+                base_path,
+                config.path_on_host.clone(),
+                DEFAULT_BLOCK_SIZE,
+                &config.drive_id,
+            )?
         } else {
             DiskProperties::new(
                 config.path_on_host.clone(),
@@ -1153,6 +1238,115 @@ mod tests {
             // Validate read failed (the config space was not updated).
             assert_eq!(actual_config_space, expected_config_space);
         }
+    }
+
+    #[test]
+    fn test_fresh_overlay_boot_prefers_the_saved_block_map_beside_the_overlay() {
+        use std::os::unix::fs::FileExt;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::devices::virtio::block::virtio::io::dirty_bitmap::DirtyBitmap;
+        use crate::devices::virtio::block::virtio::persist::OverlayState;
+        const BLOCK: u64 = DEFAULT_BLOCK_SIZE as u64;
+        const FILE_LEN: u64 = 4 * BLOCK;
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(FILE_LEN).unwrap();
+        let overlay = TempFile::new().unwrap();
+        overlay.as_file().set_len(FILE_LEN).unwrap();
+        // The file says block 1 was written; the saved map says block 2.
+        overlay
+            .as_file()
+            .write_all_at(&vec![0xBB_u8; BLOCK as usize], BLOCK)
+            .unwrap();
+        let overlay_path = overlay.as_path().to_str().unwrap().to_string();
+        let sidecar_path = DiskProperties::overlay_bitmap_sidecar_path(&overlay_path);
+
+        let make = |drive_id: &str| {
+            DiskProperties::new_overlay(
+                base.as_path().to_str().unwrap().to_string(),
+                overlay_path.clone(),
+                DEFAULT_BLOCK_SIZE,
+                drive_id,
+            )
+        };
+        let dirty_blocks = |disk: &DiskProperties| -> Vec<u64> {
+            match &disk.file_engine {
+                FileEngine::Overlay(e) => e.bitmap().iter_dirty().collect(),
+                _ => panic!("overlay engine expected"),
+            }
+        };
+
+        // No side-car: the map comes from the file.
+        assert_eq!(dirty_blocks(&make("rootfs").unwrap()), vec![1]);
+
+        let mut saved = DirtyBitmap::new(FILE_LEN, DEFAULT_BLOCK_SIZE).unwrap();
+        saved.set(2 * BLOCK, DEFAULT_BLOCK_SIZE);
+        let state = OverlayState {
+            base_path: String::new(),
+            overlay_path: overlay_path.clone(),
+            dirty_bitmap: saved.serialize(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            total_blocks: saved.total_blocks(),
+            delta_dir: None,
+        };
+        let bytes = bitcode::serialize(&crate::persist::OverlaySidecar {
+            devices: vec![("rootfs".to_string(), state)],
+        })
+        .unwrap();
+        std::fs::write(&sidecar_path, bytes).unwrap();
+
+        // A side-car that does not name this drive is a misplaced file, and
+        // is left in place.
+        make("other").unwrap_err();
+        assert!(Path::new(&sidecar_path).exists());
+
+        // A side-car beside the overlay wins, and the boot that loads it makes
+        // the file agree with it before removing it.
+        assert_eq!(dirty_blocks(&make("rootfs").unwrap()), vec![2]);
+        assert!(!Path::new(&sidecar_path).exists());
+
+        // The next fresh boot derives the same map from the file alone.
+        assert_eq!(dirty_blocks(&make("rootfs").unwrap()), vec![2]);
+    }
+
+    #[test]
+    fn test_fresh_overlay_boot_of_a_new_file_starts_empty_and_drops_a_stale_side_car() {
+        use vmm_sys_util::tempfile::TempFile;
+        const FILE_LEN: u64 = 4 * DEFAULT_BLOCK_SIZE as u64;
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(FILE_LEN).unwrap();
+        let dir = TempFile::new().unwrap();
+        let overlay_path = format!("{}.overlay", dir.as_path().to_str().unwrap());
+        let sidecar_path = DiskProperties::overlay_bitmap_sidecar_path(&overlay_path);
+        let make = || {
+            DiskProperties::new_overlay(
+                base.as_path().to_str().unwrap().to_string(),
+                overlay_path.clone(),
+                DEFAULT_BLOCK_SIZE,
+                "rootfs",
+            )
+        };
+
+        // A side-car that cannot be removed (here: a directory in its place)
+        // fails the boot before the overlay grows, so the retry below still
+        // starts from an empty file instead of trusting the stale map.
+        std::fs::create_dir(&sidecar_path).unwrap();
+        make().unwrap_err();
+        assert_eq!(std::fs::metadata(&overlay_path).unwrap().len(), 0);
+        std::fs::remove_dir(&sidecar_path).unwrap();
+
+        std::fs::write(&sidecar_path, b"left behind by an earlier overlay").unwrap();
+        let disk = make().unwrap();
+        match &disk.file_engine {
+            FileEngine::Overlay(e) => assert_eq!(e.bitmap().dirty_count(), 0),
+            _ => panic!("overlay engine expected"),
+        }
+        assert!(
+            !Path::new(&sidecar_path).exists(),
+            "a stale side-car must not survive a fresh overlay"
+        );
+        std::fs::remove_file(&overlay_path).unwrap();
     }
 
     #[test]

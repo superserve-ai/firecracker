@@ -9,6 +9,8 @@ pub mod net;
 pub mod signal;
 /// Module with state machine
 pub mod sm;
+/// Sparse-file extent walking.
+pub mod sparse;
 
 use std::fs::{File, OpenOptions};
 use std::num::Wrapping;
