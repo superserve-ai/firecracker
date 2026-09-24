@@ -26,6 +26,25 @@ pub enum DirtyBitmapError {
     OutOfBounds { index: u64, total_blocks: u64 },
     /// Disk size overflow: disk_size_bytes={disk_size_bytes}, block_size={block_size}
     DiskSizeOverflow { disk_size_bytes: u64, block_size: u32 },
+    /// Scanning the overlay's extents failed: {0}
+    Scan(std::io::Error),
+    /// Overlay allocation unit {blksize} is coarser than the block size {block_size}
+    AllocationUnit { blksize: u64, block_size: u32 },
+    /// Overlay extent [{start}, {end}) is not aligned to the block size {block_size}
+    UnalignedExtent {
+        start: u64,
+        end: u64,
+        block_size: u32,
+    },
+    /// Materializing the block map into the overlay left block {block} disagreeing with it
+    MaterializeMismatch { block: u64 },
+}
+
+/// Whether an allocated extent covers whole blocks: it starts on a block
+/// boundary and ends on one, or at the end of the disk.
+fn extent_block_aligned(start: u64, end: u64, disk_size: u64, block_size: u32) -> bool {
+    let block = u64::from(block_size);
+    start.is_multiple_of(block) && (end.is_multiple_of(block) || end == disk_size)
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +79,54 @@ impl DirtyBitmap {
             block_size,
             total_blocks,
         })
+    }
+
+    /// Derive the bitmap from the overlay file itself: every allocated extent
+    /// is a block the guest wrote, every hole falls through to the base. That
+    /// holds for an overlay this engine wrote and for one restored from a
+    /// backup of it, read from the filesystem's own extent map, which
+    /// reports real allocation or fails. A coarser allocation unit would
+    /// report a hole beside data as data, and a finer one could leave part
+    /// of a block unallocated; both are refused, the first by the
+    /// filesystem's preferred size and the second by every reported extent
+    /// having to start and end on a block boundary.
+    pub fn from_overlay_extents(
+        overlay: &std::fs::File,
+        disk_size_bytes: u64,
+        block_size: u32,
+    ) -> Result<Self, DirtyBitmapError> {
+        use std::os::unix::fs::MetadataExt;
+        let mut bitmap = Self::new(disk_size_bytes, block_size)?;
+        let meta = overlay.metadata().map_err(DirtyBitmapError::Scan)?;
+        let blksize = meta.blksize();
+        if blksize > u64::from(block_size) {
+            return Err(DirtyBitmapError::AllocationUnit {
+                blksize,
+                block_size,
+            });
+        }
+        let mut unaligned = None;
+        crate::utils::sparse::for_each_allocated_extent(overlay, disk_size_bytes, |start, end| {
+            if unaligned.is_none() && !extent_block_aligned(start, end, disk_size_bytes, block_size)
+            {
+                unaligned = Some((start, end));
+            }
+            let mut at = start;
+            while at < end {
+                let len = u32::try_from(end - at).unwrap_or(u32::MAX);
+                bitmap.set(at, len);
+                at += u64::from(len);
+            }
+        })
+        .map_err(DirtyBitmapError::Scan)?;
+        if let Some((start, end)) = unaligned {
+            return Err(DirtyBitmapError::UnalignedExtent {
+                start,
+                end,
+                block_size,
+            });
+        }
+        Ok(bitmap)
     }
 
     /// Mark all blocks covering the byte range `[offset, offset + len)` as dirty.
@@ -413,5 +480,28 @@ mod tests {
         let restored =
             DirtyBitmap::deserialize(&serialized, BLOCK_SIZE, bm.total_blocks()).unwrap();
         assert_eq!(restored.dirty_count(), bm.total_blocks());
+    }
+}
+
+#[cfg(test)]
+mod extent_alignment_tests {
+    use super::extent_block_aligned;
+
+    #[test]
+    fn whole_blocks_only() {
+        assert!(extent_block_aligned(0, 4096, 16384, 4096));
+        assert!(extent_block_aligned(8192, 16384, 16384, 4096));
+        assert!(
+            extent_block_aligned(12288, 16000, 16000, 4096),
+            "an extent may end at a ragged end of disk"
+        );
+        assert!(
+            !extent_block_aligned(512, 4096, 16384, 4096),
+            "start inside a block"
+        );
+        assert!(
+            !extent_block_aligned(0, 1024, 16384, 4096),
+            "end inside a block"
+        );
     }
 }

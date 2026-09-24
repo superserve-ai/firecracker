@@ -433,8 +433,11 @@ fn overlay_sidecar_path(snapshot_path: &Path) -> std::path::PathBuf {
 
 /// Side-car payload: maps drive_id → OverlayState. Bitcode-encoded.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct OverlaySidecar {
-    devices: Vec<(String, crate::devices::virtio::block::virtio::persist::OverlayState)>,
+pub(crate) struct OverlaySidecar {
+    pub(crate) devices: Vec<(
+        String,
+        crate::devices::virtio::block::virtio::persist::OverlayState,
+    )>,
 }
 
 /// Walk the block devices in `microvm_state`, extract any `overlay_state`
@@ -477,16 +480,11 @@ fn write_overlay_sidecar(
 /// entries back into the matching block devices in `microvm_state`. Snapshots
 /// produced by vanilla Firecracker (or by this binary on a host with no
 /// overlay devices) won't have a side-car, in which case this is a no-op.
-fn read_overlay_sidecar(
-    microvm_state: &mut MicrovmState,
-    snapshot_path: &Path,
-) -> Result<(), io::Error> {
-    use crate::devices::virtio::block::persist::BlockState;
-
-    let path = overlay_sidecar_path(snapshot_path);
-    let bytes = match std::fs::read(&path) {
+/// Decode an overlay side-car; `Ok(None)` when there is no file at `path`.
+fn decode_overlay_sidecar(path: &Path) -> Result<Option<OverlaySidecar>, io::Error> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     // 0-byte file is the torn-save sentinel from `snapshot_state_to_file`.
@@ -496,9 +494,45 @@ fn read_overlay_sidecar(
             format!("overlay side-car at {path:?} is empty (torn snapshot save)"),
         ));
     }
-    let sidecar: OverlaySidecar = bitcode::deserialize(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("decode sidecar: {e}")))?;
+    bitcode::deserialize(&bytes)
+        .map(Some)
+        .map_err(|e| io::Error::other(format!("decode sidecar: {e}")))
+}
 
+/// The saved overlay state for `drive_id` in the side-car at `path`, for a
+/// drive booted fresh from an overlay whose snapshot-time side-car was kept
+/// beside it. `Ok(None)` when no side-car exists; a side-car that exists but
+/// does not name the drive is a misplaced file and an error.
+pub fn overlay_state_from_sidecar(
+    path: &Path,
+    drive_id: &str,
+) -> Result<Option<crate::devices::virtio::block::virtio::persist::OverlayState>, io::Error> {
+    let Some(sidecar) = decode_overlay_sidecar(path)? else {
+        return Ok(None);
+    };
+    sidecar
+        .devices
+        .into_iter()
+        .find(|(id, _)| id == drive_id)
+        .map(|(_, state)| Some(state))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("overlay side-car at {path:?} carries no state for drive {drive_id}"),
+            )
+        })
+}
+
+fn read_overlay_sidecar(
+    microvm_state: &mut MicrovmState,
+    snapshot_path: &Path,
+) -> Result<(), io::Error> {
+    use crate::devices::virtio::block::persist::BlockState;
+
+    let path = overlay_sidecar_path(snapshot_path);
+    let Some(sidecar) = decode_overlay_sidecar(&path)? else {
+        return Ok(());
+    };
     let mut by_id: std::collections::HashMap<String, _> =
         sidecar.devices.into_iter().collect();
     for block_state in microvm_state
