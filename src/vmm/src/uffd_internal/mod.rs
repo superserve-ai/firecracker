@@ -15,9 +15,10 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use userfaultfd::{Error as UffdCrateError, Event, FeatureFlags, Uffd, UffdBuilder};
 
@@ -29,6 +30,9 @@ use crate::vstate::memory::{self, GuestMemoryState, GuestRegionMmap, MemoryError
 /// Poll timeout between shutdown-channel checks. Bounds how long a handler thread takes
 /// to notice that the VM is going away.
 const POLL_TIMEOUT_MS: i32 = 100;
+
+/// Largest single pre-copy. Bounds how long teardown waits on the stop flag.
+const PRECOPY_CHUNK: usize = 1 << 20;
 
 /// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
 /// observability; not used for synchronization, hence `Ordering::Relaxed` throughout.
@@ -106,6 +110,9 @@ pub struct Config {
     /// aborts the Firecracker process instead of leaving the guest to hang on its next
     /// page fault — so a supervisor sees a dead VM rather than a frozen one.
     pub abort_on_handler_death: bool,
+    /// Layered restore only: copy every page the overlay provides into guest memory on
+    /// a background thread, so the guest does not fault on them one page at a time.
+    pub eager_overlay: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -114,6 +121,7 @@ pub struct Handler {
     drain_tx: mpsc::SyncSender<mpsc::SyncSender<()>>,
     stats: Arc<Stats>,
     thread: Option<thread::JoinHandle<()>>,
+    precopy: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -126,6 +134,10 @@ impl std::fmt::Debug for Handler {
 
 impl Drop for Handler {
     fn drop(&mut self) {
+        if let Some((stop, t)) = self.precopy.take() {
+            stop.store(true, Ordering::Relaxed);
+            let _ = t.join();
+        }
         let _ = self.shutdown_tx.send(());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -288,6 +300,10 @@ pub fn setup(
         }
         None => (None, None),
     };
+    let precopy_runs = match &present {
+        Some(p) if cfg.eager_overlay => present_runs(p, page_size, total_mem as usize / page_size),
+        _ => Vec::new(),
+    };
     let backing = Backing {
         overlay,
         base,
@@ -325,6 +341,8 @@ pub fn setup(
     let (drain_tx, drain_rx) = mpsc::sync_channel::<mpsc::SyncSender<()>>(0);
     let stats = Arc::new(Stats::default());
     let stats_for_thread = Arc::clone(&stats);
+    let precopy_mappings = mappings.clone();
+    let precopy_filter = Arc::clone(&vmm_filter);
     let thread = thread::Builder::new()
         .name("uffd-internal".into())
         .spawn(move || {
@@ -362,6 +380,22 @@ pub fn setup(
         })
         .map_err(InternalUffdError::SpawnThread)?;
 
+    // An optimization only: if it cannot start, the guest still faults its pages in.
+    let precopy = if precopy_runs.is_empty() {
+        None
+    } else {
+        spawn_precopy(
+            &uffd,
+            &cfg.snapshot_path,
+            precopy_mappings,
+            precopy_runs,
+            page_size,
+            precopy_filter,
+        )
+        .inspect_err(|e| log::warn!("uffd-precopy: not started: {e}"))
+        .ok()
+    };
+
     Ok((
         guest_memory,
         uffd,
@@ -370,8 +404,151 @@ pub fn setup(
             drain_tx,
             stats,
             thread: Some(thread),
+            precopy,
         },
     ))
+}
+
+/// Runs of pages the overlay provides, as (file offset, length) pairs.
+fn present_runs(present: &PresenceBitmap, page_size: usize, npages: usize) -> Vec<(u64, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < npages {
+        if i & 63 == 0 && present.bits.get(i >> 6) == Some(&0) {
+            i += 64;
+            continue;
+        }
+        if !present.is_set(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < npages && present.is_set(i) {
+            i += 1;
+        }
+        runs.push(((start * page_size) as u64, (i - start) * page_size));
+    }
+    runs
+}
+
+/// Starts the pre-copy thread on its own uffd descriptor and its own mapping of the
+/// overlay, so it never shares state with the fault handler.
+fn spawn_precopy(
+    uffd: &Uffd,
+    overlay_path: &Path,
+    mappings: Vec<GuestRegionUffdMapping>,
+    runs: Vec<(u64, usize)>,
+    page_size: usize,
+    vmm_filter: Arc<BpfProgram>,
+) -> std::io::Result<(Arc<AtomicBool>, thread::JoinHandle<()>)> {
+    let overlay = mmap_snapshot(overlay_path)?;
+    // SAFETY: `uffd` is alive for the duration of this call and exposes a valid open fd.
+    let dup_fd = unsafe { libc::dup(uffd.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `dup_fd` was just returned by `dup()` and is owned only by this `Uffd`.
+    let uffd = unsafe { Uffd::from_raw_fd(dup_fd) };
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let thread = thread::Builder::new()
+        .name("uffd-precopy".into())
+        .spawn(move || {
+            if let Err(e) = apply_filter(vmm_filter.as_slice()) {
+                log::error!("uffd-precopy: failed to apply seccomp filter: {e:?}");
+                return;
+            }
+            let start = Instant::now();
+            let (copied, skipped) = precopy(
+                &uffd,
+                &mappings,
+                &overlay,
+                &runs,
+                page_size,
+                &stop_for_thread,
+            );
+            log::info!(
+                "uffd-precopy: copied {copied} pages, skipped {skipped}, in {} ms{}",
+                start.elapsed().as_millis(),
+                if stop_for_thread.load(Ordering::Relaxed) {
+                    " (stopped)"
+                } else {
+                    ""
+                },
+            );
+        })?;
+    Ok((stop, thread))
+}
+
+/// Copies `runs` of the overlay into guest memory in chunks of at most
+/// [`PRECOPY_CHUNK`]. A page the guest already faulted in, or one in a range the
+/// balloon unregistered, is skipped. Returns (pages copied, pages skipped).
+fn precopy(
+    uffd: &Uffd,
+    mappings: &[GuestRegionUffdMapping],
+    overlay: &SnapshotMmap,
+    runs: &[(u64, usize)],
+    page_size: usize,
+    stop: &AtomicBool,
+) -> (usize, usize) {
+    let (mut copied, mut skipped) = (0, 0);
+    for &(start, len) in runs {
+        let end = start + len as u64;
+        let mut off = start;
+        while off < end {
+            if stop.load(Ordering::Relaxed) {
+                return (copied, skipped);
+            }
+            let Some(r) = mappings
+                .iter()
+                .find(|r| off >= r.offset && off < r.offset + r.size as u64)
+            else {
+                break;
+            };
+            let n = (end.min(r.offset + r.size as u64) - off).min(PRECOPY_CHUNK as u64) as usize;
+            let dst = (r.base_host_virt_addr + (off - r.offset)) as *mut libc::c_void;
+            // SAFETY: `off + n` is within the region, and setup validated the overlay
+            // covers all guest memory.
+            let src = unsafe { overlay.addr.add(off as usize) }.cast::<libc::c_void>();
+            // SAFETY: `src` is within the overlay mmap and `dst` within a region registered
+            // with this UFFD, both for `n` bytes. Waking lets a vCPU already faulting on a
+            // copied page resume.
+            let res = unsafe { uffd.copy(src, dst, n, true) };
+            let step = match res {
+                Ok(c) => {
+                    copied += c / page_size;
+                    c.max(page_size)
+                }
+                // Stopped at a page the guest faulted in first; the next pass skips it.
+                Err(UffdCrateError::PartiallyCopied(c)) if c > 0 && c < n => {
+                    copied += c / page_size;
+                    c
+                }
+                Err(UffdCrateError::PartiallyCopied(_)) => {
+                    skipped += 1;
+                    page_size
+                }
+                Err(UffdCrateError::CopyFailed(errno))
+                    if std::io::Error::from(errno).raw_os_error() == Some(libc::EEXIST) =>
+                {
+                    skipped += 1;
+                    page_size
+                }
+                Err(UffdCrateError::CopyFailed(errno))
+                    if std::io::Error::from(errno).raw_os_error() == Some(libc::ENOENT) =>
+                {
+                    skipped += n / page_size;
+                    n
+                }
+                Err(e) => {
+                    log::warn!("uffd-precopy: UFFDIO_COPY failed, stopping: {e:?}");
+                    return (copied, skipped);
+                }
+            };
+            off += step as u64;
+        }
+    }
+    (copied, skipped)
 }
 
 struct SnapshotMmap {
@@ -1247,6 +1424,7 @@ pub fn config_from_paths(
     access_log_path: Option<&Path>,
     record_to: Option<&Path>,
     abort_on_handler_death: bool,
+    eager_overlay: bool,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
@@ -1254,6 +1432,7 @@ pub fn config_from_paths(
         access_log_path: access_log_path.map(Path::to_path_buf),
         record_to: record_to.map(Path::to_path_buf),
         abort_on_handler_death,
+        eager_overlay,
     }
 }
 
@@ -1626,6 +1805,84 @@ mod tests {
             // SAFETY: the page at `addr` was just installed by UFFDIO_COPY.
             let got = unsafe { *(addr as *const u8) };
             let want = if pg == 1 { 0xAA } else { 0xBB };
+            assert_eq!(got, want, "page {pg}");
+        }
+
+        // SAFETY: unmap the region we mapped above.
+        unsafe { libc::munmap(mem, total) };
+    }
+
+    #[test]
+    fn precopy_installs_overlay_pages_and_skips_ones_already_faulted() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ps = 4096usize;
+        let npages = 6usize;
+        let total = npages * ps;
+
+        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping precopy test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+        // SAFETY: standard anonymous mmap of `total` bytes; checked against MAP_FAILED.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+        uffd.register(mem, total).expect("register region");
+
+        // Overlay provides pages 1, 2, 3 and 5; the rest come from the base.
+        let dir = tempfile::tempdir().unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&ov_path).unwrap();
+        f.set_len(total as u64).unwrap();
+        for pg in [1u64, 2, 3, 5] {
+            f.seek(SeekFrom::Start(pg * ps as u64)).unwrap();
+            f.write_all(&vec![0xAAu8; ps]).unwrap();
+        }
+        f.sync_all().unwrap();
+        drop(f);
+        let runs = present_runs(&scan_present_pages(&ov_path, ps).unwrap(), ps, npages);
+        assert_eq!(runs, vec![(ps as u64, 3 * ps), (5 * ps as u64, ps)]);
+
+        // The guest already faulted page 2 in, with its own contents.
+        let other = vec![0xCCu8; ps];
+        // SAFETY: `other` is `ps` bytes; page 2 lies within the registered region.
+        unsafe {
+            uffd.copy(other.as_ptr().cast(), mem.cast::<u8>().add(2 * ps).cast(), ps, true)
+                .expect("fault page 2 in");
+        }
+
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: mem as u64,
+            size: total,
+            offset: 0,
+            page_size: ps,
+            page_size_kib: ps,
+        }];
+        let overlay = mmap_snapshot(&ov_path).unwrap();
+        let stop = AtomicBool::new(false);
+        assert_eq!(precopy(&uffd, &mappings, &overlay, &runs, ps, &stop), (3, 1));
+
+        // Pages 0 and 4 are left to the fault path: not resident, so never touched here.
+        let mut resident = vec![0u8; npages];
+        // SAFETY: `mem` is page-aligned and `resident` has one byte per page.
+        assert_eq!(unsafe { libc::mincore(mem, total, resident.as_mut_ptr()) }, 0);
+        let resident: Vec<bool> = resident.iter().map(|b| b & 1 == 1).collect();
+        assert_eq!(resident, vec![false, true, true, true, false, true]);
+        for (pg, want) in [(1, 0xAA), (2, 0xCC), (3, 0xAA), (5, 0xAA)] {
+            // SAFETY: the page is resident, installed by UFFDIO_COPY above.
+            let got = unsafe { *mem.cast::<u8>().add(pg * ps) };
             assert_eq!(got, want, "page {pg}");
         }
 
