@@ -34,13 +34,13 @@ use crate::vstate::memory::{self, GuestMemoryState, GuestRegionMmap, MemoryError
 const POLL_TIMEOUT_MS: i32 = 100;
 
 /// Largest single pre-copy. The fault handler copies one chunk at a time between
-/// faults, from pages already in the page cache, so this bounds how long a fault can
+/// faults, from memory the warmer already read, so this bounds how long a fault can
 /// wait behind it.
 const PRECOPY_CHUNK: usize = 1 << 20;
 
-/// Chunks the warmer may read ahead of the fault handler's copies, bounding the page
-/// cache it fills before the copies catch up.
-const PRECOPY_LOOKAHEAD: usize = 16;
+/// Chunks the warmer may read ahead of the fault handler's copies, bounding the
+/// memory its buffers hold at once.
+const PRECOPY_LOOKAHEAD: usize = 4;
 
 /// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
 /// observability; not used for synchronization, hence `Ordering::Relaxed` throughout.
@@ -442,11 +442,11 @@ fn present_runs(present: &PresenceBitmap, page_size: usize, npages: usize) -> Ve
 }
 
 /// Pre-copy as the fault handler runs it: chunks of the overlay the warmer has
-/// already read into the page cache, copied into guest memory only while no fault is
-/// waiting. Copying on the handler thread keeps it ordered with REMOVE handling, so
-/// no copy can land in a range the balloon is reclaiming.
+/// already read into memory of its own, copied into guest memory only while no fault
+/// is waiting. Copying on the handler thread keeps it ordered with REMOVE handling,
+/// so no copy can land in a range the balloon is reclaiming.
 struct Precopy {
-    chunks: mpsc::Receiver<(u64, usize)>,
+    chunks: mpsc::Receiver<(u64, Vec<u8>)>,
     ready: EventFd,
     copied: usize,
     skipped: usize,
@@ -469,14 +469,13 @@ impl Precopy {
         &mut self,
         uffd: &Uffd,
         mappings: &[GuestRegionUffdMapping],
-        overlay: &SnapshotMmap,
         page_size: usize,
     ) -> PrecopyStep {
         // Clear the signal before looking, so a chunk queued after this is signalled
         // again rather than missed.
         let _ = self.ready.read();
         let outcome = match self.chunks.try_recv() {
-            Ok(chunk) => match precopy(uffd, mappings, overlay, chunk, page_size) {
+            Ok((start, data)) => match precopy(uffd, mappings, start, &data, page_size) {
                 Some((copied, skipped)) => {
                     self.copied += copied;
                     self.skipped += skipped;
@@ -521,7 +520,7 @@ fn start_warmer(
                 return;
             }
             let runs = present_runs(&present, page_size, npages);
-            warm(&overlay, &runs, page_size, &tx, &signal, &stop_for_thread);
+            warm(&overlay, &runs, &tx, &signal, &stop_for_thread);
         })?;
     Ok((
         Precopy {
@@ -535,15 +534,15 @@ fn start_warmer(
     ))
 }
 
-/// Reads `runs` of the overlay into the page cache in chunks of at most
-/// [`PRECOPY_CHUNK`], handing each to the fault handler once it is resident, so the
-/// handler's copies never wait on the disk. Touches only the overlay mapping, never
-/// guest memory. Stops on `stop` or once the handler drops its end of the queue.
+/// Reads `runs` of the overlay into buffers of at most [`PRECOPY_CHUNK`] and hands
+/// each to the fault handler. The handler copies from the buffer, not the file, so
+/// its copies never wait on the disk even if the page cache is evicted meanwhile.
+/// Touches only the overlay mapping, never guest memory. Stops on `stop` or once the
+/// handler drops its end of the queue.
 fn warm(
     overlay: &SnapshotMmap,
     runs: &[(u64, usize)],
-    page_size: usize,
-    chunks: &mpsc::SyncSender<(u64, usize)>,
+    chunks: &mpsc::SyncSender<(u64, Vec<u8>)>,
     ready: &EventFd,
     stop: &AtomicBool,
 ) {
@@ -554,36 +553,35 @@ fn warm(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            let n = (end - off).min(PRECOPY_CHUNK as u64);
-            for page in (off..off + n).step_by(page_size) {
-                // SAFETY: `page` is within a run, and setup validated the overlay covers
-                // all guest memory.
-                unsafe { ptr::read_volatile(overlay.addr.add(page as usize)) };
-            }
-            if chunks.send((off, n as usize)).is_err() {
+            let n = (end - off).min(PRECOPY_CHUNK as u64) as usize;
+            // SAFETY: `off + n` is within a run, and setup validated the overlay covers
+            // all guest memory.
+            let data = unsafe { std::slice::from_raw_parts(overlay.addr.add(off as usize), n) };
+            if chunks.send((off, data.to_vec())).is_err() {
                 return;
             }
             let _ = ready.write(1);
-            off += n;
+            off += n as u64;
         }
     }
 }
 
-/// Copies one chunk of the overlay into guest memory, split at region boundaries. A
-/// page the guest already faulted in, or one in a range the balloon unregistered, is
-/// skipped on its own so the rest of the chunk is still copied. Returns (pages copied,
-/// pages skipped), or None when a copy failed in a way that ends the pre-copy.
+/// Copies one chunk of the overlay, `data` read from file offset `start`, into guest
+/// memory, split at region boundaries. A page the guest already faulted in, or one in
+/// a range the balloon unregistered, is skipped on its own so the rest of the chunk is
+/// still copied. Returns (pages copied, pages skipped), or None when a copy failed in
+/// a way that ends the pre-copy.
 fn precopy(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
-    overlay: &SnapshotMmap,
-    (start, len): (u64, usize),
+    start: u64,
+    data: &[u8],
     page_size: usize,
 ) -> Option<(usize, usize)> {
     let (mut copied, mut skipped) = (0, 0);
     // Copies before this offset go a page at a time; see the ENOENT arm.
     let mut single_until = 0u64;
-    let end = start + len as u64;
+    let end = start + data.len() as u64;
     let mut off = start;
     while off < end {
         let Some(r) = mappings
@@ -597,12 +595,10 @@ fn precopy(
             n = n.min(page_size);
         }
         let dst = (r.base_host_virt_addr + (off - r.offset)) as *mut libc::c_void;
-        // SAFETY: `off + n` is within the region, and setup validated the overlay
-        // covers all guest memory.
-        let src = unsafe { overlay.addr.add(off as usize) }.cast::<libc::c_void>();
-        // SAFETY: `src` is within the overlay mmap and `dst` within a region registered
-        // with this UFFD, both for `n` bytes. Waking lets a vCPU already faulting on a
-        // copied page resume.
+        let src = data[(off - start) as usize..].as_ptr().cast::<libc::c_void>();
+        // SAFETY: `src` is within `data` and `dst` within a region registered with this
+        // UFFD, both for `n` bytes. Waking lets a vCPU already faulting on a copied page
+        // resume.
         let res = unsafe { uffd.copy(src, dst, n, true) };
         let step = match res {
             Ok(c) => {
@@ -1130,7 +1126,7 @@ fn run(
 
         if pfds[0].revents == 0 {
             if let Some(p) = precopy.as_mut() {
-                match p.step(&uffd, &mappings, &backing.overlay, page_size) {
+                match p.step(&uffd, &mappings, page_size) {
                     PrecopyStep::Copied => {
                         precopy_queued = true;
                         continue;
@@ -2010,10 +2006,10 @@ mod tests {
         drop(f);
 
         let (first, last) = (100usize, 700usize);
-        let chunk = ((first * ps) as u64, (last - first) * ps);
-        let overlay = mmap_snapshot(&ov_path).unwrap();
+        let overlay = std::fs::read(&ov_path).unwrap();
+        let chunk = &overlay[first * ps..last * ps];
         assert_eq!(
-            precopy(&uffd, &mappings, &overlay, chunk, ps),
+            precopy(&uffd, &mappings, (first * ps) as u64, chunk, ps),
             Some((last - first, 0))
         );
 
@@ -2047,7 +2043,12 @@ mod tests {
         let ps = 4096usize;
         let npages = 3 * PRECOPY_CHUNK / ps + 5;
         let total = npages * ps;
-        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(true)
+            .create()
+        {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("skipping handler test: userfaultfd unavailable: {e:?}");
@@ -2148,7 +2149,8 @@ mod tests {
         let npages = chunk_pages * 2 + 8;
         let dir = tempfile::tempdir().unwrap();
         let ov_path = dir.path().join("mem.diff");
-        std::fs::write(&ov_path, vec![0xAAu8; npages * ps]).unwrap();
+        let contents: Vec<u8> = (0..npages).flat_map(|pg| vec![(pg % 251) as u8; ps]).collect();
+        std::fs::write(&ov_path, &contents).unwrap();
         let overlay = mmap_snapshot(&ov_path).unwrap();
         let ready = EventFd::new(EFD_NONBLOCK).unwrap();
         let stop = AtomicBool::new(false);
@@ -2156,9 +2158,14 @@ mod tests {
         // One run longer than two chunks, and a short one after a gap.
         let runs = vec![(0u64, (chunk_pages * 2 + 3) * ps), (((npages - 2) * ps) as u64, ps)];
         let (tx, rx) = mpsc::sync_channel(8);
-        warm(&overlay, &runs, ps, &tx, &ready, &stop);
+        warm(&overlay, &runs, &tx, &ready, &stop);
         drop(tx);
         let chunks: Vec<_> = rx.iter().collect();
+        for (start, data) in &chunks {
+            let at = *start as usize;
+            assert_eq!(data[..], contents[at..at + data.len()], "chunk at {start}");
+        }
+        let chunks: Vec<_> = chunks.iter().map(|(s, d)| (*s, d.len())).collect();
         assert_eq!(
             chunks,
             vec![
@@ -2172,7 +2179,7 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(8);
-        warm(&overlay, &runs, ps, &tx, &ready, &stop);
+        warm(&overlay, &runs, &tx, &ready, &stop);
         drop(tx);
         assert_eq!(rx.iter().count(), 0, "a stopped warmer hands over nothing");
     }
@@ -2207,10 +2214,6 @@ mod tests {
         let page5 = unsafe { mem.cast::<u8>().add(5 * ps) };
         uffd.unregister(page5.cast(), ps).unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
-        let ov_path = dir.path().join("mem.diff");
-        std::fs::write(&ov_path, vec![0xAAu8; total]).unwrap();
-        let overlay = mmap_snapshot(&ov_path).unwrap();
         #[allow(deprecated)]
         let mappings = vec![GuestRegionUffdMapping {
             base_host_virt_addr: mem as u64,
@@ -2221,7 +2224,7 @@ mod tests {
         }];
 
         assert_eq!(
-            precopy(&uffd, &mappings, &overlay, (0, total), ps),
+            precopy(&uffd, &mappings, 0, &vec![0xAAu8; total], ps),
             Some((npages - 1, 1))
         );
         let mut want = vec![true; npages];
@@ -2288,10 +2291,13 @@ mod tests {
             page_size: ps,
             page_size_kib: ps,
         }];
-        let overlay = mmap_snapshot(&ov_path).unwrap();
+        let overlay = std::fs::read(&ov_path).unwrap();
         let copies: Vec<_> = runs
             .iter()
-            .map(|&run| precopy(&uffd, &mappings, &overlay, run, ps))
+            .map(|&(start, len)| {
+                let at = start as usize;
+                precopy(&uffd, &mappings, start, &overlay[at..at + len], ps)
+            })
             .collect();
         assert_eq!(copies, vec![Some((2, 1)), Some((1, 0))]);
 
