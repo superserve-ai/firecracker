@@ -449,19 +449,6 @@
             },
             {
                 "syscall": "ioctl",
-                "comment": "Used by the in-process UFFD handler to wake a vCPU whose page a concurrent pre-copy already installed.",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 2148575746,
-                        "comment": "UFFDIO_WAKE"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,
