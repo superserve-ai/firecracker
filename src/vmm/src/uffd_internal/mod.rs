@@ -448,6 +448,8 @@ fn present_runs(present: &PresenceBitmap, page_size: usize, npages: usize) -> Ve
 struct Precopy {
     chunks: mpsc::Receiver<(u64, Vec<u8>)>,
     ready: EventFd,
+    /// A chunk that yielded partway, as (its start, its data, where to resume).
+    pending: Option<(u64, Vec<u8>, u64)>,
     copied: usize,
     skipped: usize,
     started: Instant,
@@ -474,18 +476,29 @@ impl Precopy {
         // Clear the signal before looking, so a chunk queued after this is signalled
         // again rather than missed.
         let _ = self.ready.read();
-        let outcome = match self.chunks.try_recv() {
-            Ok((start, data)) => match precopy(uffd, mappings, start, &data, page_size) {
-                Some((copied, skipped)) => {
-                    self.copied += copied;
-                    self.skipped += skipped;
-                    return PrecopyStep::Copied;
-                }
-                None => " (stopped)",
+        let (start, data, from) = match self.pending.take() {
+            Some(pending) => pending,
+            None => match self.chunks.try_recv() {
+                Ok((start, data)) => (start, data, start),
+                Err(TryRecvError::Empty) => return PrecopyStep::Idle,
+                Err(TryRecvError::Disconnected) => return self.finish(""),
             },
-            Err(TryRecvError::Empty) => return PrecopyStep::Idle,
-            Err(TryRecvError::Disconnected) => "",
         };
+        let rest = &data[(from - start) as usize..];
+        match precopy(uffd, mappings, from, rest, page_size) {
+            Some((copied, skipped, yielded_at)) => {
+                self.copied += copied;
+                self.skipped += skipped;
+                if let Some(at) = yielded_at {
+                    self.pending = Some((start, data, at));
+                }
+                PrecopyStep::Copied
+            }
+            None => self.finish(" (stopped)"),
+        }
+    }
+
+    fn finish(&self, outcome: &str) -> PrecopyStep {
         log::info!(
             "uffd-precopy: copied {} pages, skipped {}, in {} ms{outcome}",
             self.copied,
@@ -526,6 +539,7 @@ fn start_warmer(
         Precopy {
             chunks,
             ready,
+            pending: None,
             copied: 0,
             skipped: 0,
             started: Instant::now(),
@@ -569,15 +583,16 @@ fn warm(
 /// Copies one chunk of the overlay, `data` read from file offset `start`, into guest
 /// memory, split at region boundaries. A page the guest already faulted in, or one in
 /// a range the balloon unregistered, is skipped on its own so the rest of the chunk is
-/// still copied. Returns (pages copied, pages skipped), or None when a copy failed in
-/// a way that ends the pre-copy.
+/// still copied. Returns (pages copied, pages skipped, the offset it yielded at if a
+/// queued REMOVE stopped it), or None when a copy failed in a way that ends the
+/// pre-copy.
 fn precopy(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     start: u64,
     data: &[u8],
     page_size: usize,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, usize, Option<u64>)> {
     let (mut copied, mut skipped) = (0, 0);
     // Copies before this offset go a page at a time; see the ENOENT arm.
     let mut single_until = 0u64;
@@ -610,9 +625,10 @@ fn precopy(
                 copied += c / page_size;
                 c
             }
+            // A queued REMOVE refuses every copy until the handler loop drains it, which
+            // it cannot do while this chunk runs: yield, and resume here after.
             Err(UffdCrateError::PartiallyCopied(_)) => {
-                skipped += 1;
-                page_size
+                return Some((copied, skipped, Some(off)));
             }
             // A range the balloon unregistered splits the mapping, and a copy across
             // the split fails whole: retry this chunk a page at a time.
@@ -639,7 +655,7 @@ fn precopy(
         };
         off += step as u64;
     }
-    Some((copied, skipped))
+    Some((copied, skipped, None))
 }
 
 struct SnapshotMmap {
@@ -2010,7 +2026,7 @@ mod tests {
         let chunk = &overlay[first * ps..last * ps];
         assert_eq!(
             precopy(&uffd, &mappings, (first * ps) as u64, chunk, ps),
-            Some((last - first, 0))
+            Some((last - first, 0, None))
         );
 
         for (i, &mem) in regions.iter().enumerate() {
@@ -2225,11 +2241,83 @@ mod tests {
 
         assert_eq!(
             precopy(&uffd, &mappings, 0, &vec![0xAAu8; total], ps),
-            Some((npages - 1, 1))
+            Some((npages - 1, 1, None))
         );
         let mut want = vec![true; npages];
         want[5] = false;
         assert_eq!(resident_pages(mem, npages), want);
+        // SAFETY: unmap the region mapped above.
+        unsafe { libc::munmap(mem, total) };
+    }
+
+    #[test]
+    fn precopy_yields_to_a_queued_remove_and_resumes_after_it() {
+        let ps = 4096usize;
+        let npages = 4usize;
+        let total = npages * ps;
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(true)
+            .require_features(FeatureFlags::EVENT_REMOVE)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping precopy test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+        // SAFETY: standard anonymous mmap of `total` bytes; checked against MAP_FAILED.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+        uffd.register(mem, total).expect("register region");
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: mem as u64,
+            size: total,
+            offset: 0,
+            page_size: ps,
+            page_size_kib: ps,
+        }];
+
+        // As the balloon does: discard the last page. The madvise waits until its
+        // REMOVE is read, and copies are refused until then.
+        let last = mem as usize + (npages - 1) * ps;
+        let balloon = thread::spawn(move || {
+            // SAFETY: the page lies within the region mapped above.
+            unsafe { libc::madvise(last as *mut libc::c_void, ps, libc::MADV_DONTNEED) }
+        });
+        let mut pfd = [libc::pollfd {
+            fd: uffd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: pfd is a single-element array on this stack frame.
+        assert_eq!(unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) }, 1, "REMOVE queued");
+
+        let data = vec![0xAAu8; total];
+        assert_eq!(
+            precopy(&uffd, &mappings, 0, &data, ps),
+            Some((0, 0, Some(0))),
+            "a queued REMOVE makes the copy yield, not skip"
+        );
+        assert!(matches!(uffd.read_event(), Ok(Some(Event::Remove { .. }))));
+        assert_eq!(balloon.join().unwrap(), 0);
+        assert_eq!(
+            precopy(&uffd, &mappings, 0, &data, ps),
+            Some((npages, 0, None)),
+            "once drained, the same chunk copies in full"
+        );
         // SAFETY: unmap the region mapped above.
         unsafe { libc::munmap(mem, total) };
     }
@@ -2299,7 +2387,7 @@ mod tests {
                 precopy(&uffd, &mappings, start, &overlay[at..at + len], ps)
             })
             .collect();
-        assert_eq!(copies, vec![Some((2, 1)), Some((1, 0))]);
+        assert_eq!(copies, vec![Some((2, 1, None)), Some((1, 0, None))]);
 
         // Pages 0 and 4 are left to the fault path: not resident, so never touched here.
         assert_eq!(
