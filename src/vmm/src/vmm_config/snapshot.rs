@@ -188,10 +188,14 @@ pub struct MemBackendConfig {
     #[serde(default)]
     pub abort_on_handler_death: bool,
     /// Path to a recorded page-access trace to replay as prefetch. Only meaningful for
-    /// `UffdInternal`; ignored otherwise. Absent or unreadable → fall back to sequential
-    /// prefetch.
+    /// `UffdInternal`; ignored otherwise. Absent or unreadable → no prefetch.
     #[serde(default)]
     pub access_log_path: Option<PathBuf>,
+    /// Copy every page the overlay provides into guest memory on a background thread
+    /// after load. Only meaningful for a layered `UffdInternal` restore (`base_path`
+    /// set); ignored otherwise.
+    #[serde(default)]
+    pub eager_overlay: bool,
     /// If set, the internal UFFD handler will write each served page offset to this path
     /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
     /// otherwise. When present, prefetch is disabled so the captured trace reflects the

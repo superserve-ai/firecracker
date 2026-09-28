@@ -51,10 +51,13 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `CreateSnapshot` accepts `expected_session_id`/`expected_generation`. Both
 /// bodies deny unknown fields, so a supervisor must probe for this before
 /// sending them.
+/// eager-overlay: `LoadSnapshot` accepts `mem_backend.eager_overlay`, under the
+/// same deny-unknown-fields rule.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",
     "dirty-tracking-session",
+    "eager-overlay",
 ];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
