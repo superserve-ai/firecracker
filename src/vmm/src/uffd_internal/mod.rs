@@ -300,8 +300,12 @@ pub fn setup(
         }
         None => (None, None),
     };
+    // Recording suppresses pre-copy as it does prefetch: a pre-copied page never
+    // faults, so the trace would miss it.
     let precopy_runs = match &present {
-        Some(p) if cfg.eager_overlay => present_runs(p, page_size, total_mem as usize / page_size),
+        Some(p) if cfg.eager_overlay && cfg.record_to.is_none() => {
+            present_runs(p, page_size, total_mem as usize / page_size)
+        }
         _ => Vec::new(),
     };
     let backing = Backing {
@@ -482,7 +486,8 @@ fn spawn_precopy(
 
 /// Copies `runs` of the overlay into guest memory in chunks of at most
 /// [`PRECOPY_CHUNK`]. A page the guest already faulted in, or one in a range the
-/// balloon unregistered, is skipped. Returns (pages copied, pages skipped).
+/// balloon unregistered, is skipped on its own so the rest of its chunk is still
+/// copied. Returns (pages copied, pages skipped).
 fn precopy(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
@@ -529,16 +534,13 @@ fn precopy(
                     page_size
                 }
                 Err(UffdCrateError::CopyFailed(errno))
-                    if std::io::Error::from(errno).raw_os_error() == Some(libc::EEXIST) =>
+                    if matches!(
+                        std::io::Error::from(errno).raw_os_error(),
+                        Some(libc::EEXIST | libc::ENOENT)
+                    ) =>
                 {
                     skipped += 1;
                     page_size
-                }
-                Err(UffdCrateError::CopyFailed(errno))
-                    if std::io::Error::from(errno).raw_os_error() == Some(libc::ENOENT) =>
-                {
-                    skipped += n / page_size;
-                    n
                 }
                 Err(e) => {
                     log::warn!("uffd-precopy: UFFDIO_COPY failed, stopping: {e:?}");
@@ -1813,6 +1815,119 @@ mod tests {
     }
 
     #[test]
+    fn present_runs_merges_adjacent_pages_across_words_and_stops_at_npages() {
+        let mut pm = PresenceBitmap::with_pages(256);
+        for pg in [1, 2, 3, 5, 200, 250] {
+            pm.set(pg);
+        }
+        for pg in 60..=130 {
+            pm.set(pg);
+        }
+        // Page 250 is past npages; word 3 is empty and skipped whole.
+        let ps = 4096usize;
+        assert_eq!(
+            present_runs(&pm, ps, 201),
+            vec![
+                (ps as u64, 3 * ps),
+                (5 * ps as u64, ps),
+                (60 * ps as u64, 71 * ps),
+                (200 * ps as u64, ps),
+            ]
+        );
+        assert!(present_runs(&PresenceBitmap::with_pages(256), ps, 256).is_empty());
+    }
+
+    #[test]
+    fn precopy_splits_a_run_at_chunks_and_region_boundaries() {
+        use std::io::Write;
+        let ps = 4096usize;
+        let region_pages = 384usize; // 1.5 MiB: a run crosses both a chunk and a region
+        let region_len = region_pages * ps;
+
+        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping precopy test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+        // Two separate guest regions, so file offsets and host addresses diverge
+        // at the boundary.
+        let regions: Vec<*mut libc::c_void> = (0..2)
+            .map(|_| {
+                // SAFETY: standard anonymous mmap; checked against MAP_FAILED.
+                let mem = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        region_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+                uffd.register(mem, region_len).expect("register region");
+                mem
+            })
+            .collect();
+        #[allow(deprecated)]
+        let mappings: Vec<GuestRegionUffdMapping> = regions
+            .iter()
+            .enumerate()
+            .map(|(i, &mem)| GuestRegionUffdMapping {
+                base_host_virt_addr: mem as u64,
+                size: region_len,
+                offset: (i * region_len) as u64,
+                page_size: ps,
+                page_size_kib: ps,
+            })
+            .collect();
+
+        // Every page of the overlay carries its own index, so a page copied to the
+        // wrong place is caught.
+        let dir = tempfile::tempdir().unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        let mut f = std::fs::File::create(&ov_path).unwrap();
+        for pg in 0..2 * region_pages {
+            f.write_all(&vec![(pg % 251) as u8; ps]).unwrap();
+        }
+        f.sync_all().unwrap();
+        drop(f);
+
+        let (first, last) = (100usize, 700usize);
+        let runs = vec![((first * ps) as u64, (last - first) * ps)];
+        let overlay = mmap_snapshot(&ov_path).unwrap();
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            precopy(&uffd, &mappings, &overlay, &runs, ps, &stop),
+            (last - first, 0)
+        );
+
+        for (i, &mem) in regions.iter().enumerate() {
+            let mut resident = vec![0u8; region_pages];
+            // SAFETY: `mem` is page-aligned and `resident` has one byte per page.
+            assert_eq!(
+                unsafe { libc::mincore(mem, region_len, resident.as_mut_ptr()) },
+                0
+            );
+            for (j, r) in resident.iter().enumerate() {
+                let pg = i * region_pages + j;
+                assert_eq!(r & 1 == 1, (first..last).contains(&pg), "residency of page {pg}");
+                if (first..last).contains(&pg) {
+                    // SAFETY: the page is resident, installed by UFFDIO_COPY above.
+                    let got = unsafe { *mem.cast::<u8>().add(j * ps) };
+                    assert_eq!(got, (pg % 251) as u8, "contents of page {pg}");
+                }
+            }
+        }
+        for mem in regions {
+            // SAFETY: unmap the regions mapped above.
+            unsafe { libc::munmap(mem, region_len) };
+        }
+    }
+
+    #[test]
     fn precopy_installs_overlay_pages_and_skips_ones_already_faulted() {
         use std::io::{Seek, SeekFrom, Write};
         let ps = 4096usize;
@@ -1852,7 +1967,6 @@ mod tests {
         f.sync_all().unwrap();
         drop(f);
         let runs = present_runs(&scan_present_pages(&ov_path, ps).unwrap(), ps, npages);
-        assert_eq!(runs, vec![(ps as u64, 3 * ps), (5 * ps as u64, ps)]);
 
         // The guest already faulted page 2 in, with its own contents.
         let other = vec![0xCCu8; ps];
@@ -1877,7 +1991,10 @@ mod tests {
         // Pages 0 and 4 are left to the fault path: not resident, so never touched here.
         let mut resident = vec![0u8; npages];
         // SAFETY: `mem` is page-aligned and `resident` has one byte per page.
-        assert_eq!(unsafe { libc::mincore(mem, total, resident.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::mincore(mem, total, resident.as_mut_ptr()) },
+            0
+        );
         let resident: Vec<bool> = resident.iter().map(|b| b & 1 == 1).collect();
         assert_eq!(resident, vec![false, true, true, true, false, true]);
         for (pg, want) in [(1, 0xAA), (2, 0xCC), (3, 0xAA), (5, 0xAA)] {
