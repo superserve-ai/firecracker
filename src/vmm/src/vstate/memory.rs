@@ -29,6 +29,12 @@ use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::VmError;
 use crate::{DirtyBitmap, Vm};
 
+/// Share of plugged pages above which a diff is written densely — every page
+/// in one sequential pass — instead of one scattered write per dirty run. A
+/// nearly-all-dirty diff written sparsely is hundreds of thousands of small
+/// writes; the same bytes in order are a handful of large ones.
+const DENSE_DIFF_THRESHOLD_PERCENT: usize = 50;
+
 /// Type of GuestRegionMmap.
 pub type GuestRegionMmap = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
 /// Type of GuestMemoryMmap.
@@ -680,6 +686,68 @@ impl GuestMemoryState {
     }
 }
 
+/// Whether `dirty_bitmap` marks more than the dense threshold of the plugged
+/// pages. A bitmap that does not match the slots is left to `dump_dirty`,
+/// which reports the mismatch.
+fn dense_diff_wanted(mem: &GuestMemoryMmap, dirty_bitmap: &DirtyBitmap, page_size: usize) -> bool {
+    let mut dirty_pages = 0usize;
+    let mut plugged_pages = 0usize;
+    for (mem_slot, plugged) in mem.iter().flat_map(|region| region.slots()) {
+        if !plugged {
+            continue;
+        }
+        let pages = mem_slot.slice.len() / page_size;
+        let Some(words) = dirty_bitmap.get(&mem_slot.slot) else {
+            return false;
+        };
+        if words.len() != pages.div_ceil(64) {
+            return false;
+        }
+        for (i, word) in words.iter().enumerate() {
+            let valid = pages.saturating_sub(i * 64).min(64);
+            let mask = if valid == 64 {
+                u64::MAX
+            } else {
+                (1u64 << valid) - 1
+            };
+            if word & !mask != 0 {
+                return false;
+            }
+            dirty_pages += (word & mask).count_ones() as usize;
+        }
+        plugged_pages += pages;
+    }
+    dirty_pages * 100 > plugged_pages * DENSE_DIFF_THRESHOLD_PERCENT
+}
+
+/// Writes every plugged page in one sequential pass and reports them all as
+/// present, with the same bitmap bookkeeping as the sparse path.
+fn dump_dense<T: WriteVolatile + std::io::Seek>(
+    mem: &GuestMemoryMmap,
+    writer: &mut T,
+    dirty_bitmap: &DirtyBitmap,
+    page_size: usize,
+    total_len: usize,
+) -> Result<Vec<u64>, MemoryError> {
+    if let Err(err) = mem.dump(writer) {
+        mem.store_dirty_bitmap(dirty_bitmap, page_size);
+        return Err(err);
+    }
+    let mut dumped_pages = vec![0u64; (total_len / page_size).div_ceil(64)];
+    let mut file_page = 0usize;
+    for (mem_slot, plugged) in mem.iter().flat_map(|region| region.slots()) {
+        let pages = mem_slot.slice.len() / page_size;
+        if plugged {
+            for page in file_page..file_page + pages {
+                dumped_pages[page >> 6] |= 1u64 << (page & 63);
+            }
+        }
+        file_page += pages;
+    }
+    mem.reset_dirty();
+    Ok(dumped_pages)
+}
+
 impl GuestMemoryExtension for GuestMemoryMmap {
     /// Describes GuestMemoryMmap through a GuestMemoryState struct.
     fn describe(&self) -> GuestMemoryState {
@@ -731,6 +799,9 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             .flat_map(|region| region.slots())
             .map(|(mem_slot, _)| mem_slot.slice.len())
             .sum();
+        if dense_diff_wanted(self, dirty_bitmap, page_size) {
+            return dump_dense(self, writer, dirty_bitmap, page_size, total_len);
+        }
         let mut dumped_pages = vec![0u64; (total_len / page_size).div_ceil(64)];
 
         let mut file_offset = 0usize;
@@ -1347,6 +1418,76 @@ mod tests {
             guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
+    }
+
+    #[test]
+    fn test_dump_dirty_dense() {
+        let page_size = get_page_size().unwrap();
+
+        // Two regions of two pages each, with a one page gap between them.
+        let region_1_address = GuestAddress(0);
+        let region_2_address = GuestAddress(page_size as u64 * 3);
+        let region_size = page_size * 2;
+        let mem_regions = [
+            (region_1_address, region_size),
+            (region_2_address, region_size),
+        ];
+        let guest_memory = into_region_ext(
+            anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
+        );
+        let first_region = vec![1u8; region_size];
+        guest_memory.write(&first_region, region_1_address).unwrap();
+        let second_region = vec![2u8; region_size];
+        guest_memory
+            .write(&second_region, region_2_address)
+            .unwrap();
+        let memory_state = guest_memory.describe();
+        guest_memory.reset_dirty();
+
+        // Three of four pages dirty in KVM's view: above the dense threshold, so
+        // every page is written in order and reported present, including the
+        // clean one.
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![0b11]);
+        kvm_dirty_bitmap.insert(1, vec![0b01]);
+
+        let mut file = TempFile::new().unwrap().into_file();
+        let dumped = guest_memory
+            .dump_dirty(&mut file, &kvm_dirty_bitmap)
+            .unwrap();
+        assert_eq!(dumped, vec![0b1111]);
+
+        let mut file_content = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut file_content).unwrap();
+        assert_eq!(
+            file_content,
+            [first_region.as_slice(), second_region.as_slice()].concat()
+        );
+
+        let restored_guest_memory =
+            into_region_ext(snapshot_file(file, memory_state.regions(), false).unwrap());
+        let mut restored_region = vec![0u8; region_size];
+        restored_guest_memory
+            .read(restored_region.as_mut_slice(), region_1_address)
+            .unwrap();
+        assert_eq!(first_region, restored_region);
+        restored_guest_memory
+            .read(restored_region.as_mut_slice(), region_2_address)
+            .unwrap();
+        assert_eq!(second_region, restored_region);
+
+        // Exactly half dirty is not above the threshold: the sparse path keeps
+        // the clean pages as holes.
+        let file = TempFile::new().unwrap();
+        let mut reader = file.into_file();
+        guest_memory.reset_dirty();
+        kvm_dirty_bitmap.insert(0, vec![0b01]);
+        kvm_dirty_bitmap.insert(1, vec![0b10]);
+        let dumped = guest_memory
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .unwrap();
+        assert_eq!(dumped, vec![0b1001]);
     }
 
     #[test]
