@@ -52,9 +52,10 @@ const SKIP_ZERO_BLOCK: u64 = 2 << 20;
 /// mapping, so past this the restore registers whole regions as before.
 const SKIP_ZERO_MAX_RANGES: usize = 256;
 
-/// Most data extents scanned for zero holes, bounding the restore-time cost of a
-/// heavily fragmented file. Past this the restore registers whole regions.
-const SKIP_ZERO_MAX_EXTENTS: usize = 1024;
+/// Most data extents scanned for zero holes: two seeks each on the restore path. A
+/// template built with block-aligned holes has a handful; past this the restore
+/// registers whole regions.
+const SKIP_ZERO_MAX_EXTENTS: usize = 64;
 
 /// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
 /// observability; not used for synchronization, hence `Ordering::Relaxed` throughout.
@@ -332,24 +333,28 @@ pub fn setup(
     // optimization only: if the scan fails, the restore registers whole regions.
     let ranges = if cfg.skip_zero_holes && cfg.record_to.is_none() {
         let zero_src = cfg.base_path.as_deref().unwrap_or(&cfg.snapshot_path);
-        match nonzero_ranges(zero_src, total_mem, present.as_deref(), page_size) {
+        let started = Instant::now();
+        let ranges = match nonzero_ranges(zero_src, total_mem, present.as_deref(), page_size) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("uffd-internal: zero-hole scan of {zero_src:?} failed: {e}");
                 None
             }
+        };
+        let scan_us = started.elapsed().as_micros();
+        match &ranges {
+            Some(r) => log::info!(
+                "uffd-internal: registered {} of {total_mem} bytes in {} ranges, scan {scan_us} us",
+                r.iter().map(|(s, e)| e - s).sum::<u64>(),
+                r.len()
+            ),
+            None => log::info!("uffd-internal: registering all of guest memory, scan {scan_us} us"),
         }
+        ranges
     } else {
         None
     };
     register_ranges(&uffd, &mappings, ranges.as_deref())?;
-    if let Some(r) = &ranges {
-        let registered: u64 = r.iter().map(|(s, e)| e - s).sum();
-        log::info!(
-            "uffd-internal: registered {registered} of {total_mem} bytes in {} ranges",
-            r.len()
-        );
-    }
     // Recording suppresses pre-copy as it does prefetch: a pre-copied page never
     // faults, so the trace would miss it. An optimization only: if the warmer cannot
     // start, the guest still faults its pages in.
@@ -2194,11 +2199,11 @@ mod tests {
         for (off, want, _) in cases {
             assert_eq!(read(off), want, "byte at offset {off:#x}");
         }
-        let served = cases.iter().filter(|c| c.2).count() as u64;
-        assert_eq!(stats.snapshot().faults_served, served, "only registered pages fault");
-
         shutdown_tx.send(()).unwrap();
         assert_eq!(handler.join().unwrap(), HandlerExit::Clean);
+        // Read after the join: the copy wakes the reader before the counter moves.
+        let served = cases.iter().filter(|c| c.2).count() as u64;
+        assert_eq!(stats.snapshot().faults_served, served, "only registered pages fault");
         for mem in regions {
             // SAFETY: unmap the regions mapped above.
             unsafe { libc::munmap(mem, region) };
