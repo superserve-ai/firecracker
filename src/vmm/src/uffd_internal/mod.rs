@@ -333,8 +333,9 @@ pub fn setup(
     // optimization only: if the scan fails, the restore registers whole regions.
     let ranges = if cfg.skip_zero_holes && cfg.record_to.is_none() {
         let zero_src = cfg.base_path.as_deref().unwrap_or(&cfg.snapshot_path);
+        let mapped = base.as_ref().unwrap_or(&overlay);
         let started = Instant::now();
-        let ranges = match nonzero_ranges(zero_src, total_mem, present.as_deref(), page_size) {
+        let ranges = match nonzero_ranges(mapped, total_mem, present.as_deref(), page_size) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("uffd-internal: zero-hole scan of {zero_src:?} failed: {e}");
@@ -468,18 +469,18 @@ pub fn setup(
 
 /// File-offset ranges, sorted and disjoint, whose restored contents may be non-zero:
 /// every [`SKIP_ZERO_BLOCK`] holding a page the overlay provides or data in
-/// `zero_src`, the file that backs every other page. A page outside them is absent
-/// from the overlay and a hole in `zero_src`, so it reads as zero. None when the
+/// `mapped`, the file that backs every other page. A page outside them is absent
+/// from the overlay and a hole in `mapped`, so it reads as zero. None when the
 /// file is too fragmented or short to tell, or the ranges would exceed the cap.
 fn nonzero_ranges(
-    zero_src: &Path,
+    mapped: &SnapshotMmap,
     total_mem: u64,
     present: Option<&PresenceBitmap>,
     page_size: usize,
 ) -> std::io::Result<Option<Vec<(u64, u64)>>> {
-    let file = std::fs::File::open(zero_src)?;
+    let file = &mapped.file;
     // Past EOF the handler would fault on the mmap, not read zeros.
-    if file.metadata()?.len() < total_mem {
+    if (mapped.size as u64) < total_mem {
         return Ok(None);
     }
     let mut blocks = vec![false; total_mem.div_ceil(SKIP_ZERO_BLOCK) as usize];
@@ -496,7 +497,7 @@ fn nonzero_ranges(
         }
     }
     let mut extents = 0;
-    let scan = crate::utils::sparse::try_for_each_data_extent(&file, total_mem, |s, e| {
+    let scan = crate::utils::sparse::try_for_each_data_extent(file, total_mem, |s, e| {
         extents += 1;
         if extents > SKIP_ZERO_MAX_EXTENTS {
             return ControlFlow::Break(());
@@ -794,6 +795,9 @@ fn precopy(
 struct SnapshotMmap {
     addr: *const u8,
     size: usize,
+    // The mapped inode, so a hole scan reads the same file the mapping serves even
+    // if the path is replaced after the mmap.
+    file: std::fs::File,
 }
 
 // SAFETY: the mapping is read-only and owned exclusively by the handler thread; no
@@ -836,6 +840,7 @@ fn mmap_snapshot(path: &Path) -> std::io::Result<SnapshotMmap> {
     Ok(SnapshotMmap {
         addr: addr.cast(),
         size,
+        file,
     })
 }
 
@@ -2107,7 +2112,8 @@ mod tests {
         pm.set(ov_page);
         let present = Arc::new(pm);
 
-        let ranges = nonzero_ranges(&base_path, total as u64, Some(&present), ps)
+        let base_map = mmap_snapshot(&base_path).unwrap();
+        let ranges = nonzero_ranges(&base_map, total as u64, Some(&present), ps)
             .unwrap()
             .expect("ranges within the caps");
         assert_eq!(ranges, vec![(0, block as u64), (2 * block as u64, total as u64)]);
@@ -2215,13 +2221,16 @@ mod tests {
         let ps = 4096u64;
         let block = SKIP_ZERO_BLOCK;
         let dir = tempfile::tempdir().unwrap();
+        let ranges = |path: &Path, total: u64| {
+            nonzero_ranges(&mmap_snapshot(path).unwrap(), total, None, ps as usize)
+        };
 
         // One data page in every other block needs more ranges than the cap.
         let blocks = 2 * SKIP_ZERO_MAX_RANGES as u64 + 2;
         let spread = dir.path().join("spread");
         let data: Vec<_> = (0..blocks).step_by(2).map(|b| (b * block, ps as usize, 1u8)).collect();
         sparse_file(&spread, blocks * block, &data);
-        assert_eq!(nonzero_ranges(&spread, blocks * block, None, ps as usize).unwrap(), None);
+        assert_eq!(ranges(&spread, blocks * block).unwrap(), None);
 
         // More extents than the scan bound, all inside a single block.
         let extents = SKIP_ZERO_MAX_EXTENTS as u64 + 1;
@@ -2229,12 +2238,12 @@ mod tests {
         let len = (2 * extents * ps).div_ceil(block) * block;
         let data: Vec<_> = (0..extents).map(|i| (2 * i * ps, ps as usize, 1u8)).collect();
         sparse_file(&frag, len, &data);
-        assert_eq!(nonzero_ranges(&frag, len, None, ps as usize).unwrap(), None);
+        assert_eq!(ranges(&frag, len).unwrap(), None);
 
         // A file shorter than guest memory cannot vouch for the pages past its end.
         let short = dir.path().join("short");
         sparse_file(&short, block, &[]);
-        assert_eq!(nonzero_ranges(&short, 2 * block, None, ps as usize).unwrap(), None);
+        assert_eq!(ranges(&short, 2 * block).unwrap(), None);
     }
 
     #[test]
