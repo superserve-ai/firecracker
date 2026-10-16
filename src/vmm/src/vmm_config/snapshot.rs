@@ -196,6 +196,11 @@ pub struct MemBackendConfig {
     /// set); ignored otherwise.
     #[serde(default)]
     pub eager_overlay: bool,
+    /// Leave unregistered every page absent from the overlay and a hole in the file
+    /// backing it, so the kernel zero-fills it instead of the handler copying zeros.
+    /// Only meaningful for `UffdInternal`; ignored otherwise.
+    #[serde(default)]
+    pub skip_zero_holes: bool,
     /// If set, the internal UFFD handler will write each served page offset to this path
     /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
     /// otherwise. When present, prefetch is disabled so the captured trace reflects the

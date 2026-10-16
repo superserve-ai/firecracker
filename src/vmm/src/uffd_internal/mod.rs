@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,19 @@ const PRECOPY_CHUNK: usize = 1 << 20;
 /// Chunks the warmer may read ahead of the fault handler's copies, bounding the
 /// memory its buffers hold at once.
 const PRECOPY_LOOKAHEAD: usize = 4;
+
+/// Granularity of the ranges registered when zero holes are skipped. A block is
+/// registered whole if any page in it may hold data, which bounds the range count by
+/// guest RAM / 2 MiB.
+const SKIP_ZERO_BLOCK: u64 = 2 << 20;
+
+/// Most ranges registered when zero holes are skipped. Each one splits the guest
+/// mapping, so past this the restore registers whole regions as before.
+const SKIP_ZERO_MAX_RANGES: usize = 256;
+
+/// Most data extents scanned for zero holes, bounding the restore-time cost of a
+/// heavily fragmented file. Past this the restore registers whole regions.
+const SKIP_ZERO_MAX_EXTENTS: usize = 1024;
 
 /// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
 /// observability; not used for synchronization, hence `Ordering::Relaxed` throughout.
@@ -121,6 +135,10 @@ pub struct Config {
     /// Layered restore only: copy every page the overlay provides into guest memory
     /// ahead of the guest, so it does not fault on them one page at a time.
     pub eager_overlay: bool,
+    /// Leave unregistered every page that is absent from the overlay and a hole in the
+    /// file backing it (the base when layered, else the snapshot itself), so the
+    /// kernel zero-fills it instead of the handler copying zeros.
+    pub skip_zero_holes: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -236,8 +254,6 @@ pub fn setup(
     let mut mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0u64;
     for region in guest_memory.iter() {
-        uffd.register(region.as_ptr().cast(), region.size())
-            .map_err(InternalUffdError::Register)?;
         #[allow(deprecated)]
         mappings.push(GuestRegionUffdMapping {
             base_host_virt_addr: region.as_ptr() as u64,
@@ -312,6 +328,28 @@ pub fn setup(
         }
         None => (None, None),
     };
+    // Recording registers everything so the trace sees every first touch. An
+    // optimization only: if the scan fails, the restore registers whole regions.
+    let ranges = if cfg.skip_zero_holes && cfg.record_to.is_none() {
+        let zero_src = cfg.base_path.as_deref().unwrap_or(&cfg.snapshot_path);
+        match nonzero_ranges(zero_src, total_mem, present.as_deref(), page_size) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("uffd-internal: zero-hole scan of {zero_src:?} failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    register_ranges(&uffd, &mappings, ranges.as_deref())?;
+    if let Some(r) = &ranges {
+        let registered: u64 = r.iter().map(|(s, e)| e - s).sum();
+        log::info!(
+            "uffd-internal: registered {registered} of {total_mem} bytes in {} ranges",
+            r.len()
+        );
+    }
     // Recording suppresses pre-copy as it does prefetch: a pre-copied page never
     // faults, so the trace would miss it. An optimization only: if the warmer cannot
     // start, the guest still faults its pages in.
@@ -340,7 +378,7 @@ pub fn setup(
 
     // Recording disables prefetch so the captured trace reflects guest-driven access
     // order instead of pages pulled in by the prefetcher.
-    let prefetch_offsets = if cfg.record_to.is_some() {
+    let mut prefetch_offsets = if cfg.record_to.is_some() {
         Vec::new()
     } else {
         cfg.access_log_path
@@ -348,6 +386,10 @@ pub fn setup(
             .map(|p| load_prefetch_offsets(p, page_size))
             .unwrap_or_default()
     };
+    // A copy into an unregistered page fails, and prefetch logs each failure.
+    if let Some(r) = &ranges {
+        prefetch_offsets.retain(|&off| in_ranges(r, off));
+    }
     let recorder = match cfg.record_to.as_deref() {
         Some(path) => Some(Recorder::create(path).map_err(InternalUffdError::OpenRecorder)?),
         None => None,
@@ -417,6 +459,92 @@ pub fn setup(
             warmer,
         },
     ))
+}
+
+/// File-offset ranges, sorted and disjoint, whose restored contents may be non-zero:
+/// every [`SKIP_ZERO_BLOCK`] holding a page the overlay provides or data in
+/// `zero_src`, the file that backs every other page. A page outside them is absent
+/// from the overlay and a hole in `zero_src`, so it reads as zero. None when the
+/// file is too fragmented or short to tell, or the ranges would exceed the cap.
+fn nonzero_ranges(
+    zero_src: &Path,
+    total_mem: u64,
+    present: Option<&PresenceBitmap>,
+    page_size: usize,
+) -> std::io::Result<Option<Vec<(u64, u64)>>> {
+    let file = std::fs::File::open(zero_src)?;
+    // Past EOF the handler would fault on the mmap, not read zeros.
+    if file.metadata()?.len() < total_mem {
+        return Ok(None);
+    }
+    let mut blocks = vec![false; total_mem.div_ceil(SKIP_ZERO_BLOCK) as usize];
+    let mut mark = |start: u64, end: u64| {
+        for b in start / SKIP_ZERO_BLOCK..end.min(total_mem).div_ceil(SKIP_ZERO_BLOCK) {
+            blocks[b as usize] = true;
+        }
+    };
+    if let Some(p) = present {
+        for (w, &word) in p.bits.iter().enumerate().filter(|(_, w)| **w != 0) {
+            let first = (w * 64) as u64 + u64::from(word.trailing_zeros());
+            let last = (w * 64 + 64) as u64 - u64::from(word.leading_zeros());
+            mark(first * page_size as u64, last * page_size as u64);
+        }
+    }
+    let mut extents = 0;
+    let scan = crate::utils::sparse::try_for_each_data_extent(&file, total_mem, |s, e| {
+        extents += 1;
+        if extents > SKIP_ZERO_MAX_EXTENTS {
+            return ControlFlow::Break(());
+        }
+        mark(s, e);
+        ControlFlow::Continue(())
+    })?;
+    if scan.is_break() {
+        return Ok(None);
+    }
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (b, _) in blocks.iter().enumerate().filter(|(_, on)| **on) {
+        let start = b as u64 * SKIP_ZERO_BLOCK;
+        let end = (start + SKIP_ZERO_BLOCK).min(total_mem);
+        if let Some(last) = ranges.last_mut() {
+            if last.1 == start {
+                last.1 = end;
+                continue;
+            }
+        }
+        if ranges.len() == SKIP_ZERO_MAX_RANGES {
+            return Ok(None);
+        }
+        ranges.push((start, end));
+    }
+    Ok(Some(ranges))
+}
+
+/// Registers the parts of each region inside `ranges` (file offsets), or every
+/// region whole when there are none.
+fn register_ranges(
+    uffd: &Uffd,
+    mappings: &[GuestRegionUffdMapping],
+    ranges: Option<&[(u64, u64)]>,
+) -> Result<(), InternalUffdError> {
+    for m in mappings {
+        let (rs, re) = (m.offset, m.offset + m.size as u64);
+        let whole = [(rs, re)];
+        for &(s, e) in ranges.unwrap_or(&whole) {
+            let (s, e) = (s.max(rs), e.min(re));
+            if s < e {
+                let addr = (m.base_host_virt_addr + (s - rs)) as *mut libc::c_void;
+                uffd.register(addr, (e - s) as usize)
+                    .map_err(InternalUffdError::Register)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn in_ranges(ranges: &[(u64, u64)], off: u64) -> bool {
+    let i = ranges.partition_point(|&(_, e)| e <= off);
+    ranges.get(i).is_some_and(|&(s, _)| s <= off)
 }
 
 /// Runs of pages the overlay provides, as (file offset, length) pairs.
@@ -1553,6 +1681,7 @@ pub fn config_from_paths(
     record_to: Option<&Path>,
     abort_on_handler_death: bool,
     eager_overlay: bool,
+    skip_zero_holes: bool,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
@@ -1561,6 +1690,7 @@ pub fn config_from_paths(
         record_to: record_to.map(Path::to_path_buf),
         abort_on_handler_death,
         eager_overlay,
+        skip_zero_holes,
     }
 }
 
@@ -1938,6 +2068,168 @@ mod tests {
 
         // SAFETY: unmap the region we mapped above.
         unsafe { libc::munmap(mem, total) };
+    }
+
+    /// A sparse file of `len` bytes with `fill` written at each `(offset, len)`.
+    fn sparse_file(path: &Path, len: u64, data: &[(u64, usize, u8)]) {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::create(path).unwrap();
+        f.set_len(len).unwrap();
+        for &(off, n, fill) in data {
+            f.write_all_at(&vec![fill; n], off).unwrap();
+        }
+    }
+
+    #[test]
+    fn skip_zero_holes_serves_overlay_and_base_data_and_leaves_zero_blocks_to_the_kernel() {
+        let ps = 4096usize;
+        let block = SKIP_ZERO_BLOCK as usize;
+        // Two regions of two blocks each, so registration must split at a region
+        // boundary that is not file offset zero.
+        let region = 2 * block;
+        let total = 2 * region;
+        let npages = total / ps;
+        // Base data in blocks 0 and 3. Block 2 is a base hole holding one overlay
+        // page, so it must stay registered. Block 1 is zero in both layers.
+        let dir = tempfile::tempdir().unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        let base_path = dir.path().join("mem.base");
+        let ov_page = 2 * block / ps + 3;
+        let base_data = [(ps as u64, ps, 0x11), ((3 * block + 5 * ps) as u64, ps, 0x33)];
+        sparse_file(&base_path, total as u64, &base_data);
+        sparse_file(&ov_path, total as u64, &[((ov_page * ps) as u64, ps, 0xAB)]);
+        let mut pm = PresenceBitmap::with_pages(npages);
+        pm.set(ov_page);
+        let present = Arc::new(pm);
+
+        let ranges = nonzero_ranges(&base_path, total as u64, Some(&present), ps)
+            .unwrap()
+            .expect("ranges within the caps");
+        assert_eq!(ranges, vec![(0, block as u64), (2 * block as u64, total as u64)]);
+
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping handler test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+        let mut regions = Vec::new();
+        #[allow(deprecated)]
+        let mappings: Vec<GuestRegionUffdMapping> = (0..2)
+            .map(|i| {
+                // SAFETY: standard anonymous mmap; checked against MAP_FAILED.
+                let mem = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        region,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+                regions.push(mem);
+                GuestRegionUffdMapping {
+                    base_host_virt_addr: mem as u64,
+                    size: region,
+                    offset: (i * region) as u64,
+                    page_size: ps,
+                    page_size_kib: ps,
+                }
+            })
+            .collect();
+
+        register_ranges(&uffd, &mappings, Some(&ranges)).unwrap();
+
+        let backing = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(present),
+            page_size: ps,
+        };
+        // SAFETY: `uffd` is alive; the duplicate is owned only by the handler.
+        let handler_uffd = unsafe { Uffd::from_raw_fd(libc::dup(uffd.as_raw_fd())) };
+        let stats = Arc::new(Stats::default());
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (_drain_tx, drain_rx) = mpsc::sync_channel(0);
+        let handler = {
+            let (mappings, stats) = (mappings.clone(), Arc::clone(&stats));
+            thread::spawn(move || {
+                run(
+                    handler_uffd,
+                    mappings,
+                    ps,
+                    backing,
+                    Vec::new(),
+                    None,
+                    Arc::new(Vec::new()),
+                    stats,
+                    shutdown_rx,
+                    drain_rx,
+                    None,
+                )
+            })
+        };
+
+        let read = |off: usize| {
+            let m = &mappings[off / region];
+            // SAFETY: `off` lies within the mapped guest regions.
+            unsafe { ptr::read_volatile((m.base_host_virt_addr as *const u8).add(off % region)) }
+        };
+        // (offset, expected byte, served by the handler)
+        let cases = [
+            (ps, 0x11, true),
+            (block + 7 * ps, 0, false),
+            (ov_page * ps, 0xAB, true),
+            (2 * block + 9 * ps, 0, true),
+            (3 * block + 5 * ps, 0x33, true),
+        ];
+        for (off, want, _) in cases {
+            assert_eq!(read(off), want, "byte at offset {off:#x}");
+        }
+        let served = cases.iter().filter(|c| c.2).count() as u64;
+        assert_eq!(stats.snapshot().faults_served, served, "only registered pages fault");
+
+        shutdown_tx.send(()).unwrap();
+        assert_eq!(handler.join().unwrap(), HandlerExit::Clean);
+        for mem in regions {
+            // SAFETY: unmap the regions mapped above.
+            unsafe { libc::munmap(mem, region) };
+        }
+    }
+
+    #[test]
+    fn nonzero_ranges_falls_back_to_whole_registration_past_its_caps() {
+        let ps = 4096u64;
+        let block = SKIP_ZERO_BLOCK;
+        let dir = tempfile::tempdir().unwrap();
+
+        // One data page in every other block needs more ranges than the cap.
+        let blocks = 2 * SKIP_ZERO_MAX_RANGES as u64 + 2;
+        let spread = dir.path().join("spread");
+        let data: Vec<_> = (0..blocks).step_by(2).map(|b| (b * block, ps as usize, 1u8)).collect();
+        sparse_file(&spread, blocks * block, &data);
+        assert_eq!(nonzero_ranges(&spread, blocks * block, None, ps as usize).unwrap(), None);
+
+        // More extents than the scan bound, all inside a single block.
+        let extents = SKIP_ZERO_MAX_EXTENTS as u64 + 1;
+        let frag = dir.path().join("frag");
+        let len = (2 * extents * ps).div_ceil(block) * block;
+        let data: Vec<_> = (0..extents).map(|i| (2 * i * ps, ps as usize, 1u8)).collect();
+        sparse_file(&frag, len, &data);
+        assert_eq!(nonzero_ranges(&frag, len, None, ps as usize).unwrap(), None);
+
+        // A file shorter than guest memory cannot vouch for the pages past its end.
+        let short = dir.path().join("short");
+        sparse_file(&short, block, &[]);
+        assert_eq!(nonzero_ranges(&short, 2 * block, None, ps as usize).unwrap(), None);
     }
 
     #[test]

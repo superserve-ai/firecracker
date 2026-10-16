@@ -53,11 +53,13 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// sending them.
 /// eager-overlay: `LoadSnapshot` accepts `mem_backend.eager_overlay`, under the
 /// same deny-unknown-fields rule.
+/// skip-zero-holes: `LoadSnapshot` accepts `mem_backend.skip_zero_holes`, likewise.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",
     "dirty-tracking-session",
     "eager-overlay",
+    "skip-zero-holes",
 ];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
