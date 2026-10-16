@@ -4,6 +4,7 @@
 //! Walking a sparse file's allocated extents.
 
 use std::fs::File;
+use std::ops::ControlFlow;
 use std::os::fd::AsRawFd;
 
 /// Call `f(start, end)` for every allocated data extent of `file` within its
@@ -14,6 +15,20 @@ pub fn for_each_data_extent(
     size: u64,
     mut f: impl FnMut(u64, u64),
 ) -> std::io::Result<()> {
+    try_for_each_data_extent(file, size, |start, end| {
+        f(start, end);
+        ControlFlow::Continue(())
+    })
+    .map(|_| ())
+}
+
+/// [`for_each_data_extent`] that stops at the first extent for which `f` breaks,
+/// so a caller can bound the scan of a heavily fragmented file.
+pub fn try_for_each_data_extent(
+    file: &File,
+    size: u64,
+    mut f: impl FnMut(u64, u64) -> ControlFlow<()>,
+) -> std::io::Result<ControlFlow<()>> {
     let fd = file.as_raw_fd();
     let mut off: libc::off_t = 0;
     while (off as u64) < size {
@@ -38,12 +53,12 @@ pub fn for_each_data_extent(
             return Err(std::io::Error::last_os_error());
         }
         let end = (hole as u64).min(size);
-        if (data as u64) < end {
-            f(data as u64, end);
+        if (data as u64) < end && f(data as u64, end).is_break() {
+            return Ok(ControlFlow::Break(()));
         }
         off = hole;
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 /// `FS_IOC_FIEMAP`: `_IOWR('f', 11, struct fiemap)`, a 32-byte argument.

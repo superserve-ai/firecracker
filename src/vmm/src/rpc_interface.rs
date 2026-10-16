@@ -1298,6 +1298,7 @@ mod tests {
                     backend_type: MemBackendType::File,
                     abort_on_handler_death: false,
                     eager_overlay: false,
+                    skip_zero_holes: false,
                     backend_path: PathBuf::new(),
                     access_log_path: None,
                     record_to: None,
