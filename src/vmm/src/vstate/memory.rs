@@ -410,6 +410,11 @@ impl GuestRegionMmapExt {
                 self.start_addr().unchecked_add(caddr.raw_value()),
             ));
         }
+        // An empty guest descriptor would otherwise reach the replacement mmap with length zero,
+        // which fails and now aborts the VMM.
+        if len == 0 {
+            return Ok(());
+        }
 
         match (self.inner.file_offset(), self.inner.flags()) {
             // If and only if we are resuming from a snapshot file, we have a file and it's mapped
@@ -1520,6 +1525,12 @@ mod tests {
             .unwrap();
         assert_eq!(vec![0u8; page_size], actual_page);
         // Check that the second page still contains ones.
+        mem.read(actual_page.as_mut_slice(), GuestAddress(page_size as u64))
+            .unwrap();
+        assert_eq!(vec![1u8; page_size], actual_page);
+
+        // An empty range inside the slot is a no-op, not a failed replacement.
+        mem.discard_range(GuestAddress(page_size as u64), 0).unwrap();
         mem.read(actual_page.as_mut_slice(), GuestAddress(page_size as u64))
             .unwrap();
         assert_eq!(vec![1u8; page_size], actual_page);
