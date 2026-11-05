@@ -24,6 +24,7 @@ pub use vm_memory::{
 use vm_memory::{GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVolatile};
 use vmm_sys_util::errno;
 
+use crate::arch::host_page_size;
 use crate::utils::{get_page_size, u64_to_usize};
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::VmError;
@@ -248,14 +249,6 @@ impl<'a> GuestMemorySlot<'a> {
     }
 }
 
-fn addr_in_range(addr: GuestAddress, start: GuestAddress, len: usize) -> bool {
-    if let Some(end) = start.checked_add(len as u64) {
-        addr >= start && addr < end
-    } else {
-        false
-    }
-}
-
 impl GuestRegionMmapExt {
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
@@ -356,13 +349,20 @@ impl GuestRegionMmapExt {
         &self,
         from: GuestAddress,
         len: usize,
-    ) -> impl Iterator<Item = GuestMemorySlot<'_>> {
-        self.slots().map(|(slot, _)| slot).filter(move |slot| {
-            if let Some(slot_end) = slot.guest_addr.checked_add(slot.slice.len() as u64) {
-                addr_in_range(slot.guest_addr, from, len) || addr_in_range(slot_end, from, len)
-            } else {
-                false
-            }
+    ) -> impl Iterator<Item = (GuestMemorySlot<'_>, bool)> {
+        self.slots().filter(move |(slot, _)| {
+            // Two intervals [a, b) and [c, d) intersect iff a < d && c < b.
+            // This correctly handles the containment case where the slot fully
+            // contains the range (or vice versa).
+            let slot_start = slot.guest_addr;
+            let Some(slot_end) = slot_start.checked_add(slot.slice.len() as u64) else {
+                return false;
+            };
+            let Some(range_end) = from.checked_add(len as u64) else {
+                return false;
+            };
+            // An empty range intersects nothing, even strictly inside a slot.
+            len != 0 && slot_start < range_end && from < slot_end
         })
     }
 
@@ -377,23 +377,36 @@ impl GuestRegionMmapExt {
         assert!(self.region_type == GuestRegionType::Hotpluggable);
 
         let mut bitmap_guard = self.plugged.lock().unwrap();
-        let prev = bitmap_guard.replace((mem_slot.slot - self.slot_from) as usize, plug);
-        // do not do anything if the state is what we're trying to set
-        if prev == plug {
+        let idx = (mem_slot.slot - self.slot_from) as usize;
+        if bitmap_guard[idx] == plug {
             return Ok(());
         }
 
-        let mut kvm_region = kvm_userspace_memory_region::from(mem_slot);
+        // Commit the bitmap only once the protection and the KVM slot have both changed, rolling
+        // back the first step if the second fails. A failed rollback has no way back, so it panics.
+        let kvm_region = kvm_userspace_memory_region::from(mem_slot);
         if plug {
             // make it accessible _before_ adding it to KVM
             mem_slot.protect(false)?;
-            vm.set_user_memory_region(kvm_region)?;
+            if let Err(err) = vm.set_user_memory_region(kvm_region) {
+                mem_slot
+                    .protect(true)
+                    .expect("cannot roll back the virtio-mem slot protection");
+                return Err(err);
+            }
+            bitmap_guard.set(idx, true);
         } else {
             // to remove it we need to pass a size of zero
-            kvm_region.memory_size = 0;
-            vm.set_user_memory_region(kvm_region)?;
+            let mut removed_region = kvm_region;
+            removed_region.memory_size = 0;
+            vm.set_user_memory_region(removed_region)?;
             // make it protected _after_ removing it from KVM
-            mem_slot.protect(true)?;
+            if let Err(err) = mem_slot.protect(true) {
+                vm.set_user_memory_region(kvm_region)
+                    .expect("cannot roll back the virtio-mem slot in KVM");
+                return Err(err.into());
+            }
+            bitmap_guard.set(idx, false);
         }
         Ok(())
     }
@@ -403,7 +416,19 @@ impl GuestRegionMmapExt {
         caddr: MemoryRegionAddress,
         len: usize,
     ) -> Result<(), GuestMemoryError> {
-        let phys_address = self.get_host_address(caddr)?;
+        // The address and length can come straight from a guest descriptor (balloon), so reject
+        // unaligned input here rather than letting the mmap/madvise below fail on it.
+        let page_size = host_page_size() as u64;
+        if !caddr.raw_value().is_multiple_of(page_size) || !(len as u64).is_multiple_of(page_size) {
+            return Err(GuestMemoryError::InvalidGuestAddress(
+                self.start_addr().unchecked_add(caddr.raw_value()),
+            ));
+        }
+        // An empty guest descriptor would otherwise reach the replacement mmap with length zero,
+        // which fails and now aborts the VMM.
+        if len == 0 {
+            return Ok(());
+        }
 
         match (self.inner.file_offset(), self.inner.flags()) {
             // If and only if we are resuming from a snapshot file, we have a file and it's mapped
@@ -416,24 +441,62 @@ impl GuestRegionMmapExt {
                 // file only drops any anonymous pages in range, but subsequent accesses would read
                 // whatever page is stored on the backing file. Mmapping anonymous pages ensures
                 // it's zeroed.
-                // SAFETY: The address and length are known to be valid.
-                let ret = unsafe {
-                    libc::mmap(
-                        phys_address.cast(),
-                        len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                        -1,
-                        0,
-                    )
-                };
-                if ret == libc::MAP_FAILED {
-                    let os_error = std::io::Error::last_os_error();
-                    error!("discard_range: mmap failed: {:?}", os_error);
-                    Err(GuestMemoryError::IOError(os_error))
-                } else {
-                    Ok(())
+                // Keep MAP_NORESERVE to match the flags the region was created with (see `create`).
+                // Without it the replacement is subject to overcommit accounting and can fail with
+                // ENOMEM, by which point MAP_FIXED has already unmapped the range.
+                // TODO: this does not re-apply the region's madvise flags, so it would drop the
+                // MADV_HUGEPAGE hint on a THP + file-restore VM. That combination is unsupported
+                // today; revisit if it becomes supported.
+                //
+                // Map each intersecting slot directly to its final protection: fully unplugged
+                // slots get PROT_NONE, plugged (or mixed) slots stay PROT_READ | PROT_WRITE. This
+                // avoids mapping the whole range PROT_READ | PROT_WRITE and then reprotecting the
+                // unplugged slots.
+                let base = self.start_addr().raw_value();
+                let from = base
+                    .checked_add(caddr.raw_value())
+                    .expect("caddr should be within the region");
+                let to = from
+                    .checked_add(len as u64)
+                    .expect("range should be within the region");
+                for (slot, plugged) in self.slots_intersecting_range(GuestAddress(from), len) {
+                    let slot_start = slot.guest_addr.raw_value();
+                    let slot_end = slot_start
+                        .checked_add(slot.slice.len() as u64)
+                        .expect("slot should be within the region");
+                    let start = slot_start.max(from);
+                    let end = slot_end.min(to);
+                    let host = self.get_host_address(MemoryRegionAddress(start - base))?;
+                    let prot = if plugged {
+                        libc::PROT_READ | libc::PROT_WRITE
+                    } else {
+                        libc::PROT_NONE
+                    };
+                    // SAFETY: [start, end) is clamped to this slot, so `host` and the length are
+                    // within the region's existing mapping. MAP_FIXED replaces exactly that range.
+                    let ret = unsafe {
+                        libc::mmap(
+                            host.cast(),
+                            u64_to_usize(end - start),
+                            prot,
+                            libc::MAP_FIXED
+                                | libc::MAP_ANONYMOUS
+                                | libc::MAP_PRIVATE
+                                | libc::MAP_NORESERVE,
+                            -1,
+                            0,
+                        )
+                    };
+                    // MAP_FIXED has already unmapped the old range, so a failure here cannot be
+                    // recovered from.
+                    if ret == libc::MAP_FAILED {
+                        panic!(
+                            "discard_range: mmap failed: {:?}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
                 }
+                Ok(())
             }
             // Match either the case of an anonymous mapping, or the case
             // of a shared file mapping.
@@ -443,8 +506,9 @@ impl GuestRegionMmapExt {
             // We keep falling to the madvise branch to keep the previous behaviour.
             _ => {
                 // Madvise the region in order to mark it as not used.
+                let host_addr = self.get_host_address(caddr)?;
                 // SAFETY: The address and length are known to be valid.
-                let ret = unsafe { libc::madvise(phys_address.cast(), len, libc::MADV_DONTNEED) };
+                let ret = unsafe { libc::madvise(host_addr.cast(), len, libc::MADV_DONTNEED) };
                 if ret < 0 {
                     let os_error = std::io::Error::last_os_error();
                     error!("discard_range: madvise failed: {:?}", os_error);
@@ -1439,11 +1503,11 @@ mod tests {
             GuestMemoryError::InvalidGuestAddress(_)
         );
 
-        // Madvise fail: the guest address is not aligned to the page size.
+        // Unaligned address is rejected.
         assert_match!(
             mem.discard_range(GuestAddress(0x20), page_size)
                 .unwrap_err(),
-            GuestMemoryError::IOError(_)
+            GuestMemoryError::InvalidGuestAddress(_)
         );
     }
 
@@ -1479,6 +1543,12 @@ mod tests {
             .unwrap();
         assert_eq!(vec![1u8; page_size], actual_page);
 
+        // An empty range inside the slot is a no-op, not a failed replacement.
+        mem.discard_range(GuestAddress(page_size as u64), 0).unwrap();
+        mem.read(actual_page.as_mut_slice(), GuestAddress(page_size as u64))
+            .unwrap();
+        assert_eq!(vec![1u8; page_size], actual_page);
+
         // Malformed range: the len is too big.
         assert_match!(
             mem.discard_range(GuestAddress(0), 0x10000).unwrap_err(),
@@ -1491,11 +1561,66 @@ mod tests {
             GuestMemoryError::InvalidGuestAddress(_)
         );
 
-        // Mmap fail: the guest address is not aligned to the page size.
+        // Unaligned address is rejected, so the file-backed branch never sees a failing mmap.
         assert_match!(
             mem.discard_range(GuestAddress(0x20), page_size)
                 .unwrap_err(),
-            GuestMemoryError::IOError(_)
+            GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    /// Verifies that `slots_intersecting_range` returns the correct slots for
+    /// ranges at slot boundaries, interior to a slot, and spanning two slots.
+    #[test]
+    fn test_slots_intersecting_range() {
+        let page_size = get_page_size().unwrap();
+        let slot_size = 4 * page_size;
+        let region_size = 2 * slot_size;
+        let base = GuestAddress(0);
+        let slot1_base = base.unchecked_add(slot_size as u64);
+
+        let mmap_region = anonymous(
+            std::iter::once((base, region_size)),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let region = GuestRegionMmapExt::hotpluggable_from_mmap_region(mmap_region, 0, slot_size);
+        assert_eq!(region.slot_cnt(), 2);
+
+        // (range_offset_in_pages, range_len_in_pages, expected_slot_addrs)
+        let cases: &[(usize, usize, &[GuestAddress])] = &[
+            // At slot 0 boundary
+            (0, 1, &[base]),
+            // Interior to slot 0
+            (1, 1, &[base]),
+            // Interior to slot 1
+            (5, 1, &[slot1_base]),
+            // Spanning slot 0 and slot 1
+            (3, 2, &[base, slot1_base]),
+            // Entire region
+            (0, 8, &[base, slot1_base]),
+            // Outside the region
+            (8, 1, &[]),
+            // Zero-length range
+            (0, 0, &[]),
+            // Zero-length range strictly inside slot 0
+            (1, 0, &[]),
+        ];
+
+        for &(offset_pages, len_pages, expected) in cases {
+            let from = base.unchecked_add((offset_pages * page_size) as u64);
+            let len = len_pages * page_size;
+            let found: Vec<_> = region.slots_intersecting_range(from, len).collect();
+            let addrs: Vec<_> = found.iter().map(|(s, _)| s.guest_addr).collect();
+            assert_eq!(
+                addrs, expected,
+                "offset={offset_pages} pages, len={len_pages} pages"
+            );
+        }
     }
 }
