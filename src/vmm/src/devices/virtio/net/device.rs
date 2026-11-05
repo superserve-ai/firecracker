@@ -84,22 +84,28 @@ const ETHERTYPE_VLAN: u16 = 0x8100;
 const ETHERTYPE_QINQ: u16 = 0x88a8;
 
 // The host completes a guest-requested checksum at csum_start, so one inside the IPv4 header would
-// rewrite a header the host already parsed. Guests never VLAN-tag, and a tag shifts that header.
+// rewrite a header the host already parsed. The host strips at most two VLAN tags before IPv4.
 fn csum_start_in_ipv4_header(buf: &[u8]) -> bool {
     if buf.len() < vnet_hdr_len() || buf[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0 {
         return false;
     }
     let csum_start = usize::from(u16::from_le_bytes([buf[6], buf[7]]));
-    let Ok(eth) = EthernetFrame::from_bytes(&buf[vnet_hdr_len()..]) else {
-        return true;
-    };
-    match eth.ethertype() {
-        ETHERTYPE_VLAN | ETHERTYPE_QINQ => true,
-        ETHERTYPE_IPV4 => eth
-            .payload()
-            .first()
-            .is_none_or(|b| csum_start < PAYLOAD_OFFSET + usize::from(b & 0x0f) * 4),
-        _ => false,
+    let frame = &buf[vnet_hdr_len()..];
+    let mut l3 = PAYLOAD_OFFSET;
+    loop {
+        let Some(ethertype) = frame.get(l3 - 2..l3) else {
+            return true;
+        };
+        match u16::from_be_bytes([ethertype[0], ethertype[1]]) {
+            ETHERTYPE_VLAN | ETHERTYPE_QINQ if l3 < PAYLOAD_OFFSET + 8 => l3 += 4,
+            ETHERTYPE_VLAN | ETHERTYPE_QINQ => return true,
+            ETHERTYPE_IPV4 => {
+                return frame
+                    .get(l3)
+                    .is_none_or(|b| csum_start < l3 + usize::from(b & 0x0f) * 4);
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -580,7 +586,7 @@ impl Net {
         }
 
         let _metric = net_metrics.tap_write_agg.record_latency_metrics();
-        match Self::write_tap(tap, frame_iovec) {
+        match Self::write_tap(tap, raw_headers, frame_iovec) {
             Ok(_) => {
                 let len = u64::from(frame_iovec.len());
                 net_metrics.tx_bytes_count.add(len);
@@ -854,8 +860,8 @@ impl Net {
         self.tap.read_iovec(slice)
     }
 
-    fn write_tap(tap: &mut Tap, buf: &IoVecBuffer) -> std::io::Result<usize> {
-        tap.write_iovec(buf)
+    fn write_tap(tap: &mut Tap, prefix: &[u8], buf: &IoVecBuffer) -> std::io::Result<usize> {
+        tap.write_iovec(prefix, buf)
     }
 
     /// Process a single RX queue event.
@@ -1141,35 +1147,49 @@ pub mod tests {
 
     #[test]
     fn test_csum_start_in_ipv4_header() {
-        // vnet header + Ethernet + 20-byte IPv4 header + 8 bytes of UDP.
-        let frame = |flags: u8, csum_start: u16, ethertype: u16, ihl: u8| {
-            let mut buf = vec![0u8; vnet_hdr_len() + PAYLOAD_OFFSET + 28];
+        // vnet header + Ethernet + VLAN tags + 20-byte IPv4 header + 8 bytes of UDP, cut to the
+        // header prefix the TX path inspects.
+        let frame = |flags: u8, csum_start: u16, tags: &[u16], ethertype: u16, ihl: u8| {
+            let mut buf = vec![0u8; vnet_hdr_len() + PAYLOAD_OFFSET + 4 * tags.len() + 28];
             buf[0] = flags;
             buf[6..8].copy_from_slice(&csum_start.to_le_bytes());
-            let eth = vnet_hdr_len();
-            buf[eth + 12..eth + 14].copy_from_slice(&ethertype.to_be_bytes());
-            buf[eth + PAYLOAD_OFFSET] = 0x40 | ihl;
+            let mut at = vnet_hdr_len() + 12;
+            for tpid in tags {
+                buf[at..at + 2].copy_from_slice(&tpid.to_be_bytes());
+                at += 4;
+            }
+            buf[at..at + 2].copy_from_slice(&ethertype.to_be_bytes());
+            buf[at + 2] = 0x40 | ihl;
+            buf.truncate(frame_hdr_len());
             buf
         };
         let n = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        let ipv4 = ETHERTYPE_IPV4;
 
         // A real checksum offload starts at the L4 header.
-        assert!(!csum_start_in_ipv4_header(&frame(n, 34, ETHERTYPE_IPV4, 5)));
+        assert!(!csum_start_in_ipv4_header(&frame(n, 34, &[], ipv4, 5)));
         // Without NEEDS_CSUM the kernel ignores csum_start.
-        assert!(!csum_start_in_ipv4_header(&frame(0, 14, ETHERTYPE_IPV4, 5)));
+        assert!(!csum_start_in_ipv4_header(&frame(0, 14, &[], ipv4, 5)));
         // Inside the IPv4 header, including the options a larger ihl adds.
-        assert!(csum_start_in_ipv4_header(&frame(n, 14, ETHERTYPE_IPV4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 33, ETHERTYPE_IPV4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 34, ETHERTYPE_IPV4, 15)));
-        assert!(!csum_start_in_ipv4_header(&frame(n, 74, ETHERTYPE_IPV4, 15)));
-        // VLAN tags and frames too short to hold the IPv4 version byte are refused.
-        assert!(csum_start_in_ipv4_header(&frame(n, 64, ETHERTYPE_VLAN, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 64, ETHERTYPE_QINQ, 5)));
-        let mut short = frame(n, 34, ETHERTYPE_IPV4, 5);
+        assert!(csum_start_in_ipv4_header(&frame(n, 14, &[], ipv4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 33, &[], ipv4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 34, &[], ipv4, 15)));
+        assert!(!csum_start_in_ipv4_header(&frame(n, 74, &[], ipv4, 15)));
+        // Tagged frames are checked against the IPv4 header behind their tags.
+        let vlan = [ETHERTYPE_VLAN];
+        let qinq = [ETHERTYPE_QINQ, ETHERTYPE_VLAN];
+        assert!(!csum_start_in_ipv4_header(&frame(n, 38, &vlan, ipv4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 37, &vlan, ipv4, 5)));
+        assert!(!csum_start_in_ipv4_header(&frame(n, 42, &qinq, ipv4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 41, &qinq, ipv4, 5)));
+        // A third tag, or a frame too short to hold the IPv4 version byte, is refused.
+        let triple = [ETHERTYPE_QINQ, ETHERTYPE_VLAN, ETHERTYPE_VLAN];
+        assert!(csum_start_in_ipv4_header(&frame(n, 46, &triple, ipv4, 5)));
+        let mut short = frame(n, 34, &[], ipv4, 5);
         short.truncate(vnet_hdr_len() + PAYLOAD_OFFSET);
         assert!(csum_start_in_ipv4_header(&short));
         // Other protocols are untouched.
-        assert!(!csum_start_in_ipv4_header(&frame(n, 14, 0x86dd, 5)));
+        assert!(!csum_start_in_ipv4_header(&frame(n, 14, &[], 0x86dd, 5)));
     }
 
     #[test]
