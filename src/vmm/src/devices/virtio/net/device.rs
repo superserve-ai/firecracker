@@ -48,15 +48,20 @@ use crate::utils::net::mac::MacAddr;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
-const FRAME_HEADER_MAX_LEN: usize = PAYLOAD_OFFSET + ETH_IPV4_FRAME_LEN;
+// Matches the kernel's VLAN_MAX_DEPTH, the most nested tags the host parses.
+const VLAN_MAX_DEPTH: usize = 8;
+const VLAN_HLEN: usize = 4;
+
+const FRAME_HEADER_MAX_LEN: usize =
+    PAYLOAD_OFFSET + VLAN_MAX_DEPTH * VLAN_HLEN + ETH_IPV4_FRAME_LEN;
 
 pub(crate) const fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
 
 // This returns the maximum frame header length. This includes the VNET header plus
-// the maximum L2 frame header bytes which includes the ethernet frame header plus
-// the header IPv4 ARP header which is 28 bytes long.
+// the maximum L2 frame header bytes which includes the ethernet frame header, room for
+// the deepest VLAN tag stack, plus the header IPv4 ARP header which is 28 bytes long.
 const fn frame_hdr_len() -> usize {
     vnet_hdr_len() + FRAME_HEADER_MAX_LEN
 }
@@ -84,7 +89,7 @@ const ETHERTYPE_VLAN: u16 = 0x8100;
 const ETHERTYPE_QINQ: u16 = 0x88a8;
 
 // The host completes a guest-requested checksum at csum_start, so one inside the IPv4 header would
-// rewrite a header the host already parsed. The host strips at most two VLAN tags before IPv4.
+// rewrite a header the host already parsed. Tag stacks deeper than the host parses are refused.
 fn csum_start_in_ipv4_header(buf: &[u8]) -> bool {
     if buf.len() < vnet_hdr_len() || buf[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0 {
         return false;
@@ -97,7 +102,9 @@ fn csum_start_in_ipv4_header(buf: &[u8]) -> bool {
             return true;
         };
         match u16::from_be_bytes([ethertype[0], ethertype[1]]) {
-            ETHERTYPE_VLAN | ETHERTYPE_QINQ if l3 < PAYLOAD_OFFSET + 8 => l3 += 4,
+            ETHERTYPE_VLAN | ETHERTYPE_QINQ if l3 < PAYLOAD_OFFSET + VLAN_MAX_DEPTH * VLAN_HLEN => {
+                l3 += VLAN_HLEN
+            }
             ETHERTYPE_VLAN | ETHERTYPE_QINQ => return true,
             ETHERTYPE_IPV4 => {
                 return frame
@@ -1182,9 +1189,13 @@ pub mod tests {
         assert!(csum_start_in_ipv4_header(&frame(n, 37, &vlan, ipv4, 5)));
         assert!(!csum_start_in_ipv4_header(&frame(n, 42, &qinq, ipv4, 5)));
         assert!(csum_start_in_ipv4_header(&frame(n, 41, &qinq, ipv4, 5)));
-        // A third tag, or a frame too short to hold the IPv4 version byte, is refused.
-        let triple = [ETHERTYPE_QINQ, ETHERTYPE_VLAN, ETHERTYPE_VLAN];
-        assert!(csum_start_in_ipv4_header(&frame(n, 46, &triple, ipv4, 5)));
+        // The host parses up to VLAN_MAX_DEPTH tags; a deeper stack, or a frame too short to hold
+        // the IPv4 version byte, is refused.
+        let deepest = [ETHERTYPE_VLAN; VLAN_MAX_DEPTH];
+        assert!(!csum_start_in_ipv4_header(&frame(n, 66, &deepest, ipv4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 65, &deepest, ipv4, 5)));
+        let too_deep = [ETHERTYPE_VLAN; VLAN_MAX_DEPTH + 1];
+        assert!(csum_start_in_ipv4_header(&frame(n, 70, &too_deep, ipv4, 5)));
         let mut short = frame(n, 34, &[], ipv4, 5);
         short.truncate(vnet_hdr_len() + PAYLOAD_OFFSET);
         assert!(csum_start_in_ipv4_header(&short));
@@ -2045,7 +2056,6 @@ pub mod tests {
         let buffer = IoVecBuffer::from(&frame_buf[..frame_len]);
 
         let mut headers = vec![0; frame_hdr_len()];
-        buffer.read_exact_volatile_at(&mut headers, 0).unwrap();
 
         // Call the code which sends the packet to the host or MMDS.
         // Validate the frame was consumed by MMDS and that the metrics reflect that.
