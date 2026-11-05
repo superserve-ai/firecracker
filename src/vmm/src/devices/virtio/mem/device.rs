@@ -1274,6 +1274,35 @@ mod tests {
         assert!(!th.device().plugged_blocks[block_range.start + 1]);
     }
 
+    /// An UNPLUG_ALL whose KVM update fails must leave the blocks recorded as plugged, so the
+    /// retry is not skipped as a no-op and actually unplugs them.
+    #[test]
+    fn test_unplug_all_retry_after_kvm_failure() {
+        let mem_dev = default_virtio_mem();
+        let guest_mem = mem_dev.vm.guest_memory().clone();
+        let mut th = test_helper(mem_dev, &guest_mem);
+        th.device().update_requested_size(1024).unwrap();
+        let block_size = th.device().config.block_size;
+        // Last block of slot 0 and first block of slot 1.
+        let addr = th.device().guest_address().unchecked_add(63 * block_size);
+        let resp = emulate_request(
+            &mut th,
+            &guest_mem,
+            Request::Plug(RequestedRange { addr, nb_blocks: 2 }),
+        );
+        assert!(resp.is_ack());
+
+        th.device().vm.fail_next_set_user_memory_region(1);
+        let resp = emulate_request(&mut th, &guest_mem, Request::UnplugAll);
+        assert!(resp.is_error());
+        assert!(th.device().plugged_size_mib() > 0);
+
+        let resp = emulate_request(&mut th, &guest_mem, Request::UnplugAll);
+        assert!(resp.is_ack());
+        assert_eq!(th.device().plugged_size_mib(), 0);
+        assert_eq!(th.device().plugged_blocks.count_ones(), 0);
+    }
+
     #[test]
     fn test_repeated_unplug_all_is_noop() {
         let mem_dev = default_virtio_mem();
