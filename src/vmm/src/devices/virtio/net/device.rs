@@ -38,7 +38,7 @@ use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::{DeviceError, report_net_event_fail};
 use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
-use crate::dumbo::pdu::ethernet::{EthernetFrame, PAYLOAD_OFFSET};
+use crate::dumbo::pdu::ethernet::{ETHERTYPE_IPV4, EthernetFrame, PAYLOAD_OFFSET};
 use crate::impl_device_type;
 use crate::logger::{IncMetric, METRICS};
 use crate::mmds::data_store::Mmds;
@@ -76,6 +76,30 @@ fn frame_bytes_from_buf_mut(buf: &mut [u8]) -> Result<&mut [u8], NetError> {
         Err(NetError::VnetHeaderMissing)
     } else {
         Ok(&mut buf[vnet_hdr_len()..])
+    }
+}
+
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const ETHERTYPE_VLAN: u16 = 0x8100;
+const ETHERTYPE_QINQ: u16 = 0x88a8;
+
+// The host completes a guest-requested checksum at csum_start, so one inside the IPv4 header would
+// rewrite a header the host already parsed. Guests never VLAN-tag, and a tag shifts that header.
+fn csum_start_in_ipv4_header(buf: &[u8]) -> bool {
+    if buf.len() < vnet_hdr_len() || buf[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0 {
+        return false;
+    }
+    let csum_start = usize::from(u16::from_le_bytes([buf[6], buf[7]]));
+    let Ok(eth) = EthernetFrame::from_bytes(&buf[vnet_hdr_len()..]) else {
+        return true;
+    };
+    match eth.ethertype() {
+        ETHERTYPE_VLAN | ETHERTYPE_QINQ => true,
+        ETHERTYPE_IPV4 => eth
+            .payload()
+            .first()
+            .is_none_or(|b| csum_start < PAYLOAD_OFFSET + usize::from(b & 0x0f) * 4),
+        _ => false,
     }
 }
 
@@ -514,7 +538,8 @@ impl Net {
                 NetError::VnetHeaderMissing
             })?;
 
-        let headers = frame_bytes_from_buf(&headers[..header_len]).inspect_err(|_| {
+        let raw_headers = &headers[..header_len];
+        let headers = frame_bytes_from_buf(raw_headers).inspect_err(|_| {
             error!("VNET headers missing in TX frame");
             net_metrics.tx_malformed_frames.inc();
         })?;
@@ -539,6 +564,11 @@ impl Net {
         }
 
         // This frame goes to the TAP.
+
+        if csum_start_in_ipv4_header(raw_headers) {
+            net_metrics.tx_malformed_frames.inc();
+            return Ok(false);
+        }
 
         // Check for guest MAC spoofing.
         if let Some(guest_mac) = guest_mac {
@@ -1107,6 +1137,39 @@ pub mod tests {
         let offset = std::mem::offset_of!(virtio_net_hdr_v1, num_buffers);
         frame[offset] = bytes[0];
         frame[offset + 1] = bytes[1];
+    }
+
+    #[test]
+    fn test_csum_start_in_ipv4_header() {
+        // vnet header + Ethernet + 20-byte IPv4 header + 8 bytes of UDP.
+        let frame = |flags: u8, csum_start: u16, ethertype: u16, ihl: u8| {
+            let mut buf = vec![0u8; vnet_hdr_len() + PAYLOAD_OFFSET + 28];
+            buf[0] = flags;
+            buf[6..8].copy_from_slice(&csum_start.to_le_bytes());
+            let eth = vnet_hdr_len();
+            buf[eth + 12..eth + 14].copy_from_slice(&ethertype.to_be_bytes());
+            buf[eth + PAYLOAD_OFFSET] = 0x40 | ihl;
+            buf
+        };
+        let n = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+
+        // A real checksum offload starts at the L4 header.
+        assert!(!csum_start_in_ipv4_header(&frame(n, 34, ETHERTYPE_IPV4, 5)));
+        // Without NEEDS_CSUM the kernel ignores csum_start.
+        assert!(!csum_start_in_ipv4_header(&frame(0, 14, ETHERTYPE_IPV4, 5)));
+        // Inside the IPv4 header, including the options a larger ihl adds.
+        assert!(csum_start_in_ipv4_header(&frame(n, 14, ETHERTYPE_IPV4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 33, ETHERTYPE_IPV4, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 34, ETHERTYPE_IPV4, 15)));
+        assert!(!csum_start_in_ipv4_header(&frame(n, 74, ETHERTYPE_IPV4, 15)));
+        // VLAN tags and frames too short to hold the IPv4 version byte are refused.
+        assert!(csum_start_in_ipv4_header(&frame(n, 64, ETHERTYPE_VLAN, 5)));
+        assert!(csum_start_in_ipv4_header(&frame(n, 64, ETHERTYPE_QINQ, 5)));
+        let mut short = frame(n, 34, ETHERTYPE_IPV4, 5);
+        short.truncate(vnet_hdr_len() + PAYLOAD_OFFSET);
+        assert!(csum_start_in_ipv4_header(&short));
+        // Other protocols are untouched.
+        assert!(!csum_start_in_ipv4_header(&frame(n, 14, 0x86dd, 5)));
     }
 
     #[test]
