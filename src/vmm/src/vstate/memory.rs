@@ -361,7 +361,8 @@ impl GuestRegionMmapExt {
             let Some(range_end) = from.checked_add(len as u64) else {
                 return false;
             };
-            slot_start < range_end && from < slot_end
+            // An empty range intersects nothing, even strictly inside a slot.
+            len != 0 && slot_start < range_end && from < slot_end
         })
     }
 
@@ -1594,6 +1595,8 @@ mod tests {
             (8, 1, &[]),
             // Zero-length range
             (0, 0, &[]),
+            // Zero-length range strictly inside slot 0
+            (1, 0, &[]),
         ];
 
         for &(offset_pages, len_pages, expected) in cases {
