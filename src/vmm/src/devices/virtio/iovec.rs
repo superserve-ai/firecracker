@@ -112,9 +112,9 @@ impl IoVecBuffer {
         self.len
     }
 
-    /// Returns a pointer to the memory keeping the `iovec` structs
-    pub fn as_iovec_ptr(&self) -> *const iovec {
-        self.vecs.as_ptr()
+    /// Returns the `iovec` structs
+    pub fn as_iovec_slice(&self) -> &[iovec] {
+        &self.vecs
     }
 
     /// Returns the length of the `iovec` array.

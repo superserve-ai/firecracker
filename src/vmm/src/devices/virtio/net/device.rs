@@ -38,7 +38,7 @@ use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::{DeviceError, report_net_event_fail};
 use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
-use crate::dumbo::pdu::ethernet::{EthernetFrame, PAYLOAD_OFFSET};
+use crate::dumbo::pdu::ethernet::{ETHERTYPE_IPV4, EthernetFrame, PAYLOAD_OFFSET};
 use crate::impl_device_type;
 use crate::logger::{IncMetric, METRICS};
 use crate::mmds::data_store::Mmds;
@@ -48,15 +48,20 @@ use crate::utils::net::mac::MacAddr;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
-const FRAME_HEADER_MAX_LEN: usize = PAYLOAD_OFFSET + ETH_IPV4_FRAME_LEN;
+// Matches the kernel's VLAN_MAX_DEPTH, the most nested tags the host parses.
+const VLAN_MAX_DEPTH: usize = 8;
+const VLAN_HLEN: usize = 4;
+
+const FRAME_HEADER_MAX_LEN: usize =
+    PAYLOAD_OFFSET + VLAN_MAX_DEPTH * VLAN_HLEN + ETH_IPV4_FRAME_LEN;
 
 pub(crate) const fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
 
 // This returns the maximum frame header length. This includes the VNET header plus
-// the maximum L2 frame header bytes which includes the ethernet frame header plus
-// the header IPv4 ARP header which is 28 bytes long.
+// the maximum L2 frame header bytes which includes the ethernet frame header, room for
+// the deepest VLAN tag stack, plus the header IPv4 ARP header which is 28 bytes long.
 const fn frame_hdr_len() -> usize {
     vnet_hdr_len() + FRAME_HEADER_MAX_LEN
 }
@@ -77,6 +82,51 @@ fn frame_bytes_from_buf_mut(buf: &mut [u8]) -> Result<&mut [u8], NetError> {
     } else {
         Ok(&mut buf[vnet_hdr_len()..])
     }
+}
+
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const ETHERTYPE_VLAN: u16 = 0x8100;
+const ETHERTYPE_QINQ: u16 = 0x88a8;
+const ETHERTYPE_IPV6: u16 = 0x86dd;
+const IPV6_HLEN: usize = 40;
+// The host assumes at least this much network header for any protocol.
+const NET_HDR_MIN_LEN: usize = 20;
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+const VIRTIO_NET_HDR_GSO_ECN: u8 = 0x80;
+
+// The host completes a guest-requested checksum at csum_start, so one inside the network header
+// would rewrite a header the host already parsed. Tag stacks deeper than the host parses are refused.
+fn csum_start_in_ip_header(buf: &[u8]) -> bool {
+    if buf.len() < vnet_hdr_len() || buf[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0 {
+        return false;
+    }
+    let csum_start = usize::from(u16::from_le_bytes([buf[6], buf[7]]));
+    let frame = &buf[vnet_hdr_len()..];
+    let mut l3 = PAYLOAD_OFFSET;
+    let net_hdr_len = loop {
+        let Some(ethertype) = frame.get(l3 - 2..l3) else {
+            return true;
+        };
+        match u16::from_be_bytes([ethertype[0], ethertype[1]]) {
+            ETHERTYPE_VLAN | ETHERTYPE_QINQ if l3 < PAYLOAD_OFFSET + VLAN_MAX_DEPTH * VLAN_HLEN => {
+                l3 += VLAN_HLEN
+            }
+            ETHERTYPE_VLAN | ETHERTYPE_QINQ => return true,
+            ETHERTYPE_IPV4 => match frame.get(l3) {
+                Some(b) => break usize::from(b & 0x0f) * 4,
+                None => return true,
+            },
+            ETHERTYPE_IPV6 => break IPV6_HLEN,
+            _ => break 0,
+        }
+    };
+    // The host takes the TCPv6 minimum from gso_type, whatever the EtherType says.
+    let gso_hdr_len = if buf[1] & !VIRTIO_NET_HDR_GSO_ECN == VIRTIO_NET_HDR_GSO_TCPV6 {
+        IPV6_HLEN
+    } else {
+        0
+    };
+    csum_start < l3 + net_hdr_len.max(gso_hdr_len).max(NET_HDR_MIN_LEN)
 }
 
 // This initializes to all 0 the VNET hdr part of a buf.
@@ -514,7 +564,8 @@ impl Net {
                 NetError::VnetHeaderMissing
             })?;
 
-        let headers = frame_bytes_from_buf(&headers[..header_len]).inspect_err(|_| {
+        let raw_headers = &headers[..header_len];
+        let headers = frame_bytes_from_buf(raw_headers).inspect_err(|_| {
             error!("VNET headers missing in TX frame");
             net_metrics.tx_malformed_frames.inc();
         })?;
@@ -540,6 +591,11 @@ impl Net {
 
         // This frame goes to the TAP.
 
+        if csum_start_in_ip_header(raw_headers) {
+            net_metrics.tx_malformed_frames.inc();
+            return Ok(false);
+        }
+
         // Check for guest MAC spoofing.
         if let Some(guest_mac) = guest_mac {
             let _ = EthernetFrame::from_bytes(headers).map(|eth_frame| {
@@ -550,7 +606,7 @@ impl Net {
         }
 
         let _metric = net_metrics.tap_write_agg.record_latency_metrics();
-        match Self::write_tap(tap, frame_iovec) {
+        match Self::write_tap(tap, raw_headers, frame_iovec) {
             Ok(_) => {
                 let len = u64::from(frame_iovec.len());
                 net_metrics.tx_bytes_count.add(len);
@@ -824,8 +880,8 @@ impl Net {
         self.tap.read_iovec(slice)
     }
 
-    fn write_tap(tap: &mut Tap, buf: &IoVecBuffer) -> std::io::Result<usize> {
-        tap.write_iovec(buf)
+    fn write_tap(tap: &mut Tap, prefix: &[u8], buf: &IoVecBuffer) -> std::io::Result<usize> {
+        tap.write_iovec(prefix, buf)
     }
 
     /// Process a single RX queue event.
@@ -1107,6 +1163,80 @@ pub mod tests {
         let offset = std::mem::offset_of!(virtio_net_hdr_v1, num_buffers);
         frame[offset] = bytes[0];
         frame[offset + 1] = bytes[1];
+    }
+
+    #[test]
+    fn test_csum_start_in_ip_header() {
+        // vnet header + Ethernet + VLAN tags + 20-byte IP header + 8 bytes of UDP, cut to the
+        // header prefix the TX path inspects.
+        let frame = |flags: u8, csum_start: u16, tags: &[u16], ethertype: u16, ihl: u8| {
+            let mut buf = vec![0u8; vnet_hdr_len() + PAYLOAD_OFFSET + 4 * tags.len() + 28];
+            buf[0] = flags;
+            buf[6..8].copy_from_slice(&csum_start.to_le_bytes());
+            let mut at = vnet_hdr_len() + 12;
+            for tpid in tags {
+                buf[at..at + 2].copy_from_slice(&tpid.to_be_bytes());
+                at += 4;
+            }
+            buf[at..at + 2].copy_from_slice(&ethertype.to_be_bytes());
+            buf[at + 2] = 0x40 | ihl;
+            buf.truncate(frame_hdr_len());
+            buf
+        };
+        let n = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        let ipv4 = ETHERTYPE_IPV4;
+
+        // A real checksum offload starts at the L4 header.
+        assert!(!csum_start_in_ip_header(&frame(n, 34, &[], ipv4, 5)));
+        // Without NEEDS_CSUM the kernel ignores csum_start.
+        assert!(!csum_start_in_ip_header(&frame(0, 14, &[], ipv4, 5)));
+        // Inside the IPv4 header, including the options a larger ihl adds.
+        assert!(csum_start_in_ip_header(&frame(n, 14, &[], ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 33, &[], ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 34, &[], ipv4, 15)));
+        assert!(!csum_start_in_ip_header(&frame(n, 74, &[], ipv4, 15)));
+        // Tagged frames are checked against the IPv4 header behind their tags.
+        let vlan = [ETHERTYPE_VLAN];
+        let qinq = [ETHERTYPE_QINQ, ETHERTYPE_VLAN];
+        assert!(!csum_start_in_ip_header(&frame(n, 38, &vlan, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 37, &vlan, ipv4, 5)));
+        assert!(!csum_start_in_ip_header(&frame(n, 42, &qinq, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 41, &qinq, ipv4, 5)));
+        // The host parses up to VLAN_MAX_DEPTH tags; a deeper stack, or a frame too short to hold
+        // the IPv4 version byte, is refused.
+        let deepest = [ETHERTYPE_VLAN; VLAN_MAX_DEPTH];
+        assert!(!csum_start_in_ip_header(&frame(n, 66, &deepest, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 65, &deepest, ipv4, 5)));
+        let too_deep = [ETHERTYPE_VLAN; VLAN_MAX_DEPTH + 1];
+        assert!(csum_start_in_ip_header(&frame(n, 70, &too_deep, ipv4, 5)));
+        let mut short = frame(n, 34, &[], ipv4, 5);
+        short.truncate(vnet_hdr_len() + PAYLOAD_OFFSET);
+        assert!(csum_start_in_ip_header(&short));
+        // IPv6 offloads start at or past the end of the 40-byte base header.
+        let ipv6 = ETHERTYPE_IPV6;
+        assert!(!csum_start_in_ip_header(&frame(n, 54, &[], ipv6, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 53, &[], ipv6, 0)));
+        assert!(!csum_start_in_ip_header(&frame(n, 58, &vlan, ipv6, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 57, &vlan, ipv6, 0)));
+        // Every other protocol gets the host's generic 20-byte network header minimum, as does
+        // an IPv4 header claiming fewer bytes than that.
+        let arp = ETHERTYPE_ARP;
+        assert!(!csum_start_in_ip_header(&frame(n, 34, &[], arp, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 33, &[], arp, 0)));
+        assert!(!csum_start_in_ip_header(&frame(n, 42, &qinq, arp, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 20, &qinq, arp, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 30, &[], ipv4, 2)));
+        // A TCPv6 GSO request carries the IPv6 header minimum over any EtherType.
+        let tso6 = |csum_start: u16, ethertype: u16, gso_type: u8| {
+            let mut buf = frame(n, csum_start, &[], ethertype, 5);
+            buf[1] = gso_type;
+            buf
+        };
+        let gso = VIRTIO_NET_HDR_GSO_TCPV6;
+        let ecn = VIRTIO_NET_HDR_GSO_ECN;
+        assert!(!csum_start_in_ip_header(&tso6(54, ipv4, gso)));
+        assert!(csum_start_in_ip_header(&tso6(53, ipv4, gso)));
+        assert!(csum_start_in_ip_header(&tso6(53, arp, gso | ecn)));
     }
 
     #[test]
@@ -1962,7 +2092,6 @@ pub mod tests {
         let buffer = IoVecBuffer::from(&frame_buf[..frame_len]);
 
         let mut headers = vec![0; frame_hdr_len()];
-        buffer.read_exact_volatile_at(&mut headers, 0).unwrap();
 
         // Call the code which sends the packet to the host or MMDS.
         // Validate the frame was consumed by MMDS and that the metrics reflect that.

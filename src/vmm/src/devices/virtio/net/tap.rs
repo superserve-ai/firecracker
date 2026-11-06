@@ -8,6 +8,7 @@
 use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::Error as IoError;
+use std::mem::MaybeUninit;
 use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
@@ -15,7 +16,7 @@ use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
 use vmm_sys_util::ioctl_iow_nr;
 
 use crate::devices::virtio::iovec::IoVecBuffer;
-use crate::devices::virtio::net::generated;
+use crate::devices::virtio::net::{NET_QUEUE_MAX_SIZE, generated};
 
 // As defined in the Linux UAPI:
 // https://elixir.bootlin.com/linux/v4.17/source/include/uapi/linux/if.h#L33
@@ -180,14 +181,54 @@ impl Tap {
         Ok(())
     }
 
-    /// Write an `IoVecBuffer` to tap
-    pub(crate) fn write_iovec(&mut self, buffer: &IoVecBuffer) -> Result<usize, IoError> {
-        let iovcnt = i32::try_from(buffer.iovec_count()).unwrap();
-        let iov = buffer.as_iovec_ptr();
+    /// Write `prefix` and then `buffer` past its first `prefix.len()` bytes to tap. The guest can
+    /// rewrite its buffer concurrently, so the bytes the caller inspected go out from `prefix`.
+    pub(crate) fn write_iovec(
+        &mut self,
+        prefix: &[u8],
+        buffer: &IoVecBuffer,
+    ) -> Result<usize, IoError> {
+        // A descriptor chain never exceeds the queue size, so this covers it plus `prefix` without
+        // allocating per packet.
+        let mut iovs =
+            [const { MaybeUninit::<libc::iovec>::uninit() }; NET_QUEUE_MAX_SIZE as usize + 1];
+        let mut count = 0;
+        let mut push = |iov: libc::iovec| -> Result<(), IoError> {
+            iovs.get_mut(count)
+                .ok_or_else(|| IoError::from_raw_os_error(libc::EMSGSIZE))?
+                .write(iov);
+            count += 1;
+            Ok(())
+        };
+        push(libc::iovec {
+            iov_base: prefix.as_ptr().cast_mut().cast(),
+            iov_len: prefix.len(),
+        })?;
+        let mut skip = prefix.len();
+        for iov in buffer.as_iovec_slice() {
+            if skip >= iov.iov_len {
+                skip -= iov.iov_len;
+                continue;
+            }
+            push(libc::iovec {
+                // SAFETY: `skip < iov_len`, so the offset stays inside this guest region.
+                iov_base: unsafe { iov.iov_base.cast::<u8>().add(skip).cast() },
+                iov_len: iov.iov_len - skip,
+            })?;
+            skip = 0;
+        }
+        let iovcnt = i32::try_from(count).unwrap();
 
-        // SAFETY: `writev` is safe. Called with a valid tap fd, the iovec pointer and length
-        // is provide by the `IoVecBuffer` implementation and we check the return value.
-        let ret = unsafe { libc::writev(self.tap_file.as_raw_fd(), iov, iovcnt) };
+        // SAFETY: `writev` is safe. Called with a valid tap fd and the first `count` entries of
+        // `iovs`, all initialized above to cover `prefix` or a region of `buffer`; we check the
+        // return value.
+        let ret = unsafe {
+            libc::writev(
+                self.tap_file.as_raw_fd(),
+                iovs.as_ptr().cast::<libc::iovec>(),
+                iovcnt,
+            )
+        };
         if ret == -1 {
             return Err(IoError::last_os_error());
         }
@@ -306,18 +347,25 @@ pub mod tests {
             fragment3.as_slice(),
         ]);
 
-        let num_bytes = tap.write_iovec(&scattered).unwrap();
+        // The prefix spans into fragment2 and differs from the guest bytes it covers, as when the
+        // guest rewrites its buffer after the caller copied the headers.
+        let mut prefix = [fragment1.as_slice(), &fragment2[..10]].concat();
+        prefix[generated::ETH_HLEN as usize..]
+            .iter_mut()
+            .for_each(|b| *b ^= 0xff);
+
+        let num_bytes = tap.write_iovec(&prefix, &scattered).unwrap();
         assert_eq!(num_bytes, scattered.len() as usize);
 
         let mut read_buf = vec![0u8; scattered.len() as usize];
         assert!(tap_traffic_simulator.pop_rx_packet(&mut read_buf));
         assert_eq!(
-            &read_buf[..PAYLOAD_SIZE - VNET_HDR_SIZE],
-            &fragment1[VNET_HDR_SIZE..]
+            &read_buf[..PAYLOAD_SIZE + 10 - VNET_HDR_SIZE],
+            &prefix[VNET_HDR_SIZE..]
         );
         assert_eq!(
-            &read_buf[PAYLOAD_SIZE - VNET_HDR_SIZE..2 * PAYLOAD_SIZE - VNET_HDR_SIZE],
-            fragment2
+            &read_buf[PAYLOAD_SIZE + 10 - VNET_HDR_SIZE..2 * PAYLOAD_SIZE - VNET_HDR_SIZE],
+            &fragment2[10..]
         );
         assert_eq!(
             &read_buf[2 * PAYLOAD_SIZE - VNET_HDR_SIZE..3 * PAYLOAD_SIZE - VNET_HDR_SIZE],
