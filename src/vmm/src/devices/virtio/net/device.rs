@@ -87,10 +87,12 @@ fn frame_bytes_from_buf_mut(buf: &mut [u8]) -> Result<&mut [u8], NetError> {
 const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 const ETHERTYPE_VLAN: u16 = 0x8100;
 const ETHERTYPE_QINQ: u16 = 0x88a8;
+const ETHERTYPE_IPV6: u16 = 0x86dd;
+const IPV6_HLEN: usize = 40;
 
-// The host completes a guest-requested checksum at csum_start, so one inside the IPv4 header would
+// The host completes a guest-requested checksum at csum_start, so one inside the IP header would
 // rewrite a header the host already parsed. Tag stacks deeper than the host parses are refused.
-fn csum_start_in_ipv4_header(buf: &[u8]) -> bool {
+fn csum_start_in_ip_header(buf: &[u8]) -> bool {
     if buf.len() < vnet_hdr_len() || buf[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0 {
         return false;
     }
@@ -111,6 +113,7 @@ fn csum_start_in_ipv4_header(buf: &[u8]) -> bool {
                     .get(l3)
                     .is_none_or(|b| csum_start < l3 + usize::from(b & 0x0f) * 4);
             }
+            ETHERTYPE_IPV6 => return csum_start < l3 + IPV6_HLEN,
             _ => return false,
         }
     }
@@ -578,7 +581,7 @@ impl Net {
 
         // This frame goes to the TAP.
 
-        if csum_start_in_ipv4_header(raw_headers) {
+        if csum_start_in_ip_header(raw_headers) {
             net_metrics.tx_malformed_frames.inc();
             return Ok(false);
         }
@@ -1153,8 +1156,8 @@ pub mod tests {
     }
 
     #[test]
-    fn test_csum_start_in_ipv4_header() {
-        // vnet header + Ethernet + VLAN tags + 20-byte IPv4 header + 8 bytes of UDP, cut to the
+    fn test_csum_start_in_ip_header() {
+        // vnet header + Ethernet + VLAN tags + 20-byte IP header + 8 bytes of UDP, cut to the
         // header prefix the TX path inspects.
         let frame = |flags: u8, csum_start: u16, tags: &[u16], ethertype: u16, ihl: u8| {
             let mut buf = vec![0u8; vnet_hdr_len() + PAYLOAD_OFFSET + 4 * tags.len() + 28];
@@ -1174,33 +1177,40 @@ pub mod tests {
         let ipv4 = ETHERTYPE_IPV4;
 
         // A real checksum offload starts at the L4 header.
-        assert!(!csum_start_in_ipv4_header(&frame(n, 34, &[], ipv4, 5)));
+        assert!(!csum_start_in_ip_header(&frame(n, 34, &[], ipv4, 5)));
         // Without NEEDS_CSUM the kernel ignores csum_start.
-        assert!(!csum_start_in_ipv4_header(&frame(0, 14, &[], ipv4, 5)));
+        assert!(!csum_start_in_ip_header(&frame(0, 14, &[], ipv4, 5)));
         // Inside the IPv4 header, including the options a larger ihl adds.
-        assert!(csum_start_in_ipv4_header(&frame(n, 14, &[], ipv4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 33, &[], ipv4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 34, &[], ipv4, 15)));
-        assert!(!csum_start_in_ipv4_header(&frame(n, 74, &[], ipv4, 15)));
+        assert!(csum_start_in_ip_header(&frame(n, 14, &[], ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 33, &[], ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 34, &[], ipv4, 15)));
+        assert!(!csum_start_in_ip_header(&frame(n, 74, &[], ipv4, 15)));
         // Tagged frames are checked against the IPv4 header behind their tags.
         let vlan = [ETHERTYPE_VLAN];
         let qinq = [ETHERTYPE_QINQ, ETHERTYPE_VLAN];
-        assert!(!csum_start_in_ipv4_header(&frame(n, 38, &vlan, ipv4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 37, &vlan, ipv4, 5)));
-        assert!(!csum_start_in_ipv4_header(&frame(n, 42, &qinq, ipv4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 41, &qinq, ipv4, 5)));
+        assert!(!csum_start_in_ip_header(&frame(n, 38, &vlan, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 37, &vlan, ipv4, 5)));
+        assert!(!csum_start_in_ip_header(&frame(n, 42, &qinq, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 41, &qinq, ipv4, 5)));
         // The host parses up to VLAN_MAX_DEPTH tags; a deeper stack, or a frame too short to hold
         // the IPv4 version byte, is refused.
         let deepest = [ETHERTYPE_VLAN; VLAN_MAX_DEPTH];
-        assert!(!csum_start_in_ipv4_header(&frame(n, 66, &deepest, ipv4, 5)));
-        assert!(csum_start_in_ipv4_header(&frame(n, 65, &deepest, ipv4, 5)));
+        assert!(!csum_start_in_ip_header(&frame(n, 66, &deepest, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 65, &deepest, ipv4, 5)));
         let too_deep = [ETHERTYPE_VLAN; VLAN_MAX_DEPTH + 1];
-        assert!(csum_start_in_ipv4_header(&frame(n, 70, &too_deep, ipv4, 5)));
+        assert!(csum_start_in_ip_header(&frame(n, 70, &too_deep, ipv4, 5)));
         let mut short = frame(n, 34, &[], ipv4, 5);
         short.truncate(vnet_hdr_len() + PAYLOAD_OFFSET);
-        assert!(csum_start_in_ipv4_header(&short));
+        assert!(csum_start_in_ip_header(&short));
+        // IPv6 offloads start at or past the end of the 40-byte base header.
+        let ipv6 = ETHERTYPE_IPV6;
+        assert!(!csum_start_in_ip_header(&frame(n, 54, &[], ipv6, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 53, &[], ipv6, 0)));
+        assert!(!csum_start_in_ip_header(&frame(n, 58, &vlan, ipv6, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 57, &vlan, ipv6, 0)));
         // Other protocols are untouched.
-        assert!(!csum_start_in_ipv4_header(&frame(n, 14, &[], 0x86dd, 5)));
+        let arp = ETHERTYPE_ARP;
+        assert!(!csum_start_in_ip_header(&frame(n, 14, &[], arp, 0)));
     }
 
     #[test]
