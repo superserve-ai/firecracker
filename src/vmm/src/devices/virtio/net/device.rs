@@ -89,9 +89,11 @@ const ETHERTYPE_VLAN: u16 = 0x8100;
 const ETHERTYPE_QINQ: u16 = 0x88a8;
 const ETHERTYPE_IPV6: u16 = 0x86dd;
 const IPV6_HLEN: usize = 40;
+// The host assumes at least this much network header for any protocol.
+const NET_HDR_MIN_LEN: usize = 20;
 
-// The host completes a guest-requested checksum at csum_start, so one inside the IP header would
-// rewrite a header the host already parsed. Tag stacks deeper than the host parses are refused.
+// The host completes a guest-requested checksum at csum_start, so one inside the network header
+// would rewrite a header the host already parsed. Tag stacks deeper than the host parses are refused.
 fn csum_start_in_ip_header(buf: &[u8]) -> bool {
     if buf.len() < vnet_hdr_len() || buf[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0 {
         return false;
@@ -109,12 +111,12 @@ fn csum_start_in_ip_header(buf: &[u8]) -> bool {
             }
             ETHERTYPE_VLAN | ETHERTYPE_QINQ => return true,
             ETHERTYPE_IPV4 => {
-                return frame
-                    .get(l3)
-                    .is_none_or(|b| csum_start < l3 + usize::from(b & 0x0f) * 4);
+                return frame.get(l3).is_none_or(|b| {
+                    csum_start < l3 + NET_HDR_MIN_LEN.max(usize::from(b & 0x0f) * 4)
+                });
             }
             ETHERTYPE_IPV6 => return csum_start < l3 + IPV6_HLEN,
-            _ => return false,
+            _ => return csum_start < l3 + NET_HDR_MIN_LEN,
         }
     }
 }
@@ -1208,9 +1210,14 @@ pub mod tests {
         assert!(csum_start_in_ip_header(&frame(n, 53, &[], ipv6, 0)));
         assert!(!csum_start_in_ip_header(&frame(n, 58, &vlan, ipv6, 0)));
         assert!(csum_start_in_ip_header(&frame(n, 57, &vlan, ipv6, 0)));
-        // Other protocols are untouched.
+        // Every other protocol gets the host's generic 20-byte network header minimum, as does
+        // an IPv4 header claiming fewer bytes than that.
         let arp = ETHERTYPE_ARP;
-        assert!(!csum_start_in_ip_header(&frame(n, 14, &[], arp, 0)));
+        assert!(!csum_start_in_ip_header(&frame(n, 34, &[], arp, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 33, &[], arp, 0)));
+        assert!(!csum_start_in_ip_header(&frame(n, 42, &qinq, arp, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 20, &qinq, arp, 0)));
+        assert!(csum_start_in_ip_header(&frame(n, 30, &[], ipv4, 2)));
     }
 
     #[test]
