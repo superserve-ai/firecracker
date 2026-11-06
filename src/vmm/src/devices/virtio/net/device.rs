@@ -91,6 +91,8 @@ const ETHERTYPE_IPV6: u16 = 0x86dd;
 const IPV6_HLEN: usize = 40;
 // The host assumes at least this much network header for any protocol.
 const NET_HDR_MIN_LEN: usize = 20;
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+const VIRTIO_NET_HDR_GSO_ECN: u8 = 0x80;
 
 // The host completes a guest-requested checksum at csum_start, so one inside the network header
 // would rewrite a header the host already parsed. Tag stacks deeper than the host parses are refused.
@@ -101,7 +103,7 @@ fn csum_start_in_ip_header(buf: &[u8]) -> bool {
     let csum_start = usize::from(u16::from_le_bytes([buf[6], buf[7]]));
     let frame = &buf[vnet_hdr_len()..];
     let mut l3 = PAYLOAD_OFFSET;
-    loop {
+    let net_hdr_len = loop {
         let Some(ethertype) = frame.get(l3 - 2..l3) else {
             return true;
         };
@@ -110,15 +112,21 @@ fn csum_start_in_ip_header(buf: &[u8]) -> bool {
                 l3 += VLAN_HLEN
             }
             ETHERTYPE_VLAN | ETHERTYPE_QINQ => return true,
-            ETHERTYPE_IPV4 => {
-                return frame.get(l3).is_none_or(|b| {
-                    csum_start < l3 + NET_HDR_MIN_LEN.max(usize::from(b & 0x0f) * 4)
-                });
-            }
-            ETHERTYPE_IPV6 => return csum_start < l3 + IPV6_HLEN,
-            _ => return csum_start < l3 + NET_HDR_MIN_LEN,
+            ETHERTYPE_IPV4 => match frame.get(l3) {
+                Some(b) => break usize::from(b & 0x0f) * 4,
+                None => return true,
+            },
+            ETHERTYPE_IPV6 => break IPV6_HLEN,
+            _ => break 0,
         }
-    }
+    };
+    // The host takes the TCPv6 minimum from gso_type, whatever the EtherType says.
+    let gso_hdr_len = if buf[1] & !VIRTIO_NET_HDR_GSO_ECN == VIRTIO_NET_HDR_GSO_TCPV6 {
+        IPV6_HLEN
+    } else {
+        0
+    };
+    csum_start < l3 + net_hdr_len.max(gso_hdr_len).max(NET_HDR_MIN_LEN)
 }
 
 // This initializes to all 0 the VNET hdr part of a buf.
@@ -1218,6 +1226,17 @@ pub mod tests {
         assert!(!csum_start_in_ip_header(&frame(n, 42, &qinq, arp, 0)));
         assert!(csum_start_in_ip_header(&frame(n, 20, &qinq, arp, 0)));
         assert!(csum_start_in_ip_header(&frame(n, 30, &[], ipv4, 2)));
+        // A TCPv6 GSO request carries the IPv6 header minimum over any EtherType.
+        let tso6 = |csum_start: u16, ethertype: u16, gso_type: u8| {
+            let mut buf = frame(n, csum_start, &[], ethertype, 5);
+            buf[1] = gso_type;
+            buf
+        };
+        let gso = VIRTIO_NET_HDR_GSO_TCPV6;
+        let ecn = VIRTIO_NET_HDR_GSO_ECN;
+        assert!(!csum_start_in_ip_header(&tso6(54, ipv4, gso)));
+        assert!(csum_start_in_ip_header(&tso6(53, ipv4, gso)));
+        assert!(csum_start_in_ip_header(&tso6(53, arp, gso | ecn)));
     }
 
     #[test]
