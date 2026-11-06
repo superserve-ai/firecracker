@@ -8,6 +8,7 @@
 use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::Error as IoError;
+use std::mem::MaybeUninit;
 use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
@@ -15,7 +16,7 @@ use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
 use vmm_sys_util::ioctl_iow_nr;
 
 use crate::devices::virtio::iovec::IoVecBuffer;
-use crate::devices::virtio::net::generated;
+use crate::devices::virtio::net::{NET_QUEUE_MAX_SIZE, generated};
 
 // As defined in the Linux UAPI:
 // https://elixir.bootlin.com/linux/v4.17/source/include/uapi/linux/if.h#L33
@@ -187,29 +188,47 @@ impl Tap {
         prefix: &[u8],
         buffer: &IoVecBuffer,
     ) -> Result<usize, IoError> {
-        let mut iovs = Vec::with_capacity(buffer.iovec_count() + 1);
-        iovs.push(libc::iovec {
+        // A descriptor chain never exceeds the queue size, so this covers it plus `prefix` without
+        // allocating per packet.
+        let mut iovs =
+            [const { MaybeUninit::<libc::iovec>::uninit() }; NET_QUEUE_MAX_SIZE as usize + 1];
+        let mut count = 0;
+        let mut push = |iov: libc::iovec| -> Result<(), IoError> {
+            iovs.get_mut(count)
+                .ok_or_else(|| IoError::from_raw_os_error(libc::EMSGSIZE))?
+                .write(iov);
+            count += 1;
+            Ok(())
+        };
+        push(libc::iovec {
             iov_base: prefix.as_ptr().cast_mut().cast(),
             iov_len: prefix.len(),
-        });
+        })?;
         let mut skip = prefix.len();
         for iov in buffer.as_iovec_slice() {
             if skip >= iov.iov_len {
                 skip -= iov.iov_len;
                 continue;
             }
-            iovs.push(libc::iovec {
+            push(libc::iovec {
                 // SAFETY: `skip < iov_len`, so the offset stays inside this guest region.
                 iov_base: unsafe { iov.iov_base.cast::<u8>().add(skip).cast() },
                 iov_len: iov.iov_len - skip,
-            });
+            })?;
             skip = 0;
         }
-        let iovcnt = i32::try_from(iovs.len()).unwrap();
+        let iovcnt = i32::try_from(count).unwrap();
 
-        // SAFETY: `writev` is safe. Called with a valid tap fd, every iovec covers either `prefix`
-        // or a region of `buffer`, and we check the return value.
-        let ret = unsafe { libc::writev(self.tap_file.as_raw_fd(), iovs.as_ptr(), iovcnt) };
+        // SAFETY: `writev` is safe. Called with a valid tap fd and the first `count` entries of
+        // `iovs`, all initialized above to cover `prefix` or a region of `buffer`; we check the
+        // return value.
+        let ret = unsafe {
+            libc::writev(
+                self.tap_file.as_raw_fd(),
+                iovs.as_ptr().cast::<libc::iovec>(),
+                iovcnt,
+            )
+        };
         if ret == -1 {
             return Err(IoError::last_os_error());
         }
