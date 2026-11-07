@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the in-process UFFD handler (MemBackendType=UffdInternal)."""
 
+import struct
 from pathlib import Path
 
 import pytest
+
+MEMHP_BOOTARGS = "console=ttyS0 reboot=k panic=1 memhp_default_state=online_movable"
 
 
 @pytest.fixture(scope="function", name="snapshot")
@@ -144,3 +147,46 @@ def test_record_and_replay_roundtrip(uvm_plain, microvm_factory, snapshot):
     jailed_replay_log = replay.create_jailed_resource(str(recorded_log))
     _restore_uffd_internal(replay, snapshot, access_log_path=jailed_replay_log)
     replay.ssh.check_output("true")
+
+
+def _read_presence(mem_path):
+    """Parse the FCPRSNC1 presence side-car next to `mem_path` into a list of bools."""
+    data = Path(f"{mem_path}.presence").read_bytes()
+    assert data[:8] == b"FCPRSNC1"
+    page_size, npages = struct.unpack_from("<QQ", data, 8)
+    words = struct.unpack_from(f"<{(npages + 63) // 64}Q", data, 24)
+    return page_size, [bool(words[i // 64] >> (i % 64) & 1) for i in range(npages)]
+
+
+def test_unplugged_memory_is_not_restored(uvm_plain_6_1, microvm_factory):
+    """Memory unplugged before a snapshot is not marked present, and a restored VM
+    can plug it again and use it."""
+    vm = uvm_plain_6_1
+    vm.memory_monitor = None
+    vm.spawn()
+    vm.basic_config(boot_args=MEMHP_BOOTARGS, mem_size_mib=512)
+    vm.api.memory_hotplug.put(total_size_mib=1024, slot_size_mib=128, block_size_mib=2)
+    vm.add_net_iface()
+    vm.start()
+
+    vm.hotplug_memory(1024)
+    vm.ssh.check_output("mount -o remount,size=1024M -t tmpfs tmpfs /dev/shm")
+    vm.ssh.check_output("dd if=/dev/urandom of=/dev/shm/hp bs=1M count=768")
+    vm.ssh.check_output("rm /dev/shm/hp")
+    vm.hotplug_memory(0)
+
+    snapshot = vm.snapshot_full()
+    page_size, present = _read_presence(snapshot.mem)
+    vm.kill()
+    dram_pages = (512 << 20) // page_size
+    assert len(present) == dram_pages + (1024 << 20) // page_size
+    assert all(present[:dram_pages])
+    assert not any(present[dram_pages:])
+
+    restored = microvm_factory.build()
+    restored.memory_monitor = None
+    restored.spawn()
+    _restore_uffd_internal(restored, snapshot)
+    restored.hotplug_memory(1024)
+    restored.ssh.check_output("mount -o remount,size=1024M -t tmpfs tmpfs /dev/shm")
+    restored.ssh.check_output("dd if=/dev/zero of=/dev/shm/hp bs=1M count=768")
