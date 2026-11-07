@@ -32,6 +32,21 @@ pub struct VirtioMemState {
     plugged_blocks: Vec<bool>,
 }
 
+impl VirtioMemState {
+    /// Guest-physical (start, len) runs of the blocks the guest has not plugged.
+    pub(crate) fn unplugged_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (i, _) in self.plugged_blocks.iter().enumerate().filter(|(_, p)| !**p) {
+            let start = self.addr + usize_to_u64(i) * self.block_size;
+            match ranges.last_mut() {
+                Some(last) if last.0 + last.1 == start => last.1 += self.block_size,
+                _ => ranges.push((start, self.block_size)),
+            }
+        }
+        ranges
+    }
+}
+
 #[derive(Debug)]
 pub struct VirtioMemConstructorArgs {
     vm: Arc<Vm>,
@@ -112,6 +127,44 @@ mod tests {
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::mem::device::test_utils::default_virtio_mem;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    fn state_with_blocks(plugged_blocks: Vec<bool>) -> VirtioMemState {
+        VirtioMemState {
+            virtio_state: VirtioDeviceState {
+                device_type: VirtioDeviceType::Mem,
+                avail_features: 0,
+                acked_features: 0,
+                queues: Vec::new(),
+                activated: true,
+            },
+            addr: 0x1_0000_0000,
+            region_size: 0x80_0000,
+            block_size: 0x20_0000,
+            usable_region_size: 0x80_0000,
+            requested_size: 0,
+            // Two blocks per slot, so block 1 below is unplugged inside a plugged slot.
+            slot_size: 0x40_0000,
+            plugged_blocks,
+        }
+    }
+
+    #[test]
+    fn test_unplugged_ranges() {
+        let state = state_with_blocks(vec![true; 4]);
+        assert!(state.unplugged_ranges().is_empty());
+
+        let state = state_with_blocks(vec![false; 4]);
+        assert_eq!(state.unplugged_ranges(), vec![(0x1_0000_0000, 0x80_0000)]);
+
+        let state = state_with_blocks(vec![true, false, false, true]);
+        assert_eq!(state.unplugged_ranges(), vec![(0x1_0020_0000, 0x40_0000)]);
+
+        let state = state_with_blocks(vec![false, true, false, false]);
+        assert_eq!(
+            state.unplugged_ranges(),
+            vec![(0x1_0000_0000, 0x20_0000), (0x1_0040_0000, 0x40_0000)]
+        );
+    }
 
     #[test]
     fn test_save_state() {
