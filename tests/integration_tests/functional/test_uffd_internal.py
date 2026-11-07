@@ -25,9 +25,15 @@ def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs):
 
 
 def _restore_uffd_internal(
-    vm, snapshot, *, access_log_path=None, record_to=None, track_dirty_pages=False
+    vm,
+    snapshot,
+    *,
+    access_log_path=None,
+    record_to=None,
+    track_dirty_pages=False,
+    backend_type="UffdInternal",
 ):
-    """Restore `snapshot` into `vm` using the UffdInternal backend.
+    """Restore `snapshot` into `vm` using the UffdInternal (or another) backend.
 
     Mirrors the disk + interface plumbing in `Microvm.restore_from_snapshot` but bypasses
     its external-handler path so we can set our own `mem_backend` fields.
@@ -49,7 +55,7 @@ def _restore_uffd_internal(
     vm.kernel_file = Path(vm.kernel_file)
 
     mem_backend = {
-        "backend_type": "UffdInternal",
+        "backend_type": backend_type,
         "backend_path": str(jailed_mem),
     }
     if access_log_path is not None:
@@ -160,10 +166,30 @@ def _read_presence(mem_path):
     return page_size, [bool(words[i // 64] >> (i % 64) & 1) for i in range(npages)]
 
 
-def test_unplugged_memory_is_not_restored(uvm_plain_6_1, microvm_factory):
+def _hotplug_range_contains(mem_path, start, length, marker):
+    """Whether `marker` occurs in [start, start + length) of the memory file."""
+    chunk = 64 << 20
+    with open(mem_path, "rb") as f:
+        f.seek(start)
+        tail = b""
+        while length > 0:
+            new = f.read(min(chunk, length))
+            if not new:
+                break
+            data = tail + new
+            if marker in data:
+                return True
+            length -= len(new)
+            tail = data[-len(marker) :]
+    return False
+
+
+@pytest.mark.parametrize("backend_type", ["File", "UffdInternal"])
+def test_unplugged_memory_is_not_restored(uvm_plain_6_1, microvm_factory, backend_type):
     """Memory unplugged before a snapshot is not marked present, and a restored VM
-    can plug it again, with the next diff capturing all of it so a layered restore
-    never falls through to older contents."""
+    that plugs it again reads zeros there rather than what the memory file still
+    holds, with the next diff capturing the whole range."""
+    marker = b"stale-hotplug-contents"
     vm = uvm_plain_6_1
     vm.memory_monitor = None
     vm.spawn()
@@ -174,26 +200,35 @@ def test_unplugged_memory_is_not_restored(uvm_plain_6_1, microvm_factory):
 
     vm.hotplug_memory(1024)
     vm.ssh.check_output("mount -o remount,size=1024M -t tmpfs tmpfs /dev/shm")
-    vm.ssh.check_output("dd if=/dev/urandom of=/dev/shm/hp bs=1M count=768")
+    vm.ssh.check_output(f"yes {marker.decode()} | head -c 768M > /dev/shm/hp")
+    vm.snapshot_full()
+    vm.resume()
     vm.ssh.check_output("rm /dev/shm/hp")
     vm.hotplug_memory(0)
 
+    # Same-size full dump into the same file: unplugged slots keep the marker.
     snapshot = vm.snapshot_full()
     page_size, present = _read_presence(snapshot.mem)
     vm.kill()
-    dram_pages = (512 << 20) // page_size
-    assert len(present) == dram_pages + (1024 << 20) // page_size
+    dram_bytes, hotplug_bytes = 512 << 20, 1024 << 20
+    dram_pages = dram_bytes // page_size
+    assert len(present) == dram_pages + hotplug_bytes // page_size
     assert all(present[:dram_pages])
     assert not any(present[dram_pages:])
+    assert _hotplug_range_contains(snapshot.mem, dram_bytes, hotplug_bytes, marker)
 
     restored = microvm_factory.build()
     restored.memory_monitor = None
     restored.spawn()
-    _restore_uffd_internal(restored, snapshot, track_dirty_pages=True)
+    _restore_uffd_internal(
+        restored, snapshot, track_dirty_pages=True, backend_type=backend_type
+    )
     restored.hotplug_memory(1024)
+    # Every re-plugged page is in the diff, so the diff holds what the guest reads.
     diff = restored.snapshot_diff(mem_path="mem.diff", vmstate_path="vmstate.diff")
     _, present = _read_presence(diff.mem)
     assert all(present[dram_pages:])
+    assert not _hotplug_range_contains(diff.mem, dram_bytes, hotplug_bytes, marker)
     restored.resume()
     restored.ssh.check_output("mount -o remount,size=1024M -t tmpfs tmpfs /dev/shm")
     restored.ssh.check_output("dd if=/dev/zero of=/dev/shm/hp bs=1M count=768")
