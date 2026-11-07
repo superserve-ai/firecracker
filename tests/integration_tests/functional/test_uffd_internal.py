@@ -24,7 +24,9 @@ def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs):
     yield snap
 
 
-def _restore_uffd_internal(vm, snapshot, *, access_log_path=None, record_to=None):
+def _restore_uffd_internal(
+    vm, snapshot, *, access_log_path=None, record_to=None, track_dirty_pages=False
+):
     """Restore `snapshot` into `vm` using the UffdInternal backend.
 
     Mirrors the disk + interface plumbing in `Microvm.restore_from_snapshot` but bypasses
@@ -58,7 +60,7 @@ def _restore_uffd_internal(vm, snapshot, *, access_log_path=None, record_to=None
     vm.api.snapshot_load.put(
         mem_backend=mem_backend,
         snapshot_path=str(jailed_vmstate),
-        enable_diff_snapshots=False,
+        track_dirty_pages=track_dirty_pages,
         resume_vm=True,
     )
 
@@ -160,7 +162,8 @@ def _read_presence(mem_path):
 
 def test_unplugged_memory_is_not_restored(uvm_plain_6_1, microvm_factory):
     """Memory unplugged before a snapshot is not marked present, and a restored VM
-    can plug it again and use it."""
+    can plug it again, with the next diff capturing all of it so a layered restore
+    never falls through to older contents."""
     vm = uvm_plain_6_1
     vm.memory_monitor = None
     vm.spawn()
@@ -186,7 +189,11 @@ def test_unplugged_memory_is_not_restored(uvm_plain_6_1, microvm_factory):
     restored = microvm_factory.build()
     restored.memory_monitor = None
     restored.spawn()
-    _restore_uffd_internal(restored, snapshot)
+    _restore_uffd_internal(restored, snapshot, track_dirty_pages=True)
     restored.hotplug_memory(1024)
+    diff = restored.snapshot_diff(mem_path="mem.diff", vmstate_path="vmstate.diff")
+    _, present = _read_presence(diff.mem)
+    assert all(present[dram_pages:])
+    restored.resume()
     restored.ssh.check_output("mount -o remount,size=1024M -t tmpfs tmpfs /dev/shm")
     restored.ssh.check_output("dd if=/dev/zero of=/dev/shm/hp bs=1M count=768")
