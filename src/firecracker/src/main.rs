@@ -54,9 +54,11 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// eager-overlay: `LoadSnapshot` accepts `mem_backend.eager_overlay`, under the
 /// same deny-unknown-fields rule.
 /// skip-zero-holes: `LoadSnapshot` accepts `mem_backend.skip_zero_holes`, likewise.
-/// memory-hotplug: virtio-mem memory the guest has unplugged is neither saved as
-/// present in a snapshot nor restored from one, so a supervisor may enable hotplug
-/// on VMs it snapshots.
+/// memory-hotplug: virtio-mem memory the guest has unplugged is not saved as present
+/// in a snapshot, and a block the guest plugs again after any restore is discarded
+/// first rather than exposing what the snapshot held there (an external UFFD handler
+/// sees this as a remove event, as for the balloon), so a supervisor may enable
+/// hotplug on VMs it snapshots.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",

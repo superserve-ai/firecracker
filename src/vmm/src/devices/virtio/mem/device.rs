@@ -504,12 +504,12 @@ impl VirtioMem {
     }
 
     /// Applies the request to a single KVM slot: updates KVM first and, only if that succeeds,
-    /// commits the block state for the blocks the request touches and (when unplugging) discards
-    /// them. Committing after the KVM update keeps the block state consistent with KVM on a partial
-    /// failure, and a block is never discarded before it is committed as unplugged.
+    /// commits the block state for the blocks the request touches and discards them. Committing
+    /// after the KVM update keeps the block state consistent with KVM on a partial failure, and a
+    /// block is never discarded before its new state is committed.
     ///
     /// Returns `true` if the slot's discard failed. That is not fatal and is not reported to the
-    /// driver; the caller aggregates it into a single metric per request.
+    /// driver; for unplugs the caller aggregates it into a single metric per request.
     fn apply_range_to_slot(
         &mut self,
         slot_num: u32,
@@ -546,13 +546,16 @@ impl VirtioMem {
 
         let addr = GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
         let len = self.nb_blocks_to_len(touched.len());
+        // Plugging discards too: memory restored from a snapshot file, or by an external UFFD
+        // handler, may still hold what the blocks contained before they were unplugged.
+        if let Err(err) = self.guest_memory().discard_range(addr, len) {
+            error!("virtio-mem: Failed to discard memory range: {}", err);
+            return Ok(true);
+        }
         if plug {
             // The next diff must cover plugged blocks: an earlier layer of the snapshot
             // chain may still hold contents from before they were unplugged.
             self.guest_memory().mark_dirty(addr, len);
-        } else if let Err(err) = self.guest_memory().discard_range(addr, len) {
-            error!("virtio-mem: Failed to discard memory range: {}", err);
-            return Ok(true);
         }
         Ok(false)
     }
@@ -597,7 +600,7 @@ impl VirtioMem {
             discard_failed |=
                 self.apply_range_to_slot(slot_num, first_block, block_count, &req_blocks, plug)?;
         }
-        if discard_failed {
+        if discard_failed && !plug {
             METRICS.unplug_discard_fails.inc();
         }
         Ok(())
@@ -1124,14 +1127,16 @@ mod tests {
 
     #[test]
     fn test_plug_marks_range_dirty() {
-        let mut dev = test_utils::virtio_mem(true);
-        let addr = dev.guest_address();
-        let block = u64_to_usize(dev.config.block_size);
-        dev.update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
+        let mem_dev = test_utils::virtio_mem(true);
+        let guest_mem = mem_dev.vm.guest_memory().clone();
+        let mut th = test_helper(mem_dev, &guest_mem);
+        let addr = th.device().guest_address();
+        let block = u64_to_usize(th.device().config.block_size);
+        th.device()
+            .update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
             .unwrap();
 
-        let hp_region = dev
-            .guest_memory()
+        let hp_region = guest_mem
             .iter()
             .find(|r| r.region_type == GuestRegionType::Hotpluggable)
             .unwrap();
