@@ -544,16 +544,15 @@ impl VirtioMem {
         self.config.plugged_size -= usize_to_u64(self.nb_blocks_to_len(plugged_before));
         self.config.plugged_size += usize_to_u64(self.nb_blocks_to_len(plugged_after));
 
-        if !plug {
-            let addr =
-                GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
-            if let Err(err) = self
-                .guest_memory()
-                .discard_range(addr, self.nb_blocks_to_len(touched.len()))
-            {
-                error!("virtio-mem: Failed to discard memory range: {}", err);
-                return Ok(true);
-            }
+        let addr = GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
+        let len = self.nb_blocks_to_len(touched.len());
+        if plug {
+            // The next diff must cover plugged blocks: an earlier layer of the snapshot
+            // chain may still hold contents from before they were unplugged.
+            self.guest_memory().mark_dirty(addr, len);
+        } else if let Err(err) = self.guest_memory().discard_range(addr, len) {
+            error!("virtio-mem: Failed to discard memory range: {}", err);
+            return Ok(true);
         }
         Ok(false)
     }
@@ -762,12 +761,16 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) fn default_virtio_mem() -> VirtioMem {
+        virtio_mem(false)
+    }
+
+    pub(crate) fn virtio_mem(track_dirty_pages: bool) -> VirtioMem {
         let (_, mut vm) = setup_vm_with_memory(0x1000);
         let addr = GuestAddress(512 << 30);
         vm.register_hotpluggable_memory_region(
             memory::anonymous(
                 std::iter::once((addr, mib_to_bytes(1024))),
-                false,
+                track_dirty_pages,
                 HugePageConfig::None,
             )
             .unwrap()
@@ -785,6 +788,7 @@ mod tests {
     use std::ptr::null_mut;
 
     use serde_json::de;
+    use vm_memory::bitmap::Bitmap;
     use vm_memory::guest_memory;
     use vm_memory::mmap::MmapRegionBuilder;
 
@@ -1116,6 +1120,25 @@ mod tests {
         assert_eq!(METRICS.plug_count.count(), plug_count + 1);
         assert_eq!(METRICS.plug_bytes.count(), plug_bytes + (2 << 20));
         assert_eq!(METRICS.plug_fails.count(), plug_fails);
+    }
+
+    #[test]
+    fn test_plug_marks_range_dirty() {
+        let mut dev = test_utils::virtio_mem(true);
+        let addr = dev.guest_address();
+        let block = u64_to_usize(dev.config.block_size);
+        dev.update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
+            .unwrap();
+
+        let hp_region = dev
+            .guest_memory()
+            .iter()
+            .find(|r| r.region_type == GuestRegionType::Hotpluggable)
+            .unwrap();
+        let bitmap = hp_region.bitmap();
+        assert!(bitmap.dirty_at(0));
+        assert!(bitmap.dirty_at(block - 1));
+        assert!(!bitmap.dirty_at(block));
     }
 
     #[test]
