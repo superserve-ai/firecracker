@@ -508,8 +508,8 @@ impl VirtioMem {
     /// after the KVM update keeps the block state consistent with KVM on a partial failure, and a
     /// block is never discarded before its new state is committed.
     ///
-    /// Returns `true` if the slot's discard failed. That is not fatal and is not reported to the
-    /// driver; for unplugs the caller aggregates it into a single metric per request.
+    /// Returns `true` if an unplug's discard failed. That is not fatal and is not reported to the
+    /// driver; the caller aggregates it into a single metric per request.
     fn apply_range_to_slot(
         &mut self,
         slot_num: u32,
@@ -546,16 +546,30 @@ impl VirtioMem {
 
         let addr = GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
         let len = self.nb_blocks_to_len(touched.len());
-        // Plugging discards too: memory restored from a snapshot file, or by an external UFFD
-        // handler, may still hold what the blocks contained before they were unplugged.
-        if let Err(err) = self.guest_memory().discard_range(addr, len) {
-            error!("virtio-mem: Failed to discard memory range: {}", err);
-            return Ok(true);
-        }
         if plug {
             // The next diff must cover plugged blocks: an earlier layer of the snapshot
             // chain may still hold contents from before they were unplugged.
             self.guest_memory().mark_dirty(addr, len);
+        }
+        // Plugging discards too: memory restored from a snapshot file, or by an external UFFD
+        // handler, may still hold what the blocks contained before they were unplugged.
+        if let Err(err) = self.guest_memory().discard_range(addr, len) {
+            if !plug {
+                error!("virtio-mem: Failed to discard memory range: {}", err);
+                return Ok(true);
+            }
+            // Some backings can't discard (hugetlbfs before Linux 5.18): zero the blocks
+            // instead, so a plug never exposes their earlier contents.
+            debug!(
+                "virtio-mem: zeroing plugged range after failed discard: {}",
+                err
+            );
+            let zeros = [0u8; 4096];
+            for off in (0..len).step_by(zeros.len()) {
+                self.guest_memory()
+                    .write_slice(&zeros, addr.unchecked_add(usize_to_u64(off)))
+                    .expect("plugged blocks are mapped guest memory");
+            }
         }
         Ok(false)
     }
@@ -600,7 +614,7 @@ impl VirtioMem {
             discard_failed |=
                 self.apply_range_to_slot(slot_num, first_block, block_count, &req_blocks, plug)?;
         }
-        if discard_failed && !plug {
+        if discard_failed {
             METRICS.unplug_discard_fails.inc();
         }
         Ok(())
