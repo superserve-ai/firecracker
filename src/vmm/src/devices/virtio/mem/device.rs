@@ -781,22 +781,27 @@ pub(crate) mod test_utils {
         virtio_mem(false)
     }
 
+    pub(crate) const HOTPLUG_ADDR: GuestAddress = GuestAddress(512 << 30);
+
     pub(crate) fn virtio_mem(track_dirty_pages: bool) -> VirtioMem {
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
-        let addr = GuestAddress(512 << 30);
-        vm.register_hotpluggable_memory_region(
+        virtio_mem_on(
             memory::anonymous(
-                std::iter::once((addr, mib_to_bytes(1024))),
+                std::iter::once((HOTPLUG_ADDR, mib_to_bytes(1024))),
                 track_dirty_pages,
                 HugePageConfig::None,
             )
             .unwrap()
             .pop()
             .unwrap(),
-            mib_to_bytes(128),
-        );
+        )
+    }
+
+    /// A virtio-mem device over `region`, a 1 GiB region at [`HOTPLUG_ADDR`].
+    pub(crate) fn virtio_mem_on(region: GuestRegionMmap) -> VirtioMem {
+        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        vm.register_hotpluggable_memory_region(region, mib_to_bytes(128));
         let vm = Arc::new(vm);
-        VirtioMem::new(vm, addr, 1024, 2, 128).unwrap()
+        VirtioMem::new(vm, HOTPLUG_ADDR, 1024, 2, 128).unwrap()
     }
 }
 
@@ -1158,6 +1163,33 @@ mod tests {
         assert!(bitmap.dirty_at(0));
         assert!(bitmap.dirty_at(block - 1));
         assert!(!bitmap.dirty_at(block));
+    }
+
+    #[test]
+    fn test_plug_zeroes_blocks_restored_from_a_file() {
+        use std::os::unix::fs::FileExt;
+
+        // A memory file whose unplugged blocks still hold earlier contents.
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        file.set_len(usize_to_u64(mib_to_bytes(1024))).unwrap();
+        file.write_all_at(&[0xAB; 4096], 0).unwrap();
+        let region = crate::vstate::memory::snapshot_file(
+            file,
+            std::iter::once((test_utils::HOTPLUG_ADDR, mib_to_bytes(1024))),
+            false,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let mem_dev = test_utils::virtio_mem_on(region);
+        let guest_mem = mem_dev.vm.guest_memory().clone();
+        let mut th = test_helper(mem_dev, &guest_mem);
+
+        let addr = test_utils::HOTPLUG_ADDR;
+        th.device()
+            .update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
+            .unwrap();
+        assert_eq!(guest_mem.read_obj::<u64>(addr).unwrap(), 0);
     }
 
     #[test]
