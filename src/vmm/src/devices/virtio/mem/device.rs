@@ -552,7 +552,9 @@ impl VirtioMem {
             self.guest_memory().mark_dirty(addr, len);
         }
         // Plugging discards too: memory restored from a snapshot file, or by an external UFFD
-        // handler, may still hold what the blocks contained before they were unplugged.
+        // handler, may still hold what the blocks contained before they were unplugged. Shared
+        // memfd memory (vhost-user) is only allocated at boot, never restored, so it holds no
+        // snapshot contents even where this discard is a no-op.
         if let Err(err) = self.guest_memory().discard_range(addr, len) {
             if !plug {
                 error!("virtio-mem: Failed to discard memory range: {}", err);
