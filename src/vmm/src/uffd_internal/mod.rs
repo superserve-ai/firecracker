@@ -235,6 +235,7 @@ pub enum InternalUffdError {
 pub fn setup(
     cfg: Config,
     mem_state: &GuestMemoryState,
+    plugged: Option<Vec<u64>>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
     vmm_filter: Arc<BpfProgram>,
@@ -272,7 +273,7 @@ pub fn setup(
     // provides, so a page absent from the overlay falls through to the base. Validate
     // sizes up front so a malformed/short file fails the restore loudly instead of
     // risking an out-of-bounds page source (or a handler-thread panic) at fault time.
-    let (base, present) = match cfg.base_path.as_deref() {
+    let (base, mut present) = match cfg.base_path.as_deref() {
         Some(base_path) => {
             let base = mmap_snapshot(base_path).map_err(InternalUffdError::OpenSnapshot)?;
             // Presence comes from the side-car when one was saved with the overlay;
@@ -325,10 +326,17 @@ pub fn setup(
                         .map_err(InternalUffdError::LayeredSetup)?
                 }
             };
-            (Some(base), Some(Arc::new(present)))
+            (Some(base), Some(present))
         }
         None => (None, None),
     };
+    let plugged = plugged.map(|bits| PresenceBitmap { bits });
+    // Unplugged pages leave presence so neither the zero-hole scan nor pre-copy
+    // counts them.
+    if let (Some(p), Some(mask)) = (present.as_mut(), plugged.as_ref()) {
+        p.retain(mask);
+    }
+    let present = present.map(Arc::new);
     // Recording registers everything so the trace sees every first touch. An
     // optimization only: if the scan fails, the restore registers whole regions.
     let ranges = if cfg.skip_zero_holes && cfg.record_to.is_none() {
@@ -354,6 +362,17 @@ pub fn setup(
         ranges
     } else {
         None
+    };
+    // Unplugged memory stays unregistered, so a block the guest plugs again reads as
+    // zeros instead of whatever the snapshot holds for it.
+    let ranges = match &plugged {
+        Some(mask) => Some(plugged_ranges(
+            mask,
+            ranges.as_deref(),
+            page_size,
+            total_mem as usize / page_size,
+        )),
+        None => ranges,
     };
     register_ranges(&uffd, &mappings, ranges.as_deref())?;
     // Recording suppresses pre-copy as it does prefetch: a pre-copied page never
@@ -548,6 +567,30 @@ fn register_ranges(
     Ok(())
 }
 
+/// File-offset ranges of the pages set in `plugged`, narrowed to `nonzero` when the
+/// zero-hole scan produced ranges.
+fn plugged_ranges(
+    plugged: &PresenceBitmap,
+    nonzero: Option<&[(u64, u64)]>,
+    page_size: usize,
+    npages: usize,
+) -> Vec<(u64, u64)> {
+    let runs = present_runs(plugged, page_size, npages)
+        .into_iter()
+        .map(|(s, len)| (s, s + len as u64));
+    let Some(nonzero) = nonzero else {
+        return runs.collect();
+    };
+    let mut ranges = Vec::new();
+    for (s, e) in runs {
+        let first = nonzero.partition_point(|&(_, ne)| ne <= s);
+        for &(ns, ne) in nonzero[first..].iter().take_while(|&&(ns, _)| ns < e) {
+            ranges.push((s.max(ns), e.min(ne)));
+        }
+    }
+    ranges
+}
+
 fn in_ranges(ranges: &[(u64, u64)], off: u64) -> bool {
     let i = ranges.partition_point(|&(_, e)| e <= off);
     ranges.get(i).is_some_and(|&(s, _)| s <= off)
@@ -568,8 +611,13 @@ fn present_runs(present: &PresenceBitmap, page_size: usize, npages: usize) -> Ve
         }
         let start = i;
         while i < npages && present.is_set(i) {
-            i += 1;
+            i += if i & 63 == 0 && present.bits[i >> 6] == u64::MAX {
+                64
+            } else {
+                1
+            };
         }
+        i = i.min(npages);
         runs.push(((start * page_size) as u64, (i - start) * page_size));
     }
     runs
@@ -860,6 +908,12 @@ impl PresenceBitmap {
     }
     fn set(&mut self, i: usize) {
         self.bits[i >> 6] |= 1u64 << (i & 63);
+    }
+    /// Clears every page not set in `other`.
+    fn retain(&mut self, other: &PresenceBitmap) {
+        for (word, other_word) in self.bits.iter_mut().zip(&other.bits) {
+            *word &= other_word;
+        }
     }
     fn is_set(&self, i: usize) -> bool {
         // Out-of-range ⇒ not present (fall through to base). `setup` already
@@ -2247,6 +2301,46 @@ mod tests {
     }
 
     #[test]
+    fn unplugged_pages_are_neither_registered_nor_precopied() {
+        let ps = 4096usize;
+        let p = |n: u64| n * ps as u64;
+        let npages = 256;
+        // Pages 64..192 are unplugged.
+        let plugged = PresenceBitmap {
+            bits: vec![u64::MAX, 0, 0, u64::MAX],
+        };
+
+        let mut present = PresenceBitmap {
+            bits: vec![1, 1 << 5, 0, 1 << 63],
+        };
+        present.retain(&plugged);
+        assert_eq!(
+            present_runs(&present, ps, npages),
+            vec![(0, ps), (p(255), ps)]
+        );
+
+        assert_eq!(
+            plugged_ranges(&plugged, None, ps, npages),
+            vec![(0, p(64)), (p(192), p(256))]
+        );
+        let ranges = plugged_ranges(
+            &plugged,
+            Some(&[(p(1), p(200)), (p(250), p(256))]),
+            ps,
+            npages,
+        );
+        assert_eq!(
+            ranges,
+            vec![(p(1), p(64)), (p(192), p(200)), (p(250), p(256))]
+        );
+
+        // setup() drops prefetch offsets outside the registered ranges.
+        let mut prefetch = vec![p(2), p(70), p(195)];
+        prefetch.retain(|&off| in_ranges(&ranges, off));
+        assert_eq!(prefetch, vec![p(2), p(195)]);
+    }
+
+    #[test]
     fn present_runs_merges_adjacent_pages_across_words_and_stops_at_npages() {
         let mut pm = PresenceBitmap::with_pages(256);
         for pg in [1, 2, 3, 5, 200, 250] {
@@ -2267,6 +2361,11 @@ mod tests {
             ]
         );
         assert!(present_runs(&PresenceBitmap::with_pages(256), ps, 256).is_empty());
+        // Whole words of presence are taken at once, still stopping at npages.
+        let full = PresenceBitmap {
+            bits: vec![u64::MAX; 4],
+        };
+        assert_eq!(present_runs(&full, ps, 201), vec![(0, 201 * ps)]);
     }
 
     #[test]

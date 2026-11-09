@@ -31,7 +31,7 @@ use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Snapshot;
-use crate::utils::u64_to_usize;
+use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
@@ -292,6 +292,7 @@ pub fn create_snapshot(
         vmm.uffd_handler.is_some(),
         diff_dump,
         prior_presence,
+        plugged_page_mask(&microvm_state, page_size).as_deref(),
     )
     .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar", err))?;
     match presence {
@@ -354,6 +355,7 @@ fn derive_presence(
     layered: bool,
     diff_dump: Option<DiffDump>,
     prior_presence: Option<Vec<u64>>,
+    plugged: Option<&[u64]>,
 ) -> Result<Option<Vec<u64>>, io::Error> {
     let words = npages.div_ceil(64);
     let Some(diff) = diff_dump else {
@@ -362,7 +364,7 @@ fn derive_presence(
         if npages % 64 != 0 {
             bits[words - 1] = (1u64 << (npages % 64)) - 1;
         }
-        return Ok(Some(bits));
+        return Ok(Some(and_plugged(bits, plugged)));
     };
     let mut bits = if !diff.merged {
         // Fresh file: this dump is its entire content; any prior side-car
@@ -386,7 +388,73 @@ fn derive_presence(
     for (bit_word, dumped) in bits.iter_mut().zip(diff.dumped_pages.iter()) {
         *bit_word |= dumped;
     }
-    Ok(Some(bits))
+    Ok(Some(and_plugged(bits, plugged)))
+}
+
+/// Clears the pages of unplugged virtio-mem blocks: a dump still writes those inside
+/// a plugged slot, and a merged diff inherits prior bits for blocks unplugged since.
+fn and_plugged(mut bits: Vec<u64>, plugged: Option<&[u64]>) -> Vec<u64> {
+    if let Some(mask) = plugged {
+        for (bit_word, plugged_word) in bits.iter_mut().zip(mask) {
+            *bit_word &= plugged_word;
+        }
+    }
+    bits
+}
+
+/// Bitmap over the memory file's `page_size` pages (all regions back to back, in
+/// dump order) of the pages backing memory the guest has plugged. `None` when there
+/// is no virtio-mem device or none of its blocks is unplugged, so VMs without
+/// hotplug do no extra work.
+pub(crate) fn plugged_page_mask(state: &MicrovmState, page_size: usize) -> Option<Vec<u64>> {
+    let devices = &state.device_states;
+    let dev = match &devices.mmio_state.memory_device {
+        Some(d) => &d.device_state,
+        None => &devices.pci_state.memory_device.as_ref()?.device_state,
+    };
+    page_mask_without(&state.vm_state.memory, &dev.unplugged_ranges(), page_size)
+}
+
+fn page_mask_without(
+    mem: &GuestMemoryState,
+    unplugged: &[(u64, u64)],
+    page_size: usize,
+) -> Option<Vec<u64>> {
+    if unplugged.is_empty() {
+        return None;
+    }
+    let npages = mem.regions.iter().map(|r| r.size).sum::<usize>() / page_size;
+    let mut bits = vec![u64::MAX; npages.div_ceil(64)];
+    if npages % 64 != 0 {
+        bits[npages / 64] = (1u64 << (npages % 64)) - 1;
+    }
+    let mut file_off = 0u64;
+    for region in &mem.regions {
+        let (start, end) = (
+            region.base_address,
+            region.base_address + usize_to_u64(region.size),
+        );
+        for &(gpa, len) in unplugged {
+            let (s, e) = (gpa.max(start), (gpa + len).min(end));
+            if s >= e {
+                continue;
+            }
+            // Only pages wholly inside the range: a partly plugged page stays.
+            let mut p = u64_to_usize((file_off + s - start).div_ceil(page_size as u64));
+            let last = u64_to_usize((file_off + e - start) / page_size as u64);
+            while p < last {
+                if p % 64 == 0 && last - p >= 64 {
+                    bits[p / 64] = 0;
+                    p += 64;
+                } else {
+                    bits[p / 64] &= !(1u64 << (p % 64));
+                    p += 1;
+                }
+            }
+        }
+        file_off += usize_to_u64(region.size);
+    }
+    Some(bits)
 }
 
 fn snapshot_state_to_file(
@@ -814,6 +882,10 @@ pub fn restore_from_snapshot(
                 params.mem_backend.eager_overlay,
                 params.mem_backend.skip_zero_holes,
                 mem_state,
+                plugged_page_mask(
+                    &microvm_state,
+                    vm_resources.machine_config.huge_pages.page_size(),
+                ),
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages,
                 vmm_filter,
@@ -946,6 +1018,7 @@ fn guest_memory_from_uffd_internal(
     eager_overlay: bool,
     skip_zero_holes: bool,
     mem_state: &GuestMemoryState,
+    plugged: Option<Vec<u64>>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
     vmm_filter: std::sync::Arc<crate::seccomp::BpfProgram>,
@@ -969,6 +1042,7 @@ fn guest_memory_from_uffd_internal(
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
         mem_state,
+        plugged,
         track_dirty_pages,
         huge_pages,
         vmm_filter,
@@ -1136,7 +1210,7 @@ mod tests {
         let path = dir.path().join("mem");
 
         // Full dump: all pages present, tail bits past npages masked off.
-        let bits = derive_presence(&path, ps, 70, ps as u64, true, None, None)
+        let bits = derive_presence(&path, ps, 70, ps as u64, true, None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(bits, vec![u64::MAX, (1u64 << 6) - 1]);
@@ -1147,9 +1221,18 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: false,
         };
-        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), Some(vec![0b0001]))
-            .unwrap()
-            .unwrap();
+        let bits = derive_presence(
+            &path,
+            ps,
+            4,
+            ps as u64,
+            true,
+            Some(diff),
+            Some(vec![0b0001]),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(bits, vec![0b1010]);
 
         // Merged diff with a prior side-car: prior ∪ dumped, never a rescan of the
@@ -1158,9 +1241,18 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: true,
         };
-        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), Some(vec![0b0101]))
-            .unwrap()
-            .unwrap();
+        let bits = derive_presence(
+            &path,
+            ps,
+            4,
+            ps as u64,
+            true,
+            Some(diff),
+            Some(vec![0b0101]),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(bits, vec![0b1111]);
 
         // A prior side-car of the wrong geometry is ignored, and with a coarse
@@ -1177,6 +1269,7 @@ mod tests {
             true,
             Some(diff),
             Some(vec![0b1, 0b1]),
+            None,
         )
         .unwrap();
         assert!(refused.is_none());
@@ -1187,7 +1280,8 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: true,
         };
-        let refused = derive_presence(&path, ps, 4, ps as u64, false, Some(diff), None).unwrap();
+        let refused =
+            derive_presence(&path, ps, 4, ps as u64, false, Some(diff), None, None).unwrap();
         assert!(refused.is_none());
 
         // Merged diff in a layered chain, no prior side-car, page-granular
@@ -1203,10 +1297,87 @@ mod tests {
             dumped_pages: vec![0b1010],
             merged: true,
         };
-        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), None)
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, Some(diff), None, None)
             .unwrap()
             .unwrap();
         assert_eq!(bits, vec![0b1011]);
+
+        // Unplugged virtio-mem pages are never present: cleared from a full dump,
+        // from a fresh diff, and from a merged diff's prior bits.
+        let plugged = [0b1001u64];
+        let bits = derive_presence(&path, ps, 4, ps as u64, true, None, None, Some(&plugged))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bits, vec![0b1001]);
+        let diff = DiffDump {
+            dumped_pages: vec![0b1010],
+            merged: false,
+        };
+        let bits = derive_presence(
+            &path,
+            ps,
+            4,
+            ps as u64,
+            true,
+            Some(diff),
+            None,
+            Some(&plugged),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bits, vec![0b1000]);
+        let diff = DiffDump {
+            dumped_pages: vec![0b1000],
+            merged: true,
+        };
+        let bits = derive_presence(
+            &path,
+            ps,
+            4,
+            ps as u64,
+            true,
+            Some(diff),
+            Some(vec![0b0111]),
+            Some(&plugged),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bits, vec![0b1001]);
+    }
+
+    #[test]
+    fn plugged_page_mask_maps_hotplug_region_after_dram() {
+        let ps = 4096usize;
+        let mib = 1usize << 20;
+        let hp_base = 0x1_0000_0000u64;
+        let mem = GuestMemoryState {
+            regions: vec![
+                GuestMemoryRegionState {
+                    base_address: 0,
+                    size: 2 * mib,
+                    region_type: GuestRegionType::Dram,
+                    plugged: vec![true],
+                },
+                GuestMemoryRegionState {
+                    base_address: hp_base,
+                    size: 8 * mib,
+                    region_type: GuestRegionType::Hotpluggable,
+                    plugged: vec![true, false],
+                },
+            ],
+        };
+        assert!(page_mask_without(&mem, &[], ps).is_none());
+
+        // Hotplug offset 2 MiB is file offset 4 MiB (after 2 MiB of DRAM).
+        let bits =
+            page_mask_without(&mem, &[(hp_base + 2 * mib as u64, 6 * mib as u64)], ps).unwrap();
+        let npages = 10 * mib / ps;
+        let first_unplugged = 4 * mib / ps;
+        assert_eq!(bits.len(), npages / 64);
+        for p in 0..npages {
+            let set = bits[p / 64] & (1u64 << (p % 64)) != 0;
+            assert_eq!(set, p < first_unplugged, "page {p}");
+        }
     }
 
     fn default_vmm_with_devices() -> Vmm {

@@ -504,11 +504,11 @@ impl VirtioMem {
     }
 
     /// Applies the request to a single KVM slot: updates KVM first and, only if that succeeds,
-    /// commits the block state for the blocks the request touches and (when unplugging) discards
-    /// them. Committing after the KVM update keeps the block state consistent with KVM on a partial
-    /// failure, and a block is never discarded before it is committed as unplugged.
+    /// commits the block state for the blocks the request touches and discards them. Committing
+    /// after the KVM update keeps the block state consistent with KVM on a partial failure, and a
+    /// block is never discarded before its new state is committed.
     ///
-    /// Returns `true` if the slot's discard failed. That is not fatal and is not reported to the
+    /// Returns `true` if an unplug's discard failed. That is not fatal and is not reported to the
     /// driver; the caller aggregates it into a single metric per request.
     fn apply_range_to_slot(
         &mut self,
@@ -544,15 +544,33 @@ impl VirtioMem {
         self.config.plugged_size -= usize_to_u64(self.nb_blocks_to_len(plugged_before));
         self.config.plugged_size += usize_to_u64(self.nb_blocks_to_len(plugged_after));
 
-        if !plug {
-            let addr =
-                GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
-            if let Err(err) = self
-                .guest_memory()
-                .discard_range(addr, self.nb_blocks_to_len(touched.len()))
-            {
+        let addr = GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
+        let len = self.nb_blocks_to_len(touched.len());
+        if plug {
+            // The next diff must cover plugged blocks: an earlier layer of the snapshot
+            // chain may still hold contents from before they were unplugged.
+            self.guest_memory().mark_dirty(addr, len);
+        }
+        // Plugging discards too: memory restored from a snapshot file, or by an external UFFD
+        // handler, may still hold what the blocks contained before they were unplugged. Shared
+        // memfd memory (vhost-user) is only allocated at boot, never restored, so it holds no
+        // snapshot contents even where this discard is a no-op.
+        if let Err(err) = self.guest_memory().discard_range(addr, len) {
+            if !plug {
                 error!("virtio-mem: Failed to discard memory range: {}", err);
                 return Ok(true);
+            }
+            // Some backings can't discard (hugetlbfs before Linux 5.18): zero the blocks
+            // instead, so a plug never exposes their earlier contents.
+            debug!(
+                "virtio-mem: zeroing plugged range after failed discard: {}",
+                err
+            );
+            let zeros = [0u8; 4096];
+            for off in (0..len).step_by(zeros.len()) {
+                self.guest_memory()
+                    .write_slice(&zeros, addr.unchecked_add(usize_to_u64(off)))
+                    .expect("plugged blocks are mapped guest memory");
             }
         }
         Ok(false)
@@ -762,21 +780,30 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) fn default_virtio_mem() -> VirtioMem {
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
-        let addr = GuestAddress(512 << 30);
-        vm.register_hotpluggable_memory_region(
+        virtio_mem(false)
+    }
+
+    pub(crate) const HOTPLUG_ADDR: GuestAddress = GuestAddress(512 << 30);
+
+    pub(crate) fn virtio_mem(track_dirty_pages: bool) -> VirtioMem {
+        virtio_mem_on(
             memory::anonymous(
-                std::iter::once((addr, mib_to_bytes(1024))),
-                false,
+                std::iter::once((HOTPLUG_ADDR, mib_to_bytes(1024))),
+                track_dirty_pages,
                 HugePageConfig::None,
             )
             .unwrap()
             .pop()
             .unwrap(),
-            mib_to_bytes(128),
-        );
+        )
+    }
+
+    /// A virtio-mem device over `region`, a 1 GiB region at [`HOTPLUG_ADDR`].
+    pub(crate) fn virtio_mem_on(region: GuestRegionMmap) -> VirtioMem {
+        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        vm.register_hotpluggable_memory_region(region, mib_to_bytes(128));
         let vm = Arc::new(vm);
-        VirtioMem::new(vm, addr, 1024, 2, 128).unwrap()
+        VirtioMem::new(vm, HOTPLUG_ADDR, 1024, 2, 128).unwrap()
     }
 }
 
@@ -785,6 +812,7 @@ mod tests {
     use std::ptr::null_mut;
 
     use serde_json::de;
+    use vm_memory::bitmap::Bitmap;
     use vm_memory::guest_memory;
     use vm_memory::mmap::MmapRegionBuilder;
 
@@ -1116,6 +1144,54 @@ mod tests {
         assert_eq!(METRICS.plug_count.count(), plug_count + 1);
         assert_eq!(METRICS.plug_bytes.count(), plug_bytes + (2 << 20));
         assert_eq!(METRICS.plug_fails.count(), plug_fails);
+    }
+
+    #[test]
+    fn test_plug_marks_range_dirty() {
+        let mem_dev = test_utils::virtio_mem(true);
+        let guest_mem = mem_dev.vm.guest_memory().clone();
+        let mut th = test_helper(mem_dev, &guest_mem);
+        let addr = th.device().guest_address();
+        let block = u64_to_usize(th.device().config.block_size);
+        th.device()
+            .update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
+            .unwrap();
+
+        let hp_region = guest_mem
+            .iter()
+            .find(|r| r.region_type == GuestRegionType::Hotpluggable)
+            .unwrap();
+        let bitmap = hp_region.bitmap();
+        assert!(bitmap.dirty_at(0));
+        assert!(bitmap.dirty_at(block - 1));
+        assert!(!bitmap.dirty_at(block));
+    }
+
+    #[test]
+    fn test_plug_zeroes_blocks_restored_from_a_file() {
+        use std::os::unix::fs::FileExt;
+
+        // A memory file whose unplugged blocks still hold earlier contents.
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        file.set_len(usize_to_u64(mib_to_bytes(1024))).unwrap();
+        file.write_all_at(&[0xAB; 4096], 0).unwrap();
+        let region = crate::vstate::memory::snapshot_file(
+            file,
+            std::iter::once((test_utils::HOTPLUG_ADDR, mib_to_bytes(1024))),
+            false,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let mem_dev = test_utils::virtio_mem_on(region);
+        let guest_mem = mem_dev.vm.guest_memory().clone();
+        let mut th = test_helper(mem_dev, &guest_mem);
+
+        let addr = test_utils::HOTPLUG_ADDR;
+        th.device()
+            .update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
+            .unwrap();
+        assert_eq!(guest_mem.read_obj::<u64>(addr).unwrap(), 0);
     }
 
     #[test]
