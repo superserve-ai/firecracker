@@ -90,6 +90,19 @@
                 "comment": "Used by the block device"
             },
             {
+                "syscall": "fallocate",
+                "comment": "Used to punch freshly plugged virtio-mem blocks out of diff snapshots",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+                    }
+                ]
+            },
+            {
                 "syscall": "mremap",
                 "comment": "Used for re-allocating large memory regions, for example vectors"
             },

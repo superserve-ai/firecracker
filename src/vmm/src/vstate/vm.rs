@@ -433,7 +433,7 @@ impl Vm {
                     for &(offset, len) in zero_ranges {
                         if punch_hole(&file, offset, len).is_err() {
                             // Filesystems without hole punching get the zeros written.
-                            write_zeros(&file, offset, len)
+                            write_zeros(&mut file, offset, len)
                                 .map_err(|err| MemoryBackingFile("write_zeros", err))?;
                         }
                     }
@@ -624,15 +624,19 @@ impl DeviceRelocation for Vm {
     }
 }
 
-fn write_zeros(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
+fn write_zeros(file: &mut std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    // Seek and write: the default seccomp filters allow these, not pwrite64. The dump that
+    // follows writes from the start of the file, so the cursor goes back there.
     let zeros = vec![0u8; 1 << 20];
+    file.seek(SeekFrom::Start(offset))?;
     let mut done = 0u64;
     while done < len {
         let n = (len - done).min(zeros.len() as u64);
-        file.write_all_at(&zeros[..u64_to_usize(n)], offset + done)?;
+        file.write_all(&zeros[..u64_to_usize(n)])?;
         done += n;
     }
+    file.seek(SeekFrom::Start(0))?;
     Ok(())
 }
 
