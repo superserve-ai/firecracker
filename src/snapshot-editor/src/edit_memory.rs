@@ -26,6 +26,10 @@ pub enum EditMemoryError {
     SeekMemory(std::io::Error),
     /// Failed to send the file: {0}
     SendFile(std::io::Error),
+    /// Could not read the diff's presence side-car: {0}
+    Presence(vmm::uffd_internal::InternalUffdError),
+    /// Failed to write zeros to memory file: {0}
+    WriteZeros(std::io::Error),
 }
 
 #[derive(Debug, Subcommand)]
@@ -59,7 +63,7 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
 
     let mut diff_file = OpenOptions::new()
         .read(true)
-        .open(diff_path)
+        .open(&diff_path)
         .map_err(EditMemoryError::OpenDiffFile)?;
 
     let mut cursor: u64 = 0;
@@ -99,6 +103,73 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
         }
     }
 
+    // A presence side-car makes the diff authoritative for every page it marks, including
+    // pages left as holes because they read as zeros: those must overwrite the base too.
+    let page_size = vmm::arch::host_page_size();
+    if let Some(present) = vmm::uffd_internal::present_pages(&diff_path, page_size)
+        .map_err(EditMemoryError::Presence)?
+    {
+        let diff_len = diff_file
+            .metadata()
+            .map_err(EditMemoryError::MetadataDiff)?
+            .len();
+        let page = page_size as u64;
+        let mut p = 0u64;
+        let npages = diff_len.div_ceil(page);
+        while p < npages {
+            if present[u64_to_usize(p / 64)] & (1 << (p % 64)) == 0 {
+                p += 1;
+                continue;
+            }
+            let start = p;
+            while p < npages && present[u64_to_usize(p / 64)] & (1 << (p % 64)) != 0 {
+                p += 1;
+            }
+            zero_holes(
+                &base_file,
+                &mut diff_file,
+                start * page,
+                (p * page).min(diff_len),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes zeros to `base_file` over the holes of `diff_file` within `[start, end)`.
+fn zero_holes(
+    base_file: &std::fs::File,
+    diff_file: &mut std::fs::File,
+    start: u64,
+    end: u64,
+) -> Result<(), EditMemoryError> {
+    use std::os::unix::fs::FileExt;
+
+    let zeros = vec![0u8; 1 << 20];
+    let mut pos = start;
+    while pos < end {
+        let data = diff_file
+            .seek_data(pos)
+            .map_err(EditMemoryError::SeekDataDiff)?
+            .unwrap_or(end)
+            .min(end);
+        while pos < data {
+            let n = (data - pos).min(zeros.len() as u64);
+            base_file
+                .write_all_at(&zeros[..u64_to_usize(n)], pos)
+                .map_err(EditMemoryError::WriteZeros)?;
+            pos += n;
+        }
+        if pos >= end {
+            break;
+        }
+        pos = diff_file
+            .seek_hole(pos)
+            .map_err(EditMemoryError::SeekHoleDiff)?
+            .unwrap_or(end)
+            .min(end);
+    }
     Ok(())
 }
 
@@ -175,6 +246,27 @@ mod tests {
         diff_file.write_all(&diff_data).unwrap();
         rebase(base_path, diff_path).unwrap();
         check_file_content(base_file, &diff_data);
+    }
+
+    #[test]
+    fn test_rebase_zeroes_present_holes() {
+        let base = tempfile::TempFile::new().unwrap();
+        let diff = tempfile::TempFile::new().unwrap();
+        let ps = vmm::arch::host_page_size();
+
+        // The base holds data in all three pages; the diff writes page 0 and leaves pages 1
+        // and 2 as holes, but its side-car marks page 1 present: page 1 reads as zeros.
+        base.as_file().write_all(&vec![0xAA; 3 * ps]).unwrap();
+        diff.as_file().set_len(3 * ps as u64).unwrap();
+        diff.as_file().write_all_at(&vec![0xBB; ps], 0).unwrap();
+        vmm::uffd_internal::write_presence_bitmap(diff.as_path(), ps, 3, &[0b011]).unwrap();
+
+        rebase(base.as_path().to_path_buf(), diff.as_path().to_path_buf()).unwrap();
+        let mut expected = vec![0xBB; ps];
+        expected.extend(vec![0u8; ps]);
+        expected.extend(vec![0xAA; ps]);
+        check_file_content(base.as_file(), &expected);
+        std::fs::remove_file(vmm::uffd_internal::presence_sidecar_path(diff.as_path())).unwrap();
     }
 
     #[test]

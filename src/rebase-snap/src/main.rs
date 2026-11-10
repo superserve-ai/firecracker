@@ -31,6 +31,8 @@ enum FileError {
     SendFile(std::io::Error),
     /// Failed to get metadata: {0}
     Metadata(std::io::Error),
+    /// Diff file {0} has a presence side-car, which this tool cannot apply; use 'snapshot-editor edit-memory rebase'
+    PresenceSidecar(String),
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -70,6 +72,11 @@ fn get_files(args: &Arguments) -> Result<(File, File), FileError> {
     // Safe to unwrap since the required arguments are checked as part of
     // `arg_parser.parse_from_cmdline()`
     let diff_file_path = args.single_value(DIFF_FILE).unwrap();
+    // A side-car marks pages left as holes that still read as zeros; copying only the data
+    // extents would leave the base's bytes there.
+    if std::path::Path::new(&format!("{diff_file_path}.presence")).exists() {
+        return Err(FileError::PresenceSidecar(diff_file_path.to_string()));
+    }
     let diff_file = OpenOptions::new()
         .read(true)
         .open(diff_file_path)
