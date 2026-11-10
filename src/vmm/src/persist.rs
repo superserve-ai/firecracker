@@ -27,6 +27,7 @@ use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::device_manager::{DevicePersistError, DevicesState};
+use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMem};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -39,7 +40,8 @@ use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemB
 use crate::vstate::kvm::KvmState;
 use crate::vstate::vm::DiffDump;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryState, GuestRegionMmap,
+    GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -275,9 +277,50 @@ pub fn create_snapshot(
     )
     .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_zero", err))?;
 
-    let diff_dump = vmm
+    // Blocks plugged since the last snapshot read as zeros unless the guest wrote them, so a
+    // diff punches them out of the file rather than writing them. Write them instead when a
+    // hole could be misread: a layered merge with no trusted prior side-car falls back to an
+    // extent scan that takes a hole for "read the base", and without dirty tracking the
+    // guest's writes there would not be dumped over the holes.
+    let fresh = vmm
+        .device_manager
+        .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.fresh_ranges())
+        .unwrap_or_default();
+    let untrusted_merge =
+        vmm.uffd_handler.is_some() && prior_presence.is_none() && params.mem_file_path.exists();
+    let tracked = vmm
         .vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+        .guest_memory()
+        .iter()
+        .filter(|r| r.region_type == GuestRegionType::Hotpluggable)
+        .all(|r| (**r).bitmap().is_some());
+    let mark_fresh_dirty = |vmm: &Vmm| {
+        for &(addr, len) in &fresh {
+            vmm.vm
+                .guest_memory()
+                .mark_dirty(GuestAddress(addr), u64_to_usize(len));
+        }
+    };
+    let zero_ranges = if untrusted_merge || !tracked {
+        mark_fresh_dirty(vmm);
+        Vec::new()
+    } else {
+        file_ranges(&microvm_state.vm_state.memory, &fresh)
+    };
+    let dumped =
+        vmm.vm
+            .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type, &zero_ranges);
+    // A failed dump may already have consumed the dirty bits, so a later punch could erase
+    // guest writes: hand the fresh blocks back to the dirty bitmap, which dumps their contents.
+    if dumped.is_err() {
+        mark_fresh_dirty(vmm);
+    }
+    if !fresh.is_empty() {
+        let _ = vmm
+            .device_manager
+            .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.clear_fresh());
+    }
+    let diff_dump = dumped?;
 
     let md = std::fs::metadata(&params.mem_file_path)
         .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_stat", err))?;
@@ -455,6 +498,27 @@ fn page_mask_without(
         file_off += usize_to_u64(region.size);
     }
     Some(bits)
+}
+
+/// Memory file `(offset, len)` ranges (all regions back to back, in dump order) of the
+/// given guest `(addr, len)` ranges.
+fn file_ranges(mem: &GuestMemoryState, guest: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut file_off = 0u64;
+    for region in &mem.regions {
+        let (start, end) = (
+            region.base_address,
+            region.base_address + usize_to_u64(region.size),
+        );
+        for &(gpa, len) in guest {
+            let (s, e) = (gpa.max(start), (gpa + len).min(end));
+            if s < e {
+                out.push((file_off + s - start, e - s));
+            }
+        }
+        file_off += usize_to_u64(region.size);
+    }
+    out
 }
 
 fn snapshot_state_to_file(
@@ -1378,6 +1442,20 @@ mod tests {
             let set = bits[p / 64] & (1u64 << (p % 64)) != 0;
             assert_eq!(set, p < first_unplugged, "page {p}");
         }
+
+        // The same layout maps fresh hotplug blocks to their memory file offsets.
+        let fresh = [
+            (hp_base, 2 * mib as u64),
+            (hp_base + 6 * mib as u64, 2 * mib as u64),
+        ];
+        assert_eq!(
+            file_ranges(&mem, &fresh),
+            vec![
+                (2 * mib as u64, 2 * mib as u64),
+                (8 * mib as u64, 2 * mib as u64)
+            ]
+        );
+        assert!(file_ranges(&mem, &[]).is_empty());
     }
 
     fn default_vmm_with_devices() -> Vmm {
