@@ -66,6 +66,13 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
         .open(&diff_path)
         .map_err(EditMemoryError::OpenDiffFile)?;
 
+    // A presence side-car makes the diff authoritative for every page it marks, including
+    // pages left as holes because they read as zeros: those must overwrite the base too. It
+    // is read and checked before the base is touched, so a bad side-car changes nothing.
+    let page_size = vmm::arch::host_page_size();
+    let present = vmm::uffd_internal::present_pages(&diff_path, page_size)
+        .map_err(EditMemoryError::Presence)?;
+
     let mut cursor: u64 = 0;
     while let Some(block_start) = diff_file
         .seek_data(cursor)
@@ -103,12 +110,7 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
         }
     }
 
-    // A presence side-car makes the diff authoritative for every page it marks, including
-    // pages left as holes because they read as zeros: those must overwrite the base too.
-    let page_size = vmm::arch::host_page_size();
-    if let Some(present) = vmm::uffd_internal::present_pages(&diff_path, page_size)
-        .map_err(EditMemoryError::Presence)?
-    {
+    if let Some(present) = present {
         let diff_len = diff_file
             .metadata()
             .map_err(EditMemoryError::MetadataDiff)?
@@ -267,6 +269,23 @@ mod tests {
         expected.extend(vec![0xAA; ps]);
         check_file_content(base.as_file(), &expected);
         std::fs::remove_file(vmm::uffd_internal::presence_sidecar_path(diff.as_path())).unwrap();
+    }
+
+    #[test]
+    fn test_rebase_bad_side_car_leaves_base() {
+        let base = tempfile::TempFile::new().unwrap();
+        let diff = tempfile::TempFile::new().unwrap();
+        let ps = vmm::arch::host_page_size();
+
+        base.as_file().write_all(&vec![0xAA; ps]).unwrap();
+        diff.as_file().write_all(&vec![0xBB; ps]).unwrap();
+        // An empty side-car is what an interrupted save leaves behind.
+        let side_car = vmm::uffd_internal::presence_sidecar_path(diff.as_path());
+        std::fs::write(&side_car, []).unwrap();
+
+        rebase(base.as_path().to_path_buf(), diff.as_path().to_path_buf()).unwrap_err();
+        check_file_content(base.as_file(), &vec![0xAA; ps]);
+        std::fs::remove_file(side_car).unwrap();
     }
 
     #[test]

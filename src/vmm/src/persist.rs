@@ -279,12 +279,15 @@ pub fn create_snapshot(
 
     // Blocks plugged since the last snapshot read as zeros unless the guest wrote them, so a
     // diff punches them out of the file rather than writing them. Write them instead when a
-    // hole could be misread: a layered merge with no trusted prior side-car falls back to an
-    // extent scan that takes a hole for "read the base", and without dirty tracking the
-    // guest's writes there would not be dumped over the holes.
-    let fresh = vmm
+    // hole could be misread. A layered merge with no trusted prior side-car falls back to an
+    // extent scan that takes any hole, including ones punched by earlier saves, for "read the
+    // base", so every plugged block is written. Without dirty tracking the guest's writes
+    // there would not be dumped over the holes.
+    let (fresh, plugged) = vmm
         .device_manager
-        .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.fresh_ranges())
+        .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| {
+            (dev.fresh_ranges(), dev.plugged_ranges())
+        })
         .unwrap_or_default();
     let untrusted_merge =
         vmm.uffd_handler.is_some() && prior_presence.is_none() && params.mem_file_path.exists();
@@ -294,14 +297,18 @@ pub fn create_snapshot(
         .iter()
         .filter(|r| r.region_type == GuestRegionType::Hotpluggable)
         .all(|r| (**r).bitmap().is_some());
-    let mark_fresh_dirty = |vmm: &Vmm| {
-        for &(addr, len) in &fresh {
+    let mark_dirty = |vmm: &Vmm, ranges: &[(u64, u64)]| {
+        for &(addr, len) in ranges {
             vmm.vm
                 .guest_memory()
                 .mark_dirty(GuestAddress(addr), u64_to_usize(len));
         }
     };
-    let zero_ranges = if untrusted_merge || !tracked {
+    let mark_fresh_dirty = |vmm: &Vmm| mark_dirty(vmm, &fresh);
+    let zero_ranges = if untrusted_merge {
+        mark_dirty(vmm, &plugged);
+        Vec::new()
+    } else if !tracked {
         mark_fresh_dirty(vmm);
         Vec::new()
     } else {

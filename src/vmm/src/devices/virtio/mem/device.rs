@@ -179,9 +179,18 @@ impl VirtioMem {
 
     /// Guest ranges `(addr, len)` of blocks plugged since the last snapshot.
     pub(crate) fn fresh_ranges(&self) -> Vec<(u64, u64)> {
+        self.block_ranges(&self.fresh_blocks)
+    }
+
+    /// Guest ranges `(addr, len)` of every plugged block.
+    pub(crate) fn plugged_ranges(&self) -> Vec<(u64, u64)> {
+        self.block_ranges(&self.plugged_blocks)
+    }
+
+    fn block_ranges(&self, blocks: &BitVec) -> Vec<(u64, u64)> {
         let block_size = self.config.block_size;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
-        for b in self.fresh_blocks.iter_ones() {
+        for b in blocks.iter_ones() {
             let addr = self.config.addr + b as u64 * block_size;
             match ranges.last_mut() {
                 Some((start, len)) if *start + *len == addr => *len += block_size,
