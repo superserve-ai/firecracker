@@ -1026,7 +1026,7 @@ pub fn presence_sidecar_path(mem_path: &Path) -> PathBuf {
 /// the data but lose a newly created file's directory entry — for a presence
 /// side-car that reads back as "no side-car" and silently re-enables extent
 /// scanning of a torn merge.
-pub(crate) fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
