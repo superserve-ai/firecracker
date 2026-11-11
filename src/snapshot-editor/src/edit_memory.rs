@@ -128,9 +128,6 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
     }
 
     if let Some(mut bits) = base_present {
-        for (word, add) in bits.iter_mut().zip(&applied) {
-            *word |= add;
-        }
         base_file
             .sync_all()
             .map_err(EditMemoryError::WritePresence)?;
@@ -138,13 +135,14 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
             .metadata()
             .map_err(EditMemoryError::WritePresence)?
             .len();
-        vmm::uffd_internal::write_presence_bitmap(
-            &memory_path,
-            page_size,
-            u64_to_usize(base_len.div_ceil(page)),
-            &bits,
-        )
-        .map_err(EditMemoryError::WritePresence)?;
+        // A larger diff grows the base, and the bitmap with it.
+        let base_pages = u64_to_usize(base_len.div_ceil(page));
+        bits.resize(base_pages.div_ceil(64), 0);
+        for (word, add) in bits.iter_mut().zip(&applied) {
+            *word |= add;
+        }
+        vmm::uffd_internal::write_presence_bitmap(&memory_path, page_size, base_pages, &bits)
+            .map_err(EditMemoryError::WritePresence)?;
     }
     Ok(())
 }
@@ -384,6 +382,28 @@ mod tests {
         for f in [&older, &newer] {
             std::fs::remove_file(vmm::uffd_internal::presence_sidecar_path(f.as_path())).unwrap();
         }
+    }
+
+    #[test]
+    fn test_rebase_grows_base_presence() {
+        let base = tempfile::TempFile::new().unwrap();
+        let diff = tempfile::TempFile::new().unwrap();
+        let ps = vmm::arch::host_page_size();
+
+        // A 64-page base with a side-car takes a 65-page diff: the bitmap needs a second word.
+        base.as_file().set_len(64 * ps as u64).unwrap();
+        vmm::uffd_internal::write_presence_bitmap(base.as_path(), ps, 64, &[0]).unwrap();
+        diff.as_file().set_len(65 * ps as u64).unwrap();
+        diff.as_file()
+            .write_all_at(&vec![0xBB; ps], 64 * ps as u64)
+            .unwrap();
+
+        rebase(base.as_path().to_path_buf(), diff.as_path().to_path_buf()).unwrap();
+        assert_eq!(
+            vmm::uffd_internal::present_pages(base.as_path(), ps).unwrap(),
+            Some(vec![0, 1])
+        );
+        std::fs::remove_file(vmm::uffd_internal::presence_sidecar_path(base.as_path())).unwrap();
     }
 
     #[test]
