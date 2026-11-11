@@ -98,6 +98,9 @@ pub struct VirtioMem {
     pub(crate) slot_size: usize,
     // Bitmap to track which blocks are plugged
     pub(crate) plugged_blocks: BitVec,
+    // Blocks plugged since the last snapshot. They read as zeros until the guest writes them,
+    // so the next diff punches them out of the memory file instead of writing them.
+    pub(crate) fresh_blocks: BitVec,
     vm: Arc<Vm>,
 }
 
@@ -158,6 +161,7 @@ impl VirtioMem {
             .map(|_| EventFd::new(libc::EFD_NONBLOCK))
             .collect::<Result<Vec<EventFd>, io::Error>>()?;
 
+        let fresh_blocks = BitVec::repeat(false, plugged_blocks.len());
         Ok(Self {
             avail_features: (1 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE),
             acked_features: 0u64,
@@ -169,7 +173,36 @@ impl VirtioMem {
             vm,
             slot_size,
             plugged_blocks,
+            fresh_blocks,
         })
+    }
+
+    /// Guest ranges `(addr, len)` of blocks plugged since the last snapshot.
+    pub(crate) fn fresh_ranges(&self) -> Vec<(u64, u64)> {
+        self.block_ranges(&self.fresh_blocks)
+    }
+
+    /// Guest ranges `(addr, len)` of every plugged block.
+    pub(crate) fn plugged_ranges(&self) -> Vec<(u64, u64)> {
+        self.block_ranges(&self.plugged_blocks)
+    }
+
+    fn block_ranges(&self, blocks: &BitVec) -> Vec<(u64, u64)> {
+        let block_size = self.config.block_size;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for b in blocks.iter_ones() {
+            let addr = self.config.addr + b as u64 * block_size;
+            match ranges.last_mut() {
+                Some((start, len)) if *start + *len == addr => *len += block_size,
+                _ => ranges.push((addr, block_size)),
+            }
+        }
+        ranges
+    }
+
+    /// Called once a snapshot has captured the fresh blocks.
+    pub(crate) fn clear_fresh(&mut self) {
+        self.fresh_blocks.fill(false);
     }
 
     pub fn guest_address(&self) -> GuestAddress {
@@ -546,11 +579,10 @@ impl VirtioMem {
 
         let addr = GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
         let len = self.nb_blocks_to_len(touched.len());
-        if plug {
-            // The next diff must cover plugged blocks: an earlier layer of the snapshot
-            // chain may still hold contents from before they were unplugged.
-            self.guest_memory().mark_dirty(addr, len);
-        }
+        // The next diff must cover plugged blocks, as an earlier layer of the snapshot chain may
+        // still hold contents from before they were unplugged. Writing them would cost the
+        // whole plugged size in zeros, so the diff punches them out of the file instead.
+        self.fresh_blocks[touched.clone()].fill(plug);
         // Plugging discards too: memory restored from a snapshot file, or by an external UFFD
         // handler, may still hold what the blocks contained before they were unplugged. Shared
         // memfd memory (vhost-user) is only allocated at boot, never restored, so it holds no
@@ -1147,24 +1179,39 @@ mod tests {
     }
 
     #[test]
-    fn test_plug_marks_range_dirty() {
+    fn test_plug_marks_blocks_fresh_not_dirty() {
         let mem_dev = test_utils::virtio_mem(true);
         let guest_mem = mem_dev.vm.guest_memory().clone();
         let mut th = test_helper(mem_dev, &guest_mem);
         let addr = th.device().guest_address();
-        let block = u64_to_usize(th.device().config.block_size);
+        let block = th.device().config.block_size;
         th.device()
-            .update_range(&RequestedRange { addr, nb_blocks: 1 }, true)
+            .update_range(&RequestedRange { addr, nb_blocks: 3 }, true)
+            .unwrap();
+        th.device()
+            .update_range(
+                &RequestedRange {
+                    addr: addr.unchecked_add(block),
+                    nb_blocks: 1,
+                },
+                false,
+            )
             .unwrap();
 
         let hp_region = guest_mem
             .iter()
             .find(|r| r.region_type == GuestRegionType::Hotpluggable)
             .unwrap();
-        let bitmap = hp_region.bitmap();
-        assert!(bitmap.dirty_at(0));
-        assert!(bitmap.dirty_at(block - 1));
-        assert!(!bitmap.dirty_at(block));
+        assert!(!hp_region.bitmap().dirty_at(0));
+        assert_eq!(
+            th.device().fresh_ranges(),
+            vec![
+                (addr.raw_value(), block),
+                (addr.raw_value() + 2 * block, block)
+            ]
+        );
+        th.device().clear_fresh();
+        assert!(th.device().fresh_ranges().is_empty());
     }
 
     #[test]

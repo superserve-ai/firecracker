@@ -1026,7 +1026,7 @@ pub fn presence_sidecar_path(mem_path: &Path) -> PathBuf {
 /// the data but lose a newly created file's directory entry — for a presence
 /// side-car that reads back as "no side-car" and silently re-enables extent
 /// scanning of a torn merge.
-pub(crate) fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
@@ -1118,7 +1118,7 @@ impl PresenceBitmap {
 /// holes flips clean pages into "present, all zeros", and one that punches holes
 /// through written zero pages flips dirtied-to-zero pages into "absent, read the
 /// base". The bitmap survives any byte-preserving transfer.
-pub(crate) fn write_presence_bitmap(
+pub fn write_presence_bitmap(
     mem_path: &Path,
     page_size: usize,
     npages: usize,
@@ -1180,6 +1180,20 @@ pub(crate) fn read_presence_sidecar(
         )));
     }
     PresenceBitmap::decode(&bytes, &path, page_size, expected_npages).map(Some)
+}
+
+/// The pages a memory file's presence side-car marks as provided by that file, for offline
+/// tools that merge a diff onto its base: a present page may be a hole in the diff, and then
+/// reads as zeros that must overwrite the base. `Ok(None)` when the file has no side-car.
+pub fn present_pages(
+    mem_path: &Path,
+    page_size: usize,
+) -> Result<Option<Vec<u64>>, InternalUffdError> {
+    let len = std::fs::metadata(mem_path)
+        .map_err(InternalUffdError::LayeredSetup)?
+        .len();
+    let npages = crate::utils::u64_to_usize(len.div_ceil(page_size as u64));
+    Ok(read_presence_sidecar(mem_path, page_size, npages)?.map(|p| p.bits))
 }
 
 /// The memory backing a layered (or single-file) restore. `overlay` is the file

@@ -29,6 +29,7 @@ use crate::arch::{GSI_MSI_END, host_page_size};
 use crate::logger::info;
 use crate::pci::{DeviceRelocation, DeviceRelocationError, PciDevice};
 use crate::persist::CreateSnapshotError;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
@@ -374,10 +375,14 @@ impl Vm {
     /// pre-existing same-size file (whose earlier pages remain in the file but are not covered by
     /// `dumped_pages`); the caller derives the memory file's presence side-car from this. Full
     /// snapshots return `None` — every page of a full dump is authoritative.
+    /// `zero_ranges` are memory file `(offset, len)` ranges, page aligned, that hold zeros
+    /// unless the guest has written them since: a diff punches them out of the file and reports
+    /// them as dumped, and writes the dirty pages among them over the holes.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
+        zero_ranges: &[(u64, u64)],
     ) -> Result<Option<DiffDump>, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -423,8 +428,27 @@ impl Vm {
 
         let diff_dump = match snapshot_type {
             SnapshotType::Diff => {
+                // A file created above is already sparse; only a merge can hold old contents.
+                if merged {
+                    for &(offset, len) in zero_ranges {
+                        if punch_hole(&file, offset, len).is_err() {
+                            // Filesystems without hole punching get the zeros written.
+                            write_zeros(&mut file, offset, len)
+                                .map_err(|err| MemoryBackingFile("write_zeros", err))?;
+                        }
+                    }
+                }
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                let dumped_pages = self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                let mut dumped_pages = self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                let page_size = host_page_size() as u64;
+                for &(offset, len) in zero_ranges {
+                    for page in offset / page_size..(offset + len) / page_size {
+                        let page = u64_to_usize(page);
+                        if let Some(word) = dumped_pages.get_mut(page >> 6) {
+                            *word |= 1u64 << (page & 63);
+                        }
+                    }
+                }
                 Some(DiffDump {
                     dumped_pages,
                     merged,
@@ -598,6 +622,42 @@ impl DeviceRelocation for Vm {
     ) -> Result<(), DeviceRelocationError> {
         Err(DeviceRelocationError::NotSupported)
     }
+}
+
+fn write_zeros(file: &mut std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    // Seek and write: the default seccomp filters allow these, not pwrite64. The dump that
+    // follows writes from the start of the file, so the cursor goes back there.
+    let zeros = vec![0u8; 1 << 20];
+    file.seek(SeekFrom::Start(offset))?;
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(zeros.len() as u64);
+        file.write_all(&zeros[..u64_to_usize(n)])?;
+        done += n;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    // SAFETY: fallocate on a valid open fd; KEEP_SIZE leaves the file length alone.
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset,
+            len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
