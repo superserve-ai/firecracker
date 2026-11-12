@@ -952,6 +952,7 @@ pub fn restore_from_snapshot(
                 params.mem_backend.abort_on_handler_death,
                 params.mem_backend.eager_overlay,
                 params.mem_backend.skip_zero_holes,
+                params.mem_backend.fault_around_kib,
                 mem_state,
                 plugged_page_mask(
                     &microvm_state,
@@ -1088,6 +1089,7 @@ fn guest_memory_from_uffd_internal(
     abort_on_handler_death: bool,
     eager_overlay: bool,
     skip_zero_holes: bool,
+    fault_around_kib: u32,
     mem_state: &GuestMemoryState,
     plugged: Option<Vec<u64>>,
     track_dirty_pages: bool,
@@ -1109,6 +1111,7 @@ fn guest_memory_from_uffd_internal(
         abort_on_handler_death,
         eager_overlay,
         skip_zero_holes,
+        fault_around_kib,
     );
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
@@ -1136,6 +1139,12 @@ fn guest_memory_from_uffd_internal(
             // overlay/base pairing never restores, so the caller must fall back to a
             // Full restore rather than retry the layered path.
             GuestMemoryFromUffdError::LayeredInvalid(s)
+        }
+        e @ crate::uffd_internal::InternalUffdError::FaultAroundInvalid(_) => {
+            GuestMemoryFromUffdError::InternalHandler(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e.to_string(),
+            ))
         }
     })?;
     Ok((guest_memory, Some(uffd), Some(handler)))

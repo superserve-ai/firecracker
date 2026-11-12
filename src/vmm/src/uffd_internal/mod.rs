@@ -71,6 +71,7 @@ struct Stats {
     recorded_offsets: AtomicU64,
     fault_ns: AtomicU64,
     precopy_pages: AtomicU64,
+    fault_around_pages: AtomicU64,
 }
 
 /// Snapshot of [`Stats`] returned to external callers. Each field is a monotonic counter
@@ -106,6 +107,8 @@ pub struct StatsSnapshot {
     pub fault_ns: u64,
     /// Pages the eager-overlay pre-copy placed ahead of the guest.
     pub precopy_pages: u64,
+    /// Pages fault-around placed beside the faulting ones.
+    pub fault_around_pages: u64,
 }
 
 impl Stats {
@@ -121,6 +124,7 @@ impl Stats {
             recorded_offsets: self.recorded_offsets.load(Ordering::Relaxed),
             fault_ns: self.fault_ns.load(Ordering::Relaxed),
             precopy_pages: self.precopy_pages.load(Ordering::Relaxed),
+            fault_around_pages: self.fault_around_pages.load(Ordering::Relaxed),
         }
     }
 }
@@ -149,6 +153,9 @@ pub struct Config {
     /// file backing it (the base when layered, else the snapshot itself), so the
     /// kernel zero-fills it instead of the handler copying zeros.
     pub skip_zero_holes: bool,
+    /// Serve each fault by copying the aligned block of this many KiB around it; 0 is
+    /// off. See [`fault_around`].
+    pub fault_around_kib: u32,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -233,6 +240,8 @@ pub enum InternalUffdError {
     LayeredInvalid(String),
     /// Failed to inspect filesystem for layered restore: {0}
     LayeredSetup(std::io::Error),
+    /// Invalid fault_around_kib {0}: must be 0 or a power of two from 8 to 2048
+    FaultAroundInvalid(u32),
 }
 
 /// Allocate anonymous guest memory, create + register a userfaultfd, and start a handler
@@ -249,6 +258,10 @@ pub fn setup(
     huge_pages: HugePageConfig,
     vmm_filter: Arc<BpfProgram>,
 ) -> Result<(Vec<GuestRegionMmap>, Uffd, Handler), InternalUffdError> {
+    let kib = cfg.fault_around_kib;
+    if kib != 0 && !(kib.is_power_of_two() && (8..=2048).contains(&kib)) {
+        return Err(InternalUffdError::FaultAroundInvalid(kib));
+    }
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
     let page_size = huge_pages.page_size();
     let abort_on_handler_death = cfg.abort_on_handler_death;
@@ -403,11 +416,18 @@ pub fn setup(
         },
         _ => (None, None),
     };
+    // Recording keeps faults one page each so the trace holds only pages the guest
+    // touched; a block no larger than a (huge) page has nothing around it to copy.
+    let fault_around = match kib as usize * 1024 {
+        bytes if cfg.record_to.is_none() && bytes > page_size => bytes,
+        _ => 0,
+    };
     let backing = Backing {
         overlay,
         base,
         present,
         page_size,
+        fault_around,
     };
 
     // Recording disables prefetch so the captured trace reflects guest-driven access
@@ -1224,6 +1244,8 @@ struct Backing {
     // Page size is fixed for the restore's lifetime; held here so src_ptr needn't be
     // passed it on every fault.
     page_size: usize,
+    // Bytes of the aligned block a fault copies; 0 copies the faulting page alone.
+    fault_around: usize,
 }
 
 impl Backing {
@@ -1557,7 +1579,13 @@ fn serve_timed(
     stats: &Stats,
 ) -> ServeOutcome {
     let started = Instant::now();
-    let outcome = serve_pagefault(uffd, mappings, backing, page_size, addr);
+    let outcome = match fault_around(uffd, mappings, backing, page_size, addr) {
+        Some(extra) => {
+            stats.fault_around_pages.fetch_add(extra, Ordering::Relaxed);
+            ServeOutcome::Served
+        }
+        None => serve_pagefault(uffd, mappings, backing, page_size, addr),
+    };
     stats.fault_ns.fetch_add(
         u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
@@ -1698,6 +1726,71 @@ fn serve_pagefault(
     }
 }
 
+/// Serves a fault by copying the block of `backing.fault_around` bytes (aligned in
+/// guest memory) holding the faulting page instead of the page alone: from the fault
+/// to the block's end first, so the faulting vCPU wakes on that copy, then the
+/// block's start up to the fault.
+/// The block is cut to its region and to the pages sharing the faulting page's
+/// source, as a layered page comes from either file. Returns the pages placed beside
+/// the faulting one once that page has landed; None leaves the fault to
+/// [`serve_pagefault`], which handles every refusal (a resident page, a queued
+/// REMOVE, an unregistered range).
+fn fault_around(
+    uffd: &Uffd,
+    mappings: &[GuestRegionUffdMapping],
+    backing: &Backing,
+    page_size: usize,
+    addr: u64,
+) -> Option<u64> {
+    let block = backing.fault_around as u64;
+    if block == 0 {
+        return None;
+    }
+    let ps = page_size as u64;
+    let page_addr = addr & !(ps - 1);
+    let region = mappings.iter().find(|r| {
+        page_addr >= r.base_host_virt_addr && page_addr < r.base_host_virt_addr + r.size as u64
+    })?;
+    let region_end = region.base_host_virt_addr + region.size as u64;
+    let file_off = |a: u64| region.offset + (a - region.base_host_virt_addr);
+    let source = |a: u64| match &backing.present {
+        Some(p) if backing.base.is_some() => p.is_set((file_off(a) / ps) as usize),
+        _ => true,
+    };
+    let fault_source = source(page_addr);
+    // Blocks align to guest memory offsets, as the zero-hole registration does, not
+    // to host addresses, which mmap only page-aligns.
+    let lo_addr = page_addr - (file_off(page_addr) & (block - 1));
+    let lo = lo_addr.max(region.base_host_virt_addr);
+    let hi = (lo_addr + block).min(region_end);
+    let mut end = page_addr + ps;
+    while end < hi && source(end) == fault_source {
+        end += ps;
+    }
+    let mut start = page_addr;
+    while start > lo && source(start - ps) == fault_source {
+        start -= ps;
+    }
+    // SAFETY (both copies): the sources lie in the file chosen for every page of the
+    // run, contiguous there, and the destinations in a region registered with this
+    // UFFD, each for the length given.
+    let copy = |from: u64, to: u64| {
+        let src = backing.src_ptr(file_off(from)).cast::<libc::c_void>();
+        let len = (to - from) as usize;
+        match unsafe { uffd.copy(src, from as *mut libc::c_void, len, true) } {
+            Ok(c) => Some(c as u64 / ps),
+            Err(UffdCrateError::PartiallyCopied(c)) if c > 0 && c < len => Some(c as u64 / ps),
+            Err(_) => None,
+        }
+    };
+    let ahead = copy(page_addr, end)?;
+    if ahead == 0 {
+        return None;
+    }
+    let behind = if start < page_addr { copy(start, page_addr).unwrap_or(0) } else { 0 };
+    Some(ahead - 1 + behind)
+}
+
 fn unregister_range(uffd: &Uffd, start: *mut libc::c_void, end: *mut libc::c_void, page_size: usize) {
     let start_usz = start as usize;
     let end_usz = end as usize;
@@ -1796,6 +1889,7 @@ pub fn config_from_paths(
     abort_on_handler_death: bool,
     eager_overlay: bool,
     skip_zero_holes: bool,
+    fault_around_kib: u32,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
@@ -1805,6 +1899,7 @@ pub fn config_from_paths(
         abort_on_handler_death,
         eager_overlay,
         skip_zero_holes,
+        fault_around_kib,
     }
 }
 
@@ -1992,6 +2087,7 @@ mod tests {
             base: Some(mmap_snapshot(&base_path).unwrap()),
             present: Some(Arc::new(pm)),
             page_size: ps,
+            fault_around: 0,
         };
         let read = |pg: usize| -> u8 {
             let p = backing.src_ptr((pg * ps) as u64);
@@ -2031,6 +2127,7 @@ mod tests {
             base: Some(mmap_snapshot(&base_path).unwrap()),
             present: Some(Arc::new(present)),
             page_size: ps,
+            fault_around: 0,
         };
 
         // The resolution that, if wrong, silently corrupts guest memory: a present page
@@ -2060,6 +2157,7 @@ mod tests {
             base: None,
             present: None,
             page_size: ps,
+            fault_around: 0,
         };
         for pg in 0..2 {
             let p = backing.src_ptr((pg * ps) as u64);
@@ -2155,6 +2253,7 @@ mod tests {
             base: Some(mmap_snapshot(&base_path).unwrap()),
             present: Some(Arc::new(scan_present_pages(&ov_path, ps).unwrap())),
             page_size: ps,
+            fault_around: 0,
         };
         #[allow(deprecated)]
         let mappings = vec![GuestRegionUffdMapping {
@@ -2182,6 +2281,100 @@ mod tests {
 
         // SAFETY: unmap the region we mapped above.
         unsafe { libc::munmap(mem, total) };
+    }
+
+    #[test]
+    fn fault_around_copies_the_block_cut_to_the_faulting_pages_source() {
+        let ps = 4096usize;
+        let npages = 16usize;
+        let total = npages * ps;
+        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping fault_around test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+        // SAFETY: standard anonymous mmap of `total` bytes; checked against MAP_FAILED.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+        uffd.register(mem, total).expect("register region");
+
+        // Overlay holds pages 5 and 6; every other page comes from the base.
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; total]).unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        sparse_file(&ov_path, total as u64, &[(5 * ps as u64, 2 * ps, 0xAA)]);
+        let backing = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(Arc::new(scan_present_pages(&ov_path, ps).unwrap())),
+            page_size: ps,
+            fault_around: 8 * ps,
+        };
+        #[allow(deprecated)]
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: mem as u64,
+            size: total,
+            offset: 0,
+            page_size: ps,
+            page_size_kib: ps,
+        }];
+        let at = |pg: usize| mem as u64 + (pg * ps) as u64;
+        // SAFETY: only called on pages resident_pages reports installed.
+        let byte = |pg: usize| unsafe { *(at(pg) as *const u8) };
+        assert_eq!(
+            serve_pagefault(&uffd, &mappings, &backing, ps, at(3)),
+            ServeOutcome::Served
+        );
+
+        // A block wholly from the base lands in one copy.
+        assert_eq!(fault_around(&uffd, &mappings, &backing, ps, at(10)), Some(7));
+        // In the first block the run from page 2 stops at the resident page 3 and
+        // before the overlay's page 5; the pages behind it land too.
+        assert_eq!(fault_around(&uffd, &mappings, &backing, ps, at(2)), Some(2));
+        // An overlay fault takes only the overlay's run.
+        assert_eq!(fault_around(&uffd, &mappings, &backing, ps, at(5)), Some(1));
+        // A resident faulting page is left to the single-page path.
+        assert_eq!(fault_around(&uffd, &mappings, &backing, ps, at(3)), None);
+
+        let mut want = vec![true; npages];
+        want[4] = false;
+        want[7] = false;
+        assert_eq!(resident_pages(mem, npages), want);
+        for pg in [0, 2, 8, 15] {
+            assert_eq!(byte(pg), 0xBB, "page {pg}");
+        }
+        assert_eq!(byte(6), 0xAA);
+        // SAFETY: unmap the region mapped above.
+        unsafe { libc::munmap(mem, total) };
+    }
+
+    #[test]
+    fn setup_rejects_an_invalid_fault_around() {
+        for kib in [4, 12, 4096] {
+            let cfg = config_from_paths(Path::new("/nonexistent"), None, None, None, false, false, false, kib);
+            let err = setup(
+                cfg,
+                &GuestMemoryState::default(),
+                None,
+                false,
+                HugePageConfig::None,
+                Arc::new(Vec::new()),
+            )
+            .unwrap_err();
+            assert!(matches!(err, InternalUffdError::FaultAroundInvalid(k) if k == kib), "{kib}: {err}");
+        }
     }
 
     /// A sparse file of `len` bytes with `fill` written at each `(offset, len)`.
@@ -2268,6 +2461,7 @@ mod tests {
             base: Some(mmap_snapshot(&base_path).unwrap()),
             present: Some(present),
             page_size: ps,
+            fault_around: 0,
         };
         // SAFETY: `uffd` is alive; the duplicate is owned only by the handler.
         let handler_uffd = unsafe { Uffd::from_raw_fd(libc::dup(uffd.as_raw_fd())) };
@@ -2564,6 +2758,7 @@ mod tests {
             base: Some(mmap_snapshot(&base_path).unwrap()),
             present: Some(Arc::clone(&present)),
             page_size: ps,
+            fault_around: 0,
         };
 
         let filter: Arc<BpfProgram> = Arc::new(Vec::new());

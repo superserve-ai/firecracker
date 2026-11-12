@@ -201,6 +201,11 @@ pub struct MemBackendConfig {
     /// Only meaningful for `UffdInternal`; ignored otherwise.
     #[serde(default)]
     pub skip_zero_holes: bool,
+    /// Serve each page fault by copying the aligned block of this many KiB around it,
+    /// not just the faulting page. 0 (the default) or a power of two from 8 to 2048.
+    /// Only meaningful for `UffdInternal` with 4 KiB guest pages; ignored otherwise.
+    #[serde(default)]
+    pub fault_around_kib: u32,
     /// If set, the internal UFFD handler will write each served page offset to this path
     /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
     /// otherwise. When present, prefetch is disabled so the captured trace reflects the

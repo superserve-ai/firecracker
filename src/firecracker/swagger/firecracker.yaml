@@ -1501,6 +1501,14 @@ definitions:
           kernel to zero-fill instead of being served by the UFFD handler. Only
           meaningful when backend_type is UffdInternal; ignored otherwise. Support
           is advertised by the skip-zero-holes capability in `firecracker --version`.
+      fault_around_kib:
+        type: integer
+        default: 0
+        description: When non-zero, each page fault is served by copying the aligned
+          block of this many KiB around the faulting page rather than the page alone.
+          0 or a power of two from 8 to 2048. Only meaningful when backend_type is
+          UffdInternal with 4 KiB guest pages; ignored otherwise. Support is
+          advertised by the fault-around capability in `firecracker --version`.
       record_to:
         type: string
         description: Optional path the in-process UFFD handler writes each served
@@ -1934,6 +1942,10 @@ definitions:
         type: integer
         format: int64
         description: Pages the eager-overlay pre-copy placed ahead of the guest.
+      fault_around_pages:
+        type: integer
+        format: int64
+        description: Pages fault-around placed beside the faulting ones.
 
   MemoryHotplugStatus:
     type: object
