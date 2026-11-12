@@ -764,6 +764,11 @@ impl Vmm {
         Ok(())
     }
 
+    /// Counters of the internal UFFD handler, when guest memory is served by one.
+    pub fn uffd_stats(&self) -> Option<crate::uffd_internal::StatsSnapshot> {
+        self.uffd_handler.as_ref().map(|h| h.stats())
+    }
+
     /// Returns the current state of the memory hotplug device.
     pub fn memory_hotplug_status(&self) -> Result<VirtioMemStatus, VmmError> {
         self.device_manager

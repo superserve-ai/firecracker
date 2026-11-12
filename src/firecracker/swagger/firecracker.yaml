@@ -675,6 +675,27 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /uffd/stats:
+    get:
+      summary: Returns the internal UFFD handler's counters
+      operationId: getUffdStats
+      description:
+        Counters of the in-process UFFD handler that serves guest memory after a restore
+        with the UffdInternal backend. Fails when guest memory is served any other way.
+      responses:
+        200:
+          description: The handler's counters
+          schema:
+            $ref: "#/definitions/UffdStats"
+        400:
+          description: Guest memory is not served by the internal UFFD handler
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /network-interfaces/{iface_id}:
     put:
       summary: Creates a network interface. Pre-boot only.
@@ -1866,6 +1887,53 @@ definitions:
         minimum: 0
         maximum: 4294967295
         description: New target region size.
+
+  UffdStats:
+    type: object
+    description:
+      Counters of the internal UFFD handler serving guest memory, monotonic since the
+      restore that started it.
+    properties:
+      faults_served:
+        type: integer
+        format: int64
+        description: Guest page faults resolved by copying a page into guest memory.
+      faults_deferred:
+        type: integer
+        format: int64
+        description: Page-fault copies deferred behind a queued remove event.
+      faults_failed_transient:
+        type: integer
+        format: int64
+        description: Page-fault copies that failed with an unexpected error.
+      prefetch_served:
+        type: integer
+        format: int64
+        description: Pages copied by access-log prefetch.
+      prefetch_eexist:
+        type: integer
+        format: int64
+        description: Prefetch copies skipped because the guest had already faulted the page.
+      prefetch_eagain:
+        type: integer
+        format: int64
+        description: Prefetch copies deferred behind a queued remove event.
+      prefetch_failed:
+        type: integer
+        format: int64
+        description: Prefetch copies that failed with an unexpected error.
+      recorded_offsets:
+        type: integer
+        format: int64
+        description: Unique page offsets held by the access recorder, when recording.
+      fault_ns:
+        type: integer
+        format: int64
+        description: Nanoseconds the handler thread spent serving page faults.
+      precopy_pages:
+        type: integer
+        format: int64
+        description: Pages the eager-overlay pre-copy placed ahead of the guest.
 
   MemoryHotplugStatus:
     type: object

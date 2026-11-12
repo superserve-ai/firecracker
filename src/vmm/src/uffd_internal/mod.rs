@@ -69,12 +69,14 @@ struct Stats {
     prefetch_eagain: AtomicU64,
     prefetch_failed: AtomicU64,
     recorded_offsets: AtomicU64,
+    fault_ns: AtomicU64,
+    precopy_pages: AtomicU64,
 }
 
 /// Snapshot of [`Stats`] returned to external callers. Each field is a monotonic counter
 /// of events since the handler started, except `recorded_offsets`, which is the count of
 /// unique offsets currently held by the in-memory recorder (template-build mode only).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StatsSnapshot {
     /// Count of guest page faults the handler resolved by copying a page from the
     /// snapshot into guest memory.
@@ -99,6 +101,11 @@ pub struct StatsSnapshot {
     /// Number of unique page offsets the in-memory recorder is currently holding
     /// (template-build mode only; zero otherwise).
     pub recorded_offsets: u64,
+    /// Nanoseconds the handler thread spent serving guest page faults, deferred and
+    /// failed attempts included. Every vCPU waits on this one thread.
+    pub fault_ns: u64,
+    /// Pages the eager-overlay pre-copy placed ahead of the guest.
+    pub precopy_pages: u64,
 }
 
 impl Stats {
@@ -112,6 +119,8 @@ impl Stats {
             prefetch_eagain: self.prefetch_eagain.load(Ordering::Relaxed),
             prefetch_failed: self.prefetch_failed.load(Ordering::Relaxed),
             recorded_offsets: self.recorded_offsets.load(Ordering::Relaxed),
+            fault_ns: self.fault_ns.load(Ordering::Relaxed),
+            precopy_pages: self.precopy_pages.load(Ordering::Relaxed),
         }
     }
 }
@@ -654,6 +663,7 @@ impl Precopy {
         uffd: &Uffd,
         mappings: &[GuestRegionUffdMapping],
         page_size: usize,
+        stats: &Stats,
     ) -> PrecopyStep {
         // Clear the signal before looking, so a chunk queued after this is signalled
         // again rather than missed.
@@ -670,6 +680,7 @@ impl Precopy {
         match precopy(uffd, mappings, from, rest, page_size) {
             Some((copied, skipped, yielded_at)) => {
                 self.copied += copied;
+                stats.precopy_pages.fetch_add(copied as u64, Ordering::Relaxed);
                 self.skipped += skipped;
                 if let Some(at) = yielded_at {
                     self.pending = Some((start, data, at));
@@ -1348,7 +1359,7 @@ fn run(
 
         if pfds[0].revents == 0 {
             if let Some(p) = precopy.as_mut() {
-                match p.step(&uffd, &mappings, page_size) {
+                match p.step(&uffd, &mappings, page_size, &stats) {
                     PrecopyStep::Copied => {
                         precopy_queued = true;
                         continue;
@@ -1423,7 +1434,7 @@ fn retry_deferred(
     }
     let mut still_deferred = Vec::with_capacity(deferred.len());
     for addr in deferred.drain(..) {
-        match serve_pagefault(uffd, mappings, backing, page_size, addr) {
+        match serve_timed(uffd, mappings, backing, page_size, addr, stats) {
             ServeOutcome::Served => {
                 stats.faults_served.fetch_add(1, Ordering::Relaxed);
                 record_fault(recorder.as_deref_mut(), mappings, page_size, addr, stats);
@@ -1508,7 +1519,7 @@ fn handle_event(
     match ev {
         Event::Pagefault { addr, .. } => {
             let addr_u64 = addr as u64;
-            match serve_pagefault(uffd, mappings, backing, page_size, addr_u64) {
+            match serve_timed(uffd, mappings, backing, page_size, addr_u64, stats) {
                 ServeOutcome::Served => {
                     stats.faults_served.fetch_add(1, Ordering::Relaxed);
                     record_fault(recorder, mappings, page_size, addr_u64, stats);
@@ -1527,6 +1538,26 @@ fn handle_event(
             log::debug!("uffd-internal: unexpected event: {ev:?}");
         }
     }
+}
+
+/// [`serve_pagefault`], charging its time to `fault_ns`.
+fn serve_timed(
+    uffd: &Uffd,
+    mappings: &[GuestRegionUffdMapping],
+    backing: &Backing,
+    page_size: usize,
+    addr: u64,
+    stats: &Stats,
+) -> ServeOutcome {
+    let started = Instant::now();
+    let outcome = serve_pagefault(uffd, mappings, backing, page_size, addr);
+    stats
+        .fault_ns
+        .fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    outcome
 }
 
 /// Record the page-aligned file offset corresponding to `addr` if a recorder is active.
@@ -2278,6 +2309,7 @@ mod tests {
         // Read after the join: the copy wakes the reader before the counter moves.
         let served = cases.iter().filter(|c| c.2).count() as u64;
         assert_eq!(stats.snapshot().faults_served, served, "only registered pages fault");
+        assert!(stats.snapshot().fault_ns > 0, "served faults are timed");
         for mem in regions {
             // SAFETY: unmap the regions mapped above.
             unsafe { libc::munmap(mem, region) };
