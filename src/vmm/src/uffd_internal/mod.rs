@@ -1726,9 +1726,10 @@ fn serve_pagefault(
     }
 }
 
-/// Serves a fault by copying the `backing.fault_around`-aligned block holding the
-/// faulting page instead of the page alone: from the fault to the block's end first,
-/// so the faulting vCPU wakes on that copy, then the block's start up to the fault.
+/// Serves a fault by copying the block of `backing.fault_around` bytes (aligned in
+/// guest memory) holding the faulting page instead of the page alone: from the fault
+/// to the block's end first, so the faulting vCPU wakes on that copy, then the
+/// block's start up to the fault.
 /// The block is cut to its region and to the pages sharing the faulting page's
 /// source, as a layered page comes from either file. Returns the pages placed beside
 /// the faulting one once that page has landed; None leaves the fault to
@@ -1757,8 +1758,11 @@ fn fault_around(
         _ => true,
     };
     let fault_source = source(page_addr);
-    let lo = (page_addr & !(block - 1)).max(region.base_host_virt_addr);
-    let hi = ((page_addr | (block - 1)) + 1).min(region_end);
+    // Blocks align to guest memory offsets, as the zero-hole registration does, not
+    // to host addresses, which mmap only page-aligns.
+    let lo_addr = page_addr - (file_off(page_addr) & (block - 1));
+    let lo = lo_addr.max(region.base_host_virt_addr);
+    let hi = (lo_addr + block).min(region_end);
     let mut end = page_addr + ps;
     while end < hi && source(end) == fault_source {
         end += ps;
