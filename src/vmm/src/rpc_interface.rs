@@ -1315,6 +1315,7 @@ mod tests {
                     abort_on_handler_death: false,
                     eager_overlay: false,
                     skip_zero_holes: false,
+                    fault_around_kib: 0,
                     backend_path: PathBuf::new(),
                     access_log_path: None,
                     record_to: None,
