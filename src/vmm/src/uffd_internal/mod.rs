@@ -677,10 +677,9 @@ impl Precopy {
             },
         };
         let rest = &data[(from - start) as usize..];
-        match precopy(uffd, mappings, from, rest, page_size) {
+        match precopy(uffd, mappings, from, rest, page_size, stats) {
             Some((copied, skipped, yielded_at)) => {
                 self.copied += copied;
-                stats.precopy_pages.fetch_add(copied as u64, Ordering::Relaxed);
                 self.skipped += skipped;
                 if let Some(at) = yielded_at {
                     self.pending = Some((start, data, at));
@@ -778,13 +777,15 @@ fn warm(
 /// a range the balloon unregistered, is skipped on its own so the rest of the chunk is
 /// still copied. Returns (pages copied, pages skipped, the offset it yielded at if a
 /// queued REMOVE stopped it), or None when a copy failed in a way that ends the
-/// pre-copy.
+/// pre-copy. Placed pages are counted in `stats` as they land, so a stop doesn't
+/// lose the ones before it.
 fn precopy(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     start: u64,
     data: &[u8],
     page_size: usize,
+    stats: &Stats,
 ) -> Option<(usize, usize, Option<u64>)> {
     let (mut copied, mut skipped) = (0, 0);
     // Copies before this offset go a page at a time; see the ENOENT arm.
@@ -811,11 +812,17 @@ fn precopy(
         let step = match res {
             Ok(c) => {
                 copied += c / page_size;
+                stats
+                    .precopy_pages
+                    .fetch_add((c / page_size) as u64, Ordering::Relaxed);
                 c.max(page_size)
             }
             // Stopped at a page the guest faulted in first; the next pass skips it.
             Err(UffdCrateError::PartiallyCopied(c)) if c > 0 && c < n => {
                 copied += c / page_size;
+                stats
+                    .precopy_pages
+                    .fetch_add((c / page_size) as u64, Ordering::Relaxed);
                 c
             }
             // A queued REMOVE refuses every copy until the handler loop drains it, which
@@ -1551,12 +1558,10 @@ fn serve_timed(
 ) -> ServeOutcome {
     let started = Instant::now();
     let outcome = serve_pagefault(uffd, mappings, backing, page_size, addr);
-    stats
-        .fault_ns
-        .fetch_add(
-            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+    stats.fault_ns.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     outcome
 }
 
@@ -2476,7 +2481,7 @@ mod tests {
         let overlay = std::fs::read(&ov_path).unwrap();
         let chunk = &overlay[first * ps..last * ps];
         assert_eq!(
-            precopy(&uffd, &mappings, (first * ps) as u64, chunk, ps),
+            precopy(&uffd, &mappings, (first * ps) as u64, chunk, ps, &Stats::default()),
             Some((last - first, 0, None))
         );
 
@@ -2691,12 +2696,62 @@ mod tests {
         }];
 
         assert_eq!(
-            precopy(&uffd, &mappings, 0, &vec![0xAAu8; total], ps),
+            precopy(&uffd, &mappings, 0, &vec![0xAAu8; total], ps, &Stats::default()),
             Some((npages - 1, 1, None))
         );
         let mut want = vec![true; npages];
         want[5] = false;
         assert_eq!(resident_pages(mem, npages), want);
+        // SAFETY: unmap the region mapped above.
+        unsafe { libc::munmap(mem, total) };
+    }
+
+    #[test]
+    fn precopy_counts_pages_placed_before_a_failure_that_stops_it() {
+        let ps = 4096usize;
+        let total = 8 * ps;
+        let uffd = match UffdBuilder::new().close_on_exec(true).user_mode_only(true).create() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("skipping precopy test: userfaultfd unavailable: {e:?}");
+                return;
+            }
+        };
+        // SAFETY: standard anonymous mmap of `total` bytes; checked against MAP_FAILED.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap guest region");
+        uffd.register(mem, total).expect("register region");
+        // The second region's address is misaligned, so its copy fails with EINVAL
+        // after the first region's four pages have landed.
+        #[allow(deprecated)]
+        let mappings = vec![
+            GuestRegionUffdMapping {
+                base_host_virt_addr: mem as u64,
+                size: 4 * ps,
+                offset: 0,
+                page_size: ps,
+                page_size_kib: ps,
+            },
+            GuestRegionUffdMapping {
+                base_host_virt_addr: mem as u64 + 4 * ps as u64 + 1,
+                size: 4 * ps,
+                offset: 4 * ps as u64,
+                page_size: ps,
+                page_size_kib: ps,
+            },
+        ];
+        let stats = Stats::default();
+        assert_eq!(precopy(&uffd, &mappings, 0, &vec![0xAAu8; total], ps, &stats), None);
+        assert_eq!(stats.snapshot().precopy_pages, 4);
         // SAFETY: unmap the region mapped above.
         unsafe { libc::munmap(mem, total) };
     }
@@ -2758,14 +2813,14 @@ mod tests {
 
         let data = vec![0xAAu8; total];
         assert_eq!(
-            precopy(&uffd, &mappings, 0, &data, ps),
+            precopy(&uffd, &mappings, 0, &data, ps, &Stats::default()),
             Some((0, 0, Some(0))),
             "a queued REMOVE makes the copy yield, not skip"
         );
         assert!(matches!(uffd.read_event(), Ok(Some(Event::Remove { .. }))));
         assert_eq!(balloon.join().unwrap(), 0);
         assert_eq!(
-            precopy(&uffd, &mappings, 0, &data, ps),
+            precopy(&uffd, &mappings, 0, &data, ps, &Stats::default()),
             Some((npages, 0, None)),
             "once drained, the same chunk copies in full"
         );
@@ -2835,7 +2890,7 @@ mod tests {
             .iter()
             .map(|&(start, len)| {
                 let at = start as usize;
-                precopy(&uffd, &mappings, start, &overlay[at..at + len], ps)
+                precopy(&uffd, &mappings, start, &overlay[at..at + len], ps, &Stats::default())
             })
             .collect();
         assert_eq!(copies, vec![Some((2, 1, None)), Some((1, 0, None))]);
