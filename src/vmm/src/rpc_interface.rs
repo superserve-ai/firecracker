@@ -116,6 +116,8 @@ pub enum VmmAction {
     SetEntropyDevice(EntropyDeviceConfig),
     /// Get the memory hotplug device configuration and status.
     GetMemoryHotplugStatus,
+    /// Get the internal UFFD handler's counters.
+    GetUffdStats,
     /// Set the memory hotplug device using `MemoryHotplugConfig` as input. This action can only be
     /// called before the microVM has booted.
     SetMemoryHotplugDevice(MemoryHotplugConfig),
@@ -226,6 +228,8 @@ pub enum VmmData {
     VmmVersion(String),
     /// The status of the memory hotplug device.
     VirtioMemStatus(VirtioMemStatus),
+    /// The internal UFFD handler's counters.
+    UffdStats(crate::uffd_internal::StatsSnapshot),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
 }
@@ -488,6 +492,7 @@ impl<'a> PrebootApiController<'a> {
             | Resume
             | GetBalloonStats
             | GetMemoryHotplugStatus
+            | GetUffdStats
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
             | UpdateBlockDevice(_)
@@ -707,6 +712,17 @@ impl RuntimeApiController {
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
+            GetUffdStats => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .uffd_stats()
+                .map(VmmData::UffdStats)
+                .ok_or_else(|| {
+                    VmmActionError::NotSupported(
+                        "guest memory is not served by the internal UFFD handler".to_string(),
+                    )
+                }),
             GetMemoryHotplugStatus => self
                 .vmm
                 .lock()

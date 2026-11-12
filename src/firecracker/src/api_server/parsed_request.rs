@@ -92,6 +92,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
                 parse_get_memory_hotplug()
             }
+            (Method::Get, "uffd", None) if path_tokens.next() == Some("stats") => {
+                Ok(ParsedRequest::new_sync(VmmAction::GetUffdStats))
+            }
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
@@ -189,6 +192,7 @@ impl ParsedRequest {
                 }
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
                 VmmData::VirtioMemStatus(data) => Self::success_response_with_data(data),
+                VmmData::UffdStats(stats) => Self::success_response_with_data(stats),
                 VmmData::HintingStatus(hinting_status) => {
                     Self::success_response_with_data(hinting_status)
                 }
@@ -609,6 +613,9 @@ pub mod tests {
                 VmmData::VirtioMemStatus(data) => {
                     http_response(&serde_json::to_string(data).unwrap(), 200)
                 }
+                VmmData::UffdStats(stats) => {
+                    http_response(&serde_json::to_string(stats).unwrap(), 200)
+                }
                 VmmData::HintingStatus(status) => {
                     http_response(&serde_json::to_string(status).unwrap(), 200)
                 }
@@ -771,6 +778,21 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_get_uffd_stats() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/uffd/stats", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(matches!(
+            ParsedRequest::try_from(&req).unwrap().into_parts(),
+            (RequestAction::Sync(action), _) if *action == VmmAction::GetUffdStats
+        ));
     }
 
     #[test]
