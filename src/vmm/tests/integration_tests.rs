@@ -206,24 +206,27 @@ fn test_create_snapshot_records_resident_pages() {
     let mut controller = RuntimeApiController::new(vmm.clone());
     thread::sleep(Duration::from_millis(200));
     controller.handle_request(VmmAction::Pause).unwrap();
-    controller
-        .handle_request(VmmAction::CreateSnapshot(CreateSnapshotParams {
-            snapshot_type: SnapshotType::Full,
-            snapshot_path: snapshot_file.as_path().to_path_buf(),
-            mem_file_path: memory_file.as_path().to_path_buf(),
-            block_delta_dir: None,
-            flatten: false,
-            expected_session_id: None,
-            expected_generation: None,
-            record_resident: true,
-        }))
-        .unwrap();
-    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    let mut snapshot = |record_resident| {
+        controller
+            .handle_request(VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: memory_file.as_path().to_path_buf(),
+                block_delta_dir: None,
+                flatten: false,
+                expected_session_id: None,
+                expected_generation: None,
+                record_resident,
+            }))
+            .unwrap();
+    };
+    let side = vmm::uffd_internal::resident_sidecar_path(memory_file.as_path());
 
     // Header (magic, page size, page count), bitmap words, CRC: some of the guest's
-    // pages are resident after boot, but not all of them.
-    let side = vmm::uffd_internal::resident_sidecar_path(memory_file.as_path());
-    let bytes = std::fs::read(side).unwrap();
+    // pages are resident after boot, not all, as the Full dump reads every page only
+    // after residency is taken.
+    snapshot(true);
+    let bytes = std::fs::read(&side).unwrap();
     let npages = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
     let mem_pages = memory_file.as_file().metadata().unwrap().len() as usize / 4096;
     assert_eq!(npages, mem_pages);
@@ -232,6 +235,11 @@ fn test_create_snapshot_records_resident_pages() {
         .map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones())
         .sum();
     assert!(resident > 0 && (resident as usize) < npages, "{resident} of {npages}");
+
+    // A later save to the same file without recording leaves no hint behind.
+    snapshot(false);
+    assert_eq!(std::fs::metadata(&side).unwrap().len(), 0);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
 fn verify_create_snapshot(

@@ -1239,8 +1239,20 @@ pub fn write_resident_bitmap(
     )
 }
 
-/// `<snapshot>.resident` when it exists and describes this memory file; anything
-/// else means no resident prefetch, never a failed restore.
+/// Empties `<mem_path>.resident` if there is one, so it can't outlive the snapshot it
+/// describes; an empty side-car reads as no hint. Unlink is not in the seccomp
+/// allowlist, hence the truncate.
+pub fn clear_resident_sidecar(mem_path: &Path) {
+    let path = resident_sidecar_path(mem_path);
+    if std::fs::metadata(&path).is_ok() {
+        let _ = std::fs::File::create(&path);
+    }
+}
+
+/// `<snapshot>.resident` when it exists and describes this memory file, folded from
+/// the host pages it records to the restore's `page_size` (a page is resident if any
+/// host page in it was); anything else means no resident prefetch, never a failed
+/// restore.
 fn read_resident_sidecar(
     mem_path: &Path,
     page_size: usize,
@@ -1248,9 +1260,19 @@ fn read_resident_sidecar(
 ) -> Option<PresenceBitmap> {
     let path = resident_sidecar_path(mem_path);
     let bytes = std::fs::read(&path).ok()?;
-    PresenceBitmap::decode(&bytes, &path, page_size, npages)
+    let host = crate::arch::host_page_size();
+    let per = (page_size / host).max(1);
+    let recorded = PresenceBitmap::decode(&bytes, &path, page_size / per, npages * per)
         .inspect_err(|e| log::warn!("uffd-precopy: ignoring resident side-car: {e}"))
-        .ok()
+        .ok()?;
+    if per == 1 {
+        return Some(recorded);
+    }
+    let mut folded = PresenceBitmap::with_pages(npages);
+    for page in (0..npages * per).filter(|&p| recorded.is_set(p)) {
+        folded.set(page / per);
+    }
+    Some(folded)
 }
 
 /// Load `<overlay>.presence` if it exists. `Ok(None)` ⇒ no side-car (a pre-side-car
@@ -2985,6 +3007,25 @@ mod tests {
             "a torn side-car is ignored"
         );
         assert!(read_resident_sidecar(&dir.path().join("none"), 4096, 128).is_none());
+
+        write_resident_bitmap(&mem, 4096, 128, &bits).unwrap();
+        clear_resident_sidecar(&mem);
+        assert!(
+            read_resident_sidecar(&mem, 4096, 128).is_none(),
+            "a cleared side-car is no hint"
+        );
+    }
+
+    #[test]
+    fn resident_sidecar_folds_host_pages_into_huge_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("mem.snap");
+        // Two 2 MiB pages of 512 host pages each; host page 600 lies in the second.
+        let mut bits = vec![0u64; 1024 / 64];
+        bits[600 / 64] |= 1 << (600 % 64);
+        write_resident_bitmap(&mem, 4096, 1024, &bits).unwrap();
+        let folded = read_resident_sidecar(&mem, 2 << 20, 2).unwrap();
+        assert!(!folded.is_set(0) && folded.is_set(1));
     }
 
     #[test]

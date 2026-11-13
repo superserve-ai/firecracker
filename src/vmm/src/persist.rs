@@ -314,6 +314,14 @@ pub fn create_snapshot(
     } else {
         file_ranges(&microvm_state.vm_state.memory, &fresh)
     };
+    // Residency is read before the dump, which faults in every page a Full snapshot
+    // reads. Any earlier hint is emptied first so a failed or unrecorded save never
+    // leaves one describing another snapshot.
+    crate::uffd_internal::clear_resident_sidecar(&params.mem_file_path);
+    let resident = params.record_resident.then(|| {
+        let started = std::time::Instant::now();
+        (vmm.vm.resident_pages(), started)
+    });
     let dumped =
         vmm.vm
             .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type, &zero_ranges);
@@ -328,8 +336,8 @@ pub fn create_snapshot(
             .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.clear_fresh());
     }
     let diff_dump = dumped?;
-    if params.record_resident {
-        record_resident(vmm, &params.mem_file_path, page_size);
+    if let Some((pages, started)) = resident {
+        record_resident(pages, started, &params.mem_file_path, page_size);
     }
 
     let md = std::fs::metadata(&params.mem_file_path)
@@ -461,17 +469,17 @@ fn and_plugged(mut bits: Vec<u64>, plugged: Option<&[u64]>) -> Vec<u64> {
 /// hotplug do no extra work.
 /// Writes the resident-pages side-car for a restore to prefetch. Best effort: a VM
 /// without it only restores without the prefetch.
-fn record_resident(vmm: &Vmm, mem_file_path: &Path, page_size: usize) {
-    let started = std::time::Instant::now();
-    let result = vmm
-        .vm
-        .resident_pages()
-        .map_err(|e| e.to_string())
-        .and_then(|(bits, npages)| {
-            crate::uffd_internal::write_resident_bitmap(mem_file_path, page_size, npages, &bits)
-                .map(|()| bits.iter().map(|w| w.count_ones()).sum::<u32>())
-                .map_err(|e| e.to_string())
-        });
+fn record_resident(
+    pages: Result<(Vec<u64>, usize), VmError>,
+    started: std::time::Instant,
+    mem_file_path: &Path,
+    page_size: usize,
+) {
+    let result = pages.map_err(|e| e.to_string()).and_then(|(bits, npages)| {
+        crate::uffd_internal::write_resident_bitmap(mem_file_path, page_size, npages, &bits)
+            .map(|()| bits.iter().map(|w| w.count_ones()).sum::<u32>())
+            .map_err(|e| e.to_string())
+    });
     match result {
         Ok(n) => log::info!(
             "recorded {n} resident pages in {} us",
