@@ -72,6 +72,7 @@ struct Stats {
     fault_ns: AtomicU64,
     precopy_pages: AtomicU64,
     fault_around_pages: AtomicU64,
+    precopy_cold_pages: AtomicU64,
 }
 
 /// Snapshot of [`Stats`] returned to external callers. Each field is a monotonic counter
@@ -109,6 +110,9 @@ pub struct StatsSnapshot {
     pub precopy_pages: u64,
     /// Pages fault-around placed beside the faulting ones.
     pub fault_around_pages: u64,
+    /// Pages a resident pre-copy left to the guest's faults because their file pages
+    /// were not in the page cache.
+    pub precopy_cold_pages: u64,
 }
 
 impl Stats {
@@ -125,6 +129,7 @@ impl Stats {
             fault_ns: self.fault_ns.load(Ordering::Relaxed),
             precopy_pages: self.precopy_pages.load(Ordering::Relaxed),
             fault_around_pages: self.fault_around_pages.load(Ordering::Relaxed),
+            precopy_cold_pages: self.precopy_cold_pages.load(Ordering::Relaxed),
         }
     }
 }
@@ -409,20 +414,26 @@ pub fn setup(
         true => read_resident_sidecar(&cfg.snapshot_path, page_size, npages),
         false => None,
     };
+    // A resident copy takes only pages already in the page cache, leaving cold ones to
+    // the guest's faults rather than competing with them for the disk; a fork's overlay
+    // copy reads its cold overlay whole, which is what it is for.
     let warm_plan = match (resident, &present) {
-        (Some(r), _) => Some((Arc::new(r), cfg.base_path.as_deref())),
+        (Some(r), _) => Some((Arc::new(r), cfg.base_path.as_deref(), true)),
         (None, Some(p)) if cfg.eager_overlay && cfg.record_to.is_none() => {
-            Some((Arc::clone(p), None))
+            Some((Arc::clone(p), None, false))
         }
         _ => None,
     };
+    let stats = Arc::new(Stats::default());
     let (precopy, warmer) = match warm_plan {
-        Some((copy, base)) => match start_warmer(
+        Some((copy, base, cached_only)) => match start_warmer(
             &cfg.snapshot_path,
             base.zip(present.clone()),
             copy,
             npages,
             page_size,
+            cached_only,
+            Arc::clone(&stats),
             Arc::clone(&vmm_filter),
         ) {
             Ok((precopy, warmer)) => (Some(precopy), Some(warmer)),
@@ -479,7 +490,6 @@ pub fn setup(
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let (drain_tx, drain_rx) = mpsc::sync_channel::<mpsc::SyncSender<()>>(0);
-    let stats = Arc::new(Stats::default());
     let stats_for_thread = Arc::clone(&stats);
     let thread = thread::Builder::new()
         .name("uffd-internal".into())
@@ -747,6 +757,8 @@ fn start_warmer(
     copy: Arc<PresenceBitmap>,
     npages: usize,
     page_size: usize,
+    cached_only: bool,
+    stats: Arc<Stats>,
     vmm_filter: Arc<BpfProgram>,
 ) -> std::io::Result<(Precopy, (Arc<AtomicBool>, thread::JoinHandle<()>))> {
     // Mapped here: the warmer's seccomp filter does not allow file-backed mmap.
@@ -784,7 +796,8 @@ fn start_warmer(
                 return;
             }
             let runs = present_runs(&copy, page_size, npages);
-            warm(&source, &runs, &tx, &signal, &stop_for_thread);
+            let cold = cached_only.then_some(&stats.precopy_cold_pages);
+            warm(&source, &runs, &tx, &signal, &stop_for_thread, cold);
         })?;
     Ok((
         Precopy {
@@ -803,14 +816,16 @@ fn start_warmer(
 /// [`PRECOPY_CHUNK`], each from the one file holding all its pages, and hands each
 /// to the fault handler. The handler copies from the buffer, not the file, so its
 /// copies never wait on the disk even if the page cache is evicted meanwhile.
-/// Touches only the file mappings, never guest memory. Stops on `stop` or once the
-/// handler drops its end of the queue.
+/// Touches only the file mappings, never guest memory. With `cold` set, hands over
+/// only pages already in the page cache and counts the rest there, left to the
+/// guest's faults. Stops on `stop` or once the handler drops its end of the queue.
 fn warm(
     source: &Backing,
     runs: &[(u64, usize)],
     chunks: &mpsc::SyncSender<(u64, Vec<u8>)>,
     ready: &EventFd,
     stop: &AtomicBool,
+    cold: Option<&AtomicU64>,
 ) {
     let ps = source.page_size as u64;
     let from_overlay = |off: u64| match (&source.base, &source.present) {
@@ -831,17 +846,68 @@ fn warm(
                 next += ps;
             }
             let n = (next - off) as usize;
-            // SAFETY: `off + n` is within a run and every page in it comes from the
-            // file src_ptr picks for `off`; setup validated both files cover all guest
-            // memory.
-            let data = unsafe { std::slice::from_raw_parts(source.src_ptr(off), n) };
-            if chunks.send((off, data.to_vec())).is_err() {
-                return;
+            let src = source.src_ptr(off);
+            let parts = match cold {
+                Some(cold) => {
+                    let cached = cached_runs(src, n, source.page_size);
+                    let kept: usize = cached.iter().map(|&(_, len)| len).sum();
+                    cold.fetch_add(((n - kept) / source.page_size) as u64, Ordering::Relaxed);
+                    cached
+                }
+                None => vec![(0, n)],
+            };
+            for (at, len) in parts {
+                // SAFETY: `at + len <= n`, `off + n` is within a run and every page in it
+                // comes from the file src_ptr picks for `off`; start_warmer checked both
+                // files cover all guest memory.
+                let data = unsafe { std::slice::from_raw_parts(src.add(at), len) };
+                if chunks.send((off + at as u64, data.to_vec())).is_err() {
+                    return;
+                }
+                let _ = ready.write(1);
             }
-            let _ = ready.write(1);
             off += n as u64;
         }
     }
+}
+
+/// The runs, as (byte offset, length), of the `len` bytes mapped at `addr` whose
+/// `page_size` pages are wholly in the page cache. `mincore` reports per host page,
+/// so a page counts only when every host page it overlaps is cached, whichever of
+/// the two is larger. Empty if residency can't be read: nothing is taken cached that
+/// isn't known to be.
+fn cached_runs(addr: *const u8, len: usize, page_size: usize) -> Vec<(usize, usize)> {
+    let host = crate::arch::host_page_size();
+    let mut vec = vec![0u8; len.div_ceil(host)];
+    // SAFETY: `addr` is a page-aligned address inside a file mapping covering `len`
+    // bytes, and `vec` has a byte for each host page of it.
+    if unsafe { libc::mincore(addr as *mut libc::c_void, len, vec.as_mut_ptr()) } != 0 {
+        return Vec::new();
+    }
+    let cached = |pg: usize| {
+        let (first, end) = (pg * page_size, ((pg + 1) * page_size).min(len));
+        vec[first / host..end.div_ceil(host)]
+            .iter()
+            .all(|b| b & 1 == 1)
+    };
+    let pages = len.div_ceil(page_size);
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < pages {
+        if !cached(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < pages && cached(i) {
+            i += 1;
+        }
+        runs.push((
+            start * page_size,
+            ((i - start) * page_size).min(len - start * page_size),
+        ));
+    }
+    runs
 }
 
 /// Copies one chunk of the overlay, `data` read from file offset `start`, into guest
@@ -2875,7 +2941,7 @@ mod tests {
 
         let filter: Arc<BpfProgram> = Arc::new(Vec::new());
         let (precopy, (stop, warmer)) =
-            start_warmer(&ov_path, None, present, npages, ps, Arc::clone(&filter)).unwrap();
+            start_warmer(&ov_path, None, present, npages, ps, false, Arc::default(), Arc::clone(&filter)).unwrap();
         // SAFETY: `uffd` is alive; the duplicate is owned only by the handler.
         let handler_uffd = unsafe { Uffd::from_raw_fd(libc::dup(uffd.as_raw_fd())) };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -2943,7 +3009,7 @@ mod tests {
         // One run longer than two chunks, and a short one after a gap.
         let runs = vec![(0u64, (chunk_pages * 2 + 3) * ps), (((npages - 2) * ps) as u64, ps)];
         let (tx, rx) = mpsc::sync_channel(8);
-        warm(&overlay, &runs, &tx, &ready, &stop);
+        warm(&overlay, &runs, &tx, &ready, &stop, None);
         drop(tx);
         let chunks: Vec<_> = rx.iter().collect();
         for (start, data) in &chunks {
@@ -2964,7 +3030,7 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(8);
-        warm(&overlay, &runs, &tx, &ready, &stop);
+        warm(&overlay, &runs, &tx, &ready, &stop, None);
         drop(tx);
         assert_eq!(rx.iter().count(), 0, "a stopped warmer hands over nothing");
     }
@@ -2977,10 +3043,94 @@ mod tests {
         let mut copy = PresenceBitmap::with_pages(2);
         copy.set(0);
         copy.set(1);
-        let err = start_warmer(&mem, None, Arc::new(copy), 2, 4096, Arc::new(Vec::new()))
+        let err = start_warmer(&mem, None, Arc::new(copy), 2, 4096, false, Arc::default(), Arc::new(Vec::new()))
             .err()
             .expect("a two-page warm over a one-page file must not start");
         assert!(err.to_string().contains("shorter"), "{err}");
+    }
+
+    /// A synced file of `npages` host pages with `cold` dropped from the page cache, or
+    /// None when this filesystem keeps them anyway (tmpfs), where the test can't run.
+    fn file_with_cold_pages(dir: &Path, npages: usize, cold: &[usize]) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let hp = crate::arch::host_page_size();
+        let path = dir.join("mem.snap");
+        let f = std::fs::File::create(&path).unwrap();
+        f.write_all_at(&vec![7u8; npages * hp], 0).unwrap();
+        f.sync_all().unwrap();
+        for &pg in cold {
+            // SAFETY: a valid fd and an in-file range.
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    (pg * hp) as i64,
+                    hp as i64,
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+        }
+        let map = mmap_snapshot(&path).unwrap();
+        let runs = cached_runs(map.addr, npages * hp, hp);
+        let resident: usize = runs.iter().map(|&(_, len)| len / hp).sum();
+        (resident == npages - cold.len()).then_some(path)
+    }
+
+    #[test]
+    fn cached_runs_takes_a_larger_page_only_when_all_its_host_pages_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        // Eight host pages as four two-host-page pages; dropping host page 3 makes the
+        // second of those cold.
+        let Some(path) = file_with_cold_pages(dir.path(), 8, &[3]) else {
+            eprintln!("skipping: this filesystem keeps dropped pages cached");
+            return;
+        };
+        let map = mmap_snapshot(&path).unwrap();
+        let hp = crate::arch::host_page_size();
+        assert_eq!(
+            cached_runs(map.addr, 8 * hp, 2 * hp),
+            vec![(0, 2 * hp), (4 * hp, 4 * hp)]
+        );
+        // Pages smaller than a host page take its residency.
+        let small = hp / 2;
+        assert_eq!(
+            cached_runs(map.addr, 8 * hp, small),
+            vec![(0, 6 * small), (8 * small, 8 * small)]
+        );
+    }
+
+    #[test]
+    fn resident_warm_copies_cached_pages_and_leaves_cold_ones_to_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = file_with_cold_pages(dir.path(), 8, &[2, 3, 6]) else {
+            eprintln!("skipping: this filesystem keeps dropped pages cached");
+            return;
+        };
+        let hp = crate::arch::host_page_size();
+        let source = Backing {
+            overlay: mmap_snapshot(&path).unwrap(),
+            base: None,
+            present: None,
+            page_size: hp,
+            fault_around: 0,
+        };
+        let cold = AtomicU64::new(0);
+        let (tx, rx) = mpsc::sync_channel(16);
+        warm(
+            &source,
+            &[(0, 8 * hp)],
+            &tx,
+            &EventFd::new(EFD_NONBLOCK).unwrap(),
+            &AtomicBool::new(false),
+            Some(&cold),
+        );
+        drop(tx);
+        let chunks: Vec<_> = rx
+            .iter()
+            .map(|(off, d)| (off / hp as u64, d.len() / hp))
+            .collect();
+        assert_eq!(chunks, vec![(0, 2), (4, 2), (7, 1)]);
+        assert_eq!(cold.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -3001,7 +3151,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::sync_channel(8);
         // One run across base, overlay and base again splits at each change of layer.
-        warm(&source, &[(ps as u64, 4 * ps)], &tx, &EventFd::new(EFD_NONBLOCK).unwrap(), &AtomicBool::new(false));
+        warm(&source, &[(ps as u64, 4 * ps)], &tx, &EventFd::new(EFD_NONBLOCK).unwrap(), &AtomicBool::new(false), None);
         drop(tx);
         let chunks: Vec<_> = rx.iter().map(|(s, d)| (s, d.len(), d[0], d.iter().all(|&b| b == d[0]))).collect();
         assert_eq!(
