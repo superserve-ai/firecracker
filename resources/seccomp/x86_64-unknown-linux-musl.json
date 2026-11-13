@@ -36,6 +36,19 @@
                 "syscall": "mincore"
             },
             {
+                "syscall": "preadv2",
+                "comment": "Used by the resident pre-copy to read only memory-file pages already in the page cache",
+                "args": [
+                    {
+                        "index": 5,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 8,
+                        "comment": "RWF_NOWAIT"
+                    }
+                ]
+            },
+            {
                 "syscall": "writev",
                 "comment": "Used by the VirtIO net device to write to tap"
             },

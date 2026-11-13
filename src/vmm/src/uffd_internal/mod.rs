@@ -783,6 +783,19 @@ fn start_warmer(
             "memory file shorter than the {need} bytes of guest memory"
         )));
     }
+    // A cache-only copy needs non-blocking buffered reads, which some filesystems
+    // (overlayfs, tmpfs) refuse; without them it copies nothing rather than block.
+    if cached_only {
+        let files =
+            std::iter::once(&source.overlay.file).chain(source.base.as_ref().map(|b| &b.file));
+        for file in files {
+            if !nowait_reads_supported(file, page_size) {
+                return Err(std::io::Error::other(
+                    "memory file's filesystem does not support non-blocking reads",
+                ));
+            }
+        }
+    }
     let ready = EventFd::new(EFD_NONBLOCK)?;
     let signal = ready.try_clone()?;
     let (tx, chunks) = mpsc::sync_channel(PRECOPY_LOOKAHEAD);
@@ -846,22 +859,18 @@ fn warm(
                 next += ps;
             }
             let n = (next - off) as usize;
-            let src = source.src_ptr(off);
             let parts = match cold {
-                Some(cold) => {
-                    let cached = cached_runs(src, n, source.page_size);
-                    let kept: usize = cached.iter().map(|&(_, len)| len).sum();
-                    cold.fetch_add(((n - kept) / source.page_size) as u64, Ordering::Relaxed);
-                    cached
+                Some(cold) => cached_reads(source.src_file(off), off, n, source.page_size, cold),
+                None => {
+                    // SAFETY: `off + n` is within a run and every page in it comes from
+                    // the file src_ptr picks for `off`; start_warmer checked both files
+                    // cover all guest memory.
+                    let data = unsafe { std::slice::from_raw_parts(source.src_ptr(off), n) };
+                    vec![(off, data.to_vec())]
                 }
-                None => vec![(0, n)],
             };
-            for (at, len) in parts {
-                // SAFETY: `at + len <= n`, `off + n` is within a run and every page in it
-                // comes from the file src_ptr picks for `off`; start_warmer checked both
-                // files cover all guest memory.
-                let data = unsafe { std::slice::from_raw_parts(src.add(at), len) };
-                if chunks.send((off + at as u64, data.to_vec())).is_err() {
+            for part in parts {
+                if chunks.send(part).is_err() {
                     return;
                 }
                 let _ = ready.write(1);
@@ -871,43 +880,66 @@ fn warm(
     }
 }
 
-/// The runs, as (byte offset, length), of the `len` bytes mapped at `addr` whose
-/// `page_size` pages are wholly in the page cache. `mincore` reports per host page,
-/// so a page counts only when every host page it overlaps is cached, whichever of
-/// the two is larger. Empty if residency can't be read: nothing is taken cached that
-/// isn't known to be.
-fn cached_runs(addr: *const u8, len: usize, page_size: usize) -> Vec<(usize, usize)> {
-    let host = crate::arch::host_page_size();
-    let mut vec = vec![0u8; len.div_ceil(host)];
-    // SAFETY: `addr` is a page-aligned address inside a file mapping covering `len`
-    // bytes, and `vec` has a byte for each host page of it.
-    if unsafe { libc::mincore(addr as *mut libc::c_void, len, vec.as_mut_ptr()) } != 0 {
-        return Vec::new();
-    }
-    let cached = |pg: usize| {
-        let (first, end) = (pg * page_size, ((pg + 1) * page_size).min(len));
-        vec[first / host..end.div_ceil(host)]
-            .iter()
-            .all(|b| b & 1 == 1)
+/// Whether `file` takes `RWF_NOWAIT` buffered reads: one page read at offset 0
+/// either returns data or says it isn't cached, rather than being refused.
+fn nowait_reads_supported(file: &std::fs::File, page_size: usize) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; page_size];
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: page_size,
     };
-    let pages = len.div_ceil(page_size);
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < pages {
-        if !cached(i) {
-            i += 1;
+    // SAFETY: `iov` describes `buf`, alive for the call.
+    let got = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, 0, libc::RWF_NOWAIT) };
+    got >= 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+}
+
+/// Reads the `len` bytes of `file` at `off` that are already in the page cache, as
+/// (offset, data) runs of whole `page_size` pages, with `RWF_NOWAIT`: the kernel
+/// returns only cached data and never waits on the disk, so there is no window for a
+/// page to be evicted between a residency check and the read. Each page it can't
+/// return whole is left to the guest's faults and counted in `cold`. A miss may still
+/// start the kernel's own readahead of a page the guest is about to fault anyway.
+fn cached_reads(
+    file: &std::fs::File,
+    off: u64,
+    len: usize,
+    page_size: usize,
+    cold: &AtomicU64,
+) -> Vec<(u64, Vec<u8>)> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; len];
+    let mut parts = Vec::new();
+    let mut at = 0;
+    while at < len {
+        let iov = libc::iovec {
+            iov_base: buf[at..].as_mut_ptr().cast(),
+            iov_len: len - at,
+        };
+        // SAFETY: `iov` describes the unread tail of `buf`, alive for the call.
+        let got = unsafe {
+            libc::preadv2(
+                file.as_raw_fd(),
+                &iov,
+                1,
+                (off + at as u64) as i64,
+                libc::RWF_NOWAIT,
+            )
+        };
+        let whole = if got > 0 {
+            got as usize / page_size * page_size
+        } else {
+            0
+        };
+        if whole == 0 {
+            cold.fetch_add(1, Ordering::Relaxed);
+            at += page_size;
             continue;
         }
-        let start = i;
-        while i < pages && cached(i) {
-            i += 1;
-        }
-        runs.push((
-            start * page_size,
-            ((i - start) * page_size).min(len - start * page_size),
-        ));
+        parts.push((off + at as u64, buf[at..at + whole].to_vec()));
+        at += whole;
     }
-    runs
+    parts
 }
 
 /// Copies one chunk of the overlay, `data` read from file offset `start`, into guest
@@ -1425,6 +1457,16 @@ struct Backing {
 }
 
 impl Backing {
+    /// The file holding the page at `file_offset`, chosen as [`Backing::src_ptr`] does.
+    fn src_file(&self, file_offset: u64) -> &std::fs::File {
+        match (&self.base, &self.present) {
+            (Some(base), Some(p)) if !p.is_set((file_offset / self.page_size as u64) as usize) => {
+                &base.file
+            }
+            _ => &self.overlay.file,
+        }
+    }
+
     /// Source pointer for the page at `file_offset`: the overlay if the page is
     /// present there (or there is no base), else the base. The two layers are the
     /// same logical size, so `file_offset` is in bounds for whichever is chosen.
@@ -3050,7 +3092,8 @@ mod tests {
     }
 
     /// A synced file of `npages` host pages with `cold` dropped from the page cache, or
-    /// None when this filesystem keeps them anyway (tmpfs), where the test can't run.
+    /// None when this filesystem keeps them anyway or refuses non-blocking reads
+    /// (tmpfs, overlayfs), where the test can't run.
     fn file_with_cold_pages(dir: &Path, npages: usize, cold: &[usize]) -> Option<PathBuf> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::FileExt;
@@ -3070,33 +3113,66 @@ mod tests {
                 )
             };
         }
+        if !nowait_reads_supported(&std::fs::File::open(&path).unwrap(), hp) {
+            return None;
+        }
         let map = mmap_snapshot(&path).unwrap();
-        let runs = cached_runs(map.addr, npages * hp, hp);
-        let resident: usize = runs.iter().map(|&(_, len)| len / hp).sum();
+        let mut vec = vec![0u8; npages];
+        // SAFETY: `map` covers `npages * hp` bytes and `vec` has a byte per page.
+        assert_eq!(
+            unsafe { libc::mincore(map.addr as *mut _, npages * hp, vec.as_mut_ptr()) },
+            0
+        );
+        let resident = vec.iter().filter(|b| *b & 1 == 1).count();
         (resident == npages - cold.len()).then_some(path)
     }
 
     #[test]
-    fn cached_runs_takes_a_larger_page_only_when_all_its_host_pages_are_cached() {
+    fn a_cached_only_warmer_does_not_start_where_reads_would_block() {
+        // tmpfs refuses RWF_NOWAIT buffered reads; skip where it is absent.
+        let Ok(dir) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let mem = dir.path().join("mem.snap");
+        std::fs::write(&mem, vec![1u8; 4096]).unwrap();
+        if nowait_reads_supported(&std::fs::File::open(&mem).unwrap(), 4096) {
+            return;
+        }
+        let mut copy = PresenceBitmap::with_pages(1);
+        copy.set(0);
+        let err = start_warmer(
+            &mem,
+            None,
+            Arc::new(copy),
+            1,
+            4096,
+            true,
+            Arc::default(),
+            Arc::new(Vec::new()),
+        )
+        .err()
+        .expect("a cache-only warmer must not start without non-blocking reads");
+        assert!(err.to_string().contains("non-blocking"), "{err}");
+    }
+
+    #[test]
+    fn cached_reads_return_whole_cached_pages_and_count_the_rest_cold() {
         let dir = tempfile::tempdir().unwrap();
-        // Eight host pages as four two-host-page pages; dropping host page 3 makes the
-        // second of those cold.
+        // Eight host pages read as four two-host-page pages; dropping host page 3 leaves
+        // the second of those partly cached, so it is left to faults whole.
         let Some(path) = file_with_cold_pages(dir.path(), 8, &[3]) else {
             eprintln!("skipping: this filesystem keeps dropped pages cached");
             return;
         };
-        let map = mmap_snapshot(&path).unwrap();
         let hp = crate::arch::host_page_size();
-        assert_eq!(
-            cached_runs(map.addr, 8 * hp, 2 * hp),
-            vec![(0, 2 * hp), (4 * hp, 4 * hp)]
-        );
-        // Pages smaller than a host page take its residency.
-        let small = hp / 2;
-        assert_eq!(
-            cached_runs(map.addr, 8 * hp, small),
-            vec![(0, 6 * small), (8 * small, 8 * small)]
-        );
+        let file = std::fs::File::open(&path).unwrap();
+        let cold = AtomicU64::new(0);
+        let parts: Vec<_> = cached_reads(&file, 0, 8 * hp, 2 * hp, &cold)
+            .into_iter()
+            .map(|(off, d)| (off as usize / hp, d.len() / hp, d.iter().all(|&b| b == 7)))
+            .collect();
+        assert_eq!(parts, vec![(0, 2, true), (4, 4, true)]);
+        assert_eq!(cold.load(Ordering::Relaxed), 1);
     }
 
     #[test]
