@@ -871,28 +871,40 @@ fn warm(
     }
 }
 
-/// The runs, as (byte offset, length), of the `len` bytes mapped at `addr` whose pages
-/// are in the page cache. Empty if residency can't be read: nothing is taken cached
-/// that isn't known to be.
+/// The runs, as (byte offset, length), of the `len` bytes mapped at `addr` whose
+/// `page_size` pages are wholly in the page cache. `mincore` reports per host page,
+/// so a larger (huge) page counts only when every host page in it is cached. Empty
+/// if residency can't be read: nothing is taken cached that isn't known to be.
 fn cached_runs(addr: *const u8, len: usize, page_size: usize) -> Vec<(usize, usize)> {
-    let mut vec = vec![0u8; len.div_ceil(page_size)];
+    let host = crate::arch::host_page_size();
+    let mut vec = vec![0u8; len.div_ceil(host)];
     // SAFETY: `addr` is a page-aligned address inside a file mapping covering `len`
-    // bytes, and `vec` has a byte for each of its pages.
+    // bytes, and `vec` has a byte for each host page of it.
     if unsafe { libc::mincore(addr as *mut libc::c_void, len, vec.as_mut_ptr()) } != 0 {
         return Vec::new();
     }
+    let per = (page_size / host).max(1);
+    let cached = |pg: usize| {
+        vec[pg * per..((pg + 1) * per).min(vec.len())]
+            .iter()
+            .all(|b| b & 1 == 1)
+    };
+    let pages = len.div_ceil(page_size);
     let mut runs = Vec::new();
     let mut i = 0;
-    while i < vec.len() {
-        if vec[i] & 1 == 0 {
+    while i < pages {
+        if !cached(i) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < vec.len() && vec[i] & 1 == 1 {
+        while i < pages && cached(i) {
             i += 1;
         }
-        runs.push((start * page_size, ((i - start) * page_size).min(len - start * page_size)));
+        runs.push((
+            start * page_size,
+            ((i - start) * page_size).min(len - start * page_size),
+        ));
     }
     runs
 }
@@ -3060,6 +3072,23 @@ mod tests {
         let runs = cached_runs(map.addr, npages * 4096, 4096);
         let resident: usize = runs.iter().map(|&(_, len)| len / 4096).sum();
         (resident == npages - cold.len()).then_some(path)
+    }
+
+    #[test]
+    fn cached_runs_takes_a_larger_page_only_when_all_its_host_pages_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        // Eight host pages as four two-host-page pages; dropping host page 3 makes the
+        // second of those cold.
+        let Some(path) = file_with_cold_pages(dir.path(), 8, &[3]) else {
+            eprintln!("skipping: this filesystem keeps dropped pages cached");
+            return;
+        };
+        let map = mmap_snapshot(&path).unwrap();
+        let ps = 4096;
+        assert_eq!(
+            cached_runs(map.addr, 8 * ps, 2 * ps),
+            vec![(0, 2 * ps), (4 * ps, 4 * ps)]
+        );
     }
 
     #[test]
