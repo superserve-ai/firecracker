@@ -64,6 +64,9 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// deny-unknown-fields rule.
 /// resident-prefetch: `CreateSnapshot` accepts `record_resident` and `LoadSnapshot`
 /// accepts `mem_backend.prefetch_resident`, likewise.
+/// resident-prefetch-cached: the `prefetch_resident` copy reads only memory-file
+/// pages already in the page cache and leaves cold ones to the guest's faults, so a
+/// supervisor need not hold it back under IO pressure.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",
@@ -74,6 +77,7 @@ const CAPABILITIES: &[&str] = &[
     "uffd-stats",
     "fault-around",
     "resident-prefetch",
+    "resident-prefetch-cached",
 ];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
