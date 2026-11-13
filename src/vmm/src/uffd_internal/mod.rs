@@ -156,6 +156,10 @@ pub struct Config {
     /// Serve each fault by copying the aligned block of this many KiB around it; 0 is
     /// off. See [`fault_around`].
     pub fault_around_kib: u32,
+    /// Copy the pages recorded resident at the snapshot (`<snapshot>.resident`) into
+    /// guest memory on a background thread, from whichever file holds each. Takes the
+    /// place of `eager_overlay` when the side-car is usable.
+    pub prefetch_resident: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -400,11 +404,24 @@ pub fn setup(
     // Recording suppresses pre-copy as it does prefetch: a pre-copied page never
     // faults, so the trace would miss it. An optimization only: if the warmer cannot
     // start, the guest still faults its pages in.
-    let (precopy, warmer) = match &present {
-        Some(p) if cfg.eager_overlay && cfg.record_to.is_none() => match start_warmer(
+    let npages = total_mem as usize / page_size;
+    let resident = match cfg.prefetch_resident && cfg.record_to.is_none() {
+        true => read_resident_sidecar(&cfg.snapshot_path, page_size, npages),
+        false => None,
+    };
+    let warm_plan = match (resident, &present) {
+        (Some(r), _) => Some((Arc::new(r), cfg.base_path.as_deref())),
+        (None, Some(p)) if cfg.eager_overlay && cfg.record_to.is_none() => {
+            Some((Arc::clone(p), None))
+        }
+        _ => None,
+    };
+    let (precopy, warmer) = match warm_plan {
+        Some((copy, base)) => match start_warmer(
             &cfg.snapshot_path,
-            Arc::clone(p),
-            total_mem as usize / page_size,
+            base.zip(present.clone()),
+            copy,
+            npages,
             page_size,
             Arc::clone(&vmm_filter),
         ) {
@@ -726,12 +743,24 @@ impl Precopy {
 #[allow(clippy::type_complexity)]
 fn start_warmer(
     overlay_path: &Path,
-    present: Arc<PresenceBitmap>,
+    base: Option<(&Path, Arc<PresenceBitmap>)>,
+    copy: Arc<PresenceBitmap>,
     npages: usize,
     page_size: usize,
     vmm_filter: Arc<BpfProgram>,
 ) -> std::io::Result<(Precopy, (Arc<AtomicBool>, thread::JoinHandle<()>))> {
-    let overlay = mmap_snapshot(overlay_path)?;
+    // Mapped here: the warmer's seccomp filter does not allow file-backed mmap.
+    let (base, present) = match base {
+        Some((path, present)) => (Some(mmap_snapshot(path)?), Some(present)),
+        None => (None, None),
+    };
+    let source = Backing {
+        overlay: mmap_snapshot(overlay_path)?,
+        base,
+        present,
+        page_size,
+        fault_around: 0,
+    };
     let ready = EventFd::new(EFD_NONBLOCK)?;
     let signal = ready.try_clone()?;
     let (tx, chunks) = mpsc::sync_channel(PRECOPY_LOOKAHEAD);
@@ -744,8 +773,8 @@ fn start_warmer(
                 log::error!("uffd-precopy: failed to apply seccomp filter: {e:?}");
                 return;
             }
-            let runs = present_runs(&present, page_size, npages);
-            warm(&overlay, &runs, &tx, &signal, &stop_for_thread);
+            let runs = present_runs(&copy, page_size, npages);
+            warm(&source, &runs, &tx, &signal, &stop_for_thread);
         })?;
     Ok((
         Precopy {
@@ -760,18 +789,24 @@ fn start_warmer(
     ))
 }
 
-/// Reads `runs` of the overlay into buffers of at most [`PRECOPY_CHUNK`] and hands
-/// each to the fault handler. The handler copies from the buffer, not the file, so
-/// its copies never wait on the disk even if the page cache is evicted meanwhile.
-/// Touches only the overlay mapping, never guest memory. Stops on `stop` or once the
+/// Reads `runs` of guest memory from `source` into buffers of at most
+/// [`PRECOPY_CHUNK`], each from the one file holding all its pages, and hands each
+/// to the fault handler. The handler copies from the buffer, not the file, so its
+/// copies never wait on the disk even if the page cache is evicted meanwhile.
+/// Touches only the file mappings, never guest memory. Stops on `stop` or once the
 /// handler drops its end of the queue.
 fn warm(
-    overlay: &SnapshotMmap,
+    source: &Backing,
     runs: &[(u64, usize)],
     chunks: &mpsc::SyncSender<(u64, Vec<u8>)>,
     ready: &EventFd,
     stop: &AtomicBool,
 ) {
+    let ps = source.page_size as u64;
+    let from_overlay = |off: u64| match (&source.base, &source.present) {
+        (Some(_), Some(p)) => p.is_set((off / ps) as usize),
+        _ => true,
+    };
     for &(start, len) in runs {
         let end = start + len as u64;
         let mut off = start;
@@ -779,10 +814,17 @@ fn warm(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            let n = (end - off).min(PRECOPY_CHUNK as u64) as usize;
-            // SAFETY: `off + n` is within a run, and setup validated the overlay covers
-            // all guest memory.
-            let data = unsafe { std::slice::from_raw_parts(overlay.addr.add(off as usize), n) };
+            let layer = from_overlay(off);
+            let limit = end.min(off + PRECOPY_CHUNK as u64);
+            let mut next = off + ps;
+            while next < limit && from_overlay(next) == layer {
+                next += ps;
+            }
+            let n = (next - off) as usize;
+            // SAFETY: `off + n` is within a run and every page in it comes from the
+            // file src_ptr picks for `off`; setup validated both files cover all guest
+            // memory.
+            let data = unsafe { std::slice::from_raw_parts(source.src_ptr(off), n) };
             if chunks.send((off, data.to_vec())).is_err() {
                 return;
             }
@@ -1173,6 +1215,42 @@ pub fn write_presence_bitmap(
         &presence_sidecar_path(mem_path),
         &PresenceBitmap::encode(bits, page_size, npages),
     )
+}
+
+/// Path of the resident-pages side-car for a given memory file path.
+pub fn resident_sidecar_path(mem_path: &Path) -> PathBuf {
+    let mut p = mem_path.as_os_str().to_owned();
+    p.push(".resident");
+    p.into()
+}
+
+/// Write `<mem_path>.resident`: the file pages guest memory held at the snapshot,
+/// in the presence side-car's format. A prefetch hint only, so it is not synced:
+/// a torn write fails its checksum and the restore simply does not prefetch.
+pub fn write_resident_bitmap(
+    mem_path: &Path,
+    page_size: usize,
+    npages: usize,
+    bits: &[u64],
+) -> std::io::Result<()> {
+    std::fs::write(
+        resident_sidecar_path(mem_path),
+        PresenceBitmap::encode(bits, page_size, npages),
+    )
+}
+
+/// `<snapshot>.resident` when it exists and describes this memory file; anything
+/// else means no resident prefetch, never a failed restore.
+fn read_resident_sidecar(
+    mem_path: &Path,
+    page_size: usize,
+    npages: usize,
+) -> Option<PresenceBitmap> {
+    let path = resident_sidecar_path(mem_path);
+    let bytes = std::fs::read(&path).ok()?;
+    PresenceBitmap::decode(&bytes, &path, page_size, npages)
+        .inspect_err(|e| log::warn!("uffd-precopy: ignoring resident side-car: {e}"))
+        .ok()
 }
 
 /// Load `<overlay>.presence` if it exists. `Ok(None)` ⇒ no side-car (a pre-side-car
@@ -1890,6 +1968,7 @@ pub fn config_from_paths(
     eager_overlay: bool,
     skip_zero_holes: bool,
     fault_around_kib: u32,
+    prefetch_resident: bool,
 ) -> Config {
     Config {
         snapshot_path: snapshot_path.to_path_buf(),
@@ -1900,6 +1979,7 @@ pub fn config_from_paths(
         eager_overlay,
         skip_zero_holes,
         fault_around_kib,
+        prefetch_resident,
     }
 }
 
@@ -2363,7 +2443,7 @@ mod tests {
     #[test]
     fn setup_rejects_an_invalid_fault_around() {
         for kib in [4, 12, 4096] {
-            let cfg = config_from_paths(Path::new("/nonexistent"), None, None, None, false, false, false, kib);
+            let cfg = config_from_paths(Path::new("/nonexistent"), None, None, None, false, false, false, kib, false);
             let err = setup(
                 cfg,
                 &GuestMemoryState::default(),
@@ -2763,7 +2843,7 @@ mod tests {
 
         let filter: Arc<BpfProgram> = Arc::new(Vec::new());
         let (precopy, (stop, warmer)) =
-            start_warmer(&ov_path, present, npages, ps, Arc::clone(&filter)).unwrap();
+            start_warmer(&ov_path, None, present, npages, ps, Arc::clone(&filter)).unwrap();
         // SAFETY: `uffd` is alive; the duplicate is owned only by the handler.
         let handler_uffd = unsafe { Uffd::from_raw_fd(libc::dup(uffd.as_raw_fd())) };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -2818,7 +2898,13 @@ mod tests {
         let ov_path = dir.path().join("mem.diff");
         let contents: Vec<u8> = (0..npages).flat_map(|pg| vec![(pg % 251) as u8; ps]).collect();
         std::fs::write(&ov_path, &contents).unwrap();
-        let overlay = mmap_snapshot(&ov_path).unwrap();
+        let overlay = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: None,
+            present: None,
+            page_size: ps,
+            fault_around: 0,
+        };
         let ready = EventFd::new(EFD_NONBLOCK).unwrap();
         let stop = AtomicBool::new(false);
 
@@ -2849,6 +2935,56 @@ mod tests {
         warm(&overlay, &runs, &tx, &ready, &stop);
         drop(tx);
         assert_eq!(rx.iter().count(), 0, "a stopped warmer hands over nothing");
+    }
+
+    #[test]
+    fn warm_reads_each_page_from_the_layer_holding_it() {
+        let ps = 4096usize;
+        let npages = 8usize;
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("mem.base");
+        std::fs::write(&base_path, vec![0xBBu8; npages * ps]).unwrap();
+        let ov_path = dir.path().join("mem.diff");
+        sparse_file(&ov_path, (npages * ps) as u64, &[(2 * ps as u64, 2 * ps, 0xAA)]);
+        let source = Backing {
+            overlay: mmap_snapshot(&ov_path).unwrap(),
+            base: Some(mmap_snapshot(&base_path).unwrap()),
+            present: Some(Arc::new(scan_present_pages(&ov_path, ps).unwrap())),
+            page_size: ps,
+            fault_around: 0,
+        };
+        let (tx, rx) = mpsc::sync_channel(8);
+        // One run across base, overlay and base again splits at each change of layer.
+        warm(&source, &[(ps as u64, 4 * ps)], &tx, &EventFd::new(EFD_NONBLOCK).unwrap(), &AtomicBool::new(false));
+        drop(tx);
+        let chunks: Vec<_> = rx.iter().map(|(s, d)| (s, d.len(), d[0], d.iter().all(|&b| b == d[0]))).collect();
+        assert_eq!(
+            chunks,
+            vec![
+                (ps as u64, ps, 0xBB, true),
+                ((2 * ps) as u64, 2 * ps, 0xAA, true),
+                ((4 * ps) as u64, ps, 0xBB, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_sidecar_round_trips_and_a_mismatch_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("mem.diff");
+        let bits = vec![0b1011u64, 1 << 63];
+        write_resident_bitmap(&mem, 4096, 128, &bits).unwrap();
+        assert_eq!(read_resident_sidecar(&mem, 4096, 128).unwrap().bits, bits);
+        assert!(
+            read_resident_sidecar(&mem, 4096, 64).is_none(),
+            "another size is ignored"
+        );
+        std::fs::write(resident_sidecar_path(&mem), b"torn").unwrap();
+        assert!(
+            read_resident_sidecar(&mem, 4096, 128).is_none(),
+            "a torn side-car is ignored"
+        );
+        assert!(read_resident_sidecar(&dir.path().join("none"), 4096, 128).is_none());
     }
 
     #[test]

@@ -343,6 +343,33 @@ impl Vm {
             });
     }
 
+    /// Bitmap over memory file pages of those resident in guest memory, plugged slots
+    /// only: what the guest had populated, found by `mincore` on the mappings. Also
+    /// returns the file's page count.
+    pub fn resident_pages(&self) -> Result<(Vec<u64>, usize), VmError> {
+        let page_size = host_page_size();
+        let total: usize = self
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.slots())
+            .map(|(slot, _)| slot.slice.len())
+            .sum();
+        let mut bits = vec![0u64; (total / page_size).div_ceil(64)];
+        let mut base = 0usize;
+        for (slot, plugged) in self.guest_memory().iter().flat_map(|region| region.slots()) {
+            let pages = slot.slice.len() / page_size;
+            if plugged {
+                let resident =
+                    mincore_bitmap(slot.slice.ptr_guard_mut().as_ptr(), slot.slice.len())?;
+                for page in (0..pages).filter(|p| resident[p / 64] >> (p % 64) & 1 == 1) {
+                    bits[(base + page) / 64] |= 1 << ((base + page) % 64);
+                }
+            }
+            base += pages;
+        }
+        Ok((bits, base))
+    }
+
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
         self.guest_memory()

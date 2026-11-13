@@ -1203,6 +1203,7 @@ mod tests {
                 flatten: false,
                 expected_session_id: None,
                 expected_generation: None,
+                record_resident: false,
             },
         )));
         #[cfg(target_arch = "x86_64")]
@@ -1316,6 +1317,7 @@ mod tests {
                     eager_overlay: false,
                     skip_zero_holes: false,
                     fault_around_kib: 0,
+                    prefetch_resident: false,
                     backend_path: PathBuf::new(),
                     access_log_path: None,
                     record_to: None,

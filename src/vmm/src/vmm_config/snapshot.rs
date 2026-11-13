@@ -73,6 +73,10 @@ pub struct CreateSnapshotParams {
     /// every snapshot attempt (any type consumes or resets the bitmap).
     #[serde(default)]
     pub expected_generation: Option<u64>,
+    /// Also write `<mem_file_path>.resident`, the memory file pages guest memory holds,
+    /// for a later restore to prefetch.
+    #[serde(default)]
+    pub record_resident: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
@@ -206,6 +210,12 @@ pub struct MemBackendConfig {
     /// Only meaningful for `UffdInternal` with 4 KiB guest pages; ignored otherwise.
     #[serde(default)]
     pub fault_around_kib: u32,
+    /// Copy the pages recorded resident at the snapshot (`<backend_path>.resident`,
+    /// written when it was taken with `record_resident`) into guest memory on a
+    /// background thread after load, ahead of the guest. Only meaningful for
+    /// `UffdInternal`; ignored otherwise or when the side-car is missing or stale.
+    #[serde(default)]
+    pub prefetch_resident: bool,
     /// If set, the internal UFFD handler will write each served page offset to this path
     /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
     /// otherwise. When present, prefetch is disabled so the captured trace reflects the

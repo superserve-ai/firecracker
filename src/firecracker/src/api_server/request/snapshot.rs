@@ -144,6 +144,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 base_path: None,
                 access_log_path: None,
                 record_to: None,
@@ -312,6 +313,7 @@ mod tests {
             flatten: false,
             expected_session_id: None,
             expected_generation: None,
+            record_resident: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -330,6 +332,7 @@ mod tests {
             flatten: false,
             expected_session_id: None,
             expected_generation: None,
+            record_resident: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -359,6 +362,7 @@ mod tests {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -399,6 +403,7 @@ mod tests {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -439,6 +444,7 @@ mod tests {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -485,6 +491,7 @@ mod tests {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -525,6 +532,7 @@ mod tests {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },

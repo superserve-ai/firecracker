@@ -290,6 +290,7 @@ mod tests {
                 flatten: false,
                 expected_session_id: None,
                 expected_generation: None,
+                record_resident: false,
             })),
             start_time_us,
         );
@@ -307,6 +308,7 @@ mod tests {
                 flatten: false,
                 expected_session_id: None,
                 expected_generation: None,
+                record_resident: false,
             })),
             start_time_us,
         );

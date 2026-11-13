@@ -328,6 +328,9 @@ pub fn create_snapshot(
             .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.clear_fresh());
     }
     let diff_dump = dumped?;
+    if params.record_resident {
+        record_resident(vmm, &params.mem_file_path, page_size);
+    }
 
     let md = std::fs::metadata(&params.mem_file_path)
         .map_err(|err| CreateSnapshotError::SnapshotBackingFile("presence_sidecar_stat", err))?;
@@ -456,6 +459,28 @@ fn and_plugged(mut bits: Vec<u64>, plugged: Option<&[u64]>) -> Vec<u64> {
 /// dump order) of the pages backing memory the guest has plugged. `None` when there
 /// is no virtio-mem device or none of its blocks is unplugged, so VMs without
 /// hotplug do no extra work.
+/// Writes the resident-pages side-car for a restore to prefetch. Best effort: a VM
+/// without it only restores without the prefetch.
+fn record_resident(vmm: &Vmm, mem_file_path: &Path, page_size: usize) {
+    let started = std::time::Instant::now();
+    let result = vmm
+        .vm
+        .resident_pages()
+        .map_err(|e| e.to_string())
+        .and_then(|(bits, npages)| {
+            crate::uffd_internal::write_resident_bitmap(mem_file_path, page_size, npages, &bits)
+                .map(|()| bits.iter().map(|w| w.count_ones()).sum::<u32>())
+                .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(n) => log::info!(
+            "recorded {n} resident pages in {} us",
+            started.elapsed().as_micros()
+        ),
+        Err(e) => log::warn!("resident pages not recorded: {e}"),
+    }
+}
+
 pub(crate) fn plugged_page_mask(state: &MicrovmState, page_size: usize) -> Option<Vec<u64>> {
     let devices = &state.device_states;
     let dev = match &devices.mmio_state.memory_device {
@@ -953,6 +978,7 @@ pub fn restore_from_snapshot(
                 params.mem_backend.eager_overlay,
                 params.mem_backend.skip_zero_holes,
                 params.mem_backend.fault_around_kib,
+                params.mem_backend.prefetch_resident,
                 mem_state,
                 plugged_page_mask(
                     &microvm_state,
@@ -1090,6 +1116,7 @@ fn guest_memory_from_uffd_internal(
     eager_overlay: bool,
     skip_zero_holes: bool,
     fault_around_kib: u32,
+    prefetch_resident: bool,
     mem_state: &GuestMemoryState,
     plugged: Option<Vec<u64>>,
     track_dirty_pages: bool,
@@ -1112,6 +1139,7 @@ fn guest_memory_from_uffd_internal(
         eager_overlay,
         skip_zero_holes,
         fault_around_kib,
+        prefetch_resident,
     );
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,

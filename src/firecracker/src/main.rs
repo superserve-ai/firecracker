@@ -62,6 +62,8 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// uffd-stats: `GET /uffd/stats` returns the internal UFFD handler's counters.
 /// fault-around: `LoadSnapshot` accepts `mem_backend.fault_around_kib`, under the
 /// deny-unknown-fields rule.
+/// resident-prefetch: `CreateSnapshot` accepts `record_resident` and `LoadSnapshot`
+/// accepts `mem_backend.prefetch_resident`, likewise.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",
@@ -71,6 +73,7 @@ const CAPABILITIES: &[&str] = &[
     "memory-hotplug",
     "uffd-stats",
     "fault-around",
+    "resident-prefetch",
 ];
 const MMDS_CONTENT_ARG: &str = "metadata";
 
