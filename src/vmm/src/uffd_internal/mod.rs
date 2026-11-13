@@ -873,8 +873,9 @@ fn warm(
 
 /// The runs, as (byte offset, length), of the `len` bytes mapped at `addr` whose
 /// `page_size` pages are wholly in the page cache. `mincore` reports per host page,
-/// so a larger (huge) page counts only when every host page in it is cached. Empty
-/// if residency can't be read: nothing is taken cached that isn't known to be.
+/// so a page counts only when every host page it overlaps is cached, whichever of
+/// the two is larger. Empty if residency can't be read: nothing is taken cached that
+/// isn't known to be.
 fn cached_runs(addr: *const u8, len: usize, page_size: usize) -> Vec<(usize, usize)> {
     let host = crate::arch::host_page_size();
     let mut vec = vec![0u8; len.div_ceil(host)];
@@ -883,9 +884,9 @@ fn cached_runs(addr: *const u8, len: usize, page_size: usize) -> Vec<(usize, usi
     if unsafe { libc::mincore(addr as *mut libc::c_void, len, vec.as_mut_ptr()) } != 0 {
         return Vec::new();
     }
-    let per = (page_size / host).max(1);
     let cached = |pg: usize| {
-        vec[pg * per..((pg + 1) * per).min(vec.len())]
+        let (first, end) = (pg * page_size, ((pg + 1) * page_size).min(len));
+        vec[first / host..end.div_ceil(host)]
             .iter()
             .all(|b| b & 1 == 1)
     };
@@ -3048,29 +3049,30 @@ mod tests {
         assert!(err.to_string().contains("shorter"), "{err}");
     }
 
-    /// A synced file of `npages` pages with `cold` dropped from the page cache, or None
-    /// when this filesystem keeps them anyway (tmpfs), where the test can't run.
+    /// A synced file of `npages` host pages with `cold` dropped from the page cache, or
+    /// None when this filesystem keeps them anyway (tmpfs), where the test can't run.
     fn file_with_cold_pages(dir: &Path, npages: usize, cold: &[usize]) -> Option<PathBuf> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::FileExt;
+        let hp = crate::arch::host_page_size();
         let path = dir.join("mem.snap");
         let f = std::fs::File::create(&path).unwrap();
-        f.write_all_at(&vec![7u8; npages * 4096], 0).unwrap();
+        f.write_all_at(&vec![7u8; npages * hp], 0).unwrap();
         f.sync_all().unwrap();
         for &pg in cold {
             // SAFETY: a valid fd and an in-file range.
             unsafe {
                 libc::posix_fadvise(
                     f.as_raw_fd(),
-                    (pg * 4096) as i64,
-                    4096,
+                    (pg * hp) as i64,
+                    hp as i64,
                     libc::POSIX_FADV_DONTNEED,
                 )
             };
         }
         let map = mmap_snapshot(&path).unwrap();
-        let runs = cached_runs(map.addr, npages * 4096, 4096);
-        let resident: usize = runs.iter().map(|&(_, len)| len / 4096).sum();
+        let runs = cached_runs(map.addr, npages * hp, hp);
+        let resident: usize = runs.iter().map(|&(_, len)| len / hp).sum();
         (resident == npages - cold.len()).then_some(path)
     }
 
@@ -3084,10 +3086,16 @@ mod tests {
             return;
         };
         let map = mmap_snapshot(&path).unwrap();
-        let ps = 4096;
+        let hp = crate::arch::host_page_size();
         assert_eq!(
-            cached_runs(map.addr, 8 * ps, 2 * ps),
-            vec![(0, 2 * ps), (4 * ps, 4 * ps)]
+            cached_runs(map.addr, 8 * hp, 2 * hp),
+            vec![(0, 2 * hp), (4 * hp, 4 * hp)]
+        );
+        // Pages smaller than a host page take its residency.
+        let small = hp / 2;
+        assert_eq!(
+            cached_runs(map.addr, 8 * hp, small),
+            vec![(0, 6 * small), (8 * small, 8 * small)]
         );
     }
 
@@ -3098,18 +3106,19 @@ mod tests {
             eprintln!("skipping: this filesystem keeps dropped pages cached");
             return;
         };
+        let hp = crate::arch::host_page_size();
         let source = Backing {
             overlay: mmap_snapshot(&path).unwrap(),
             base: None,
             present: None,
-            page_size: 4096,
+            page_size: hp,
             fault_around: 0,
         };
         let cold = AtomicU64::new(0);
         let (tx, rx) = mpsc::sync_channel(16);
         warm(
             &source,
-            &[(0, 8 * 4096)],
+            &[(0, 8 * hp)],
             &tx,
             &EventFd::new(EFD_NONBLOCK).unwrap(),
             &AtomicBool::new(false),
@@ -3118,7 +3127,7 @@ mod tests {
         drop(tx);
         let chunks: Vec<_> = rx
             .iter()
-            .map(|(off, d)| (off / 4096, d.len() / 4096))
+            .map(|(off, d)| (off / hp as u64, d.len() / hp))
             .collect();
         assert_eq!(chunks, vec![(0, 2), (4, 2), (7, 1)]);
         assert_eq!(cold.load(Ordering::Relaxed), 3);
