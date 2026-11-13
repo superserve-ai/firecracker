@@ -1962,6 +1962,11 @@ definitions:
         type: integer
         format: int64
         description: Pages fault-around placed beside the faulting ones.
+      precopy_cold_pages:
+        type: integer
+        format: int64
+        description: Pages a resident pre-copy left to the guest's faults because
+          their file pages were not in the page cache.
 
   MemoryHotplugStatus:
     type: object
