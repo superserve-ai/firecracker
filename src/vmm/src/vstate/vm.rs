@@ -361,9 +361,7 @@ impl Vm {
             if plugged {
                 let resident =
                     mincore_bitmap(slot.slice.ptr_guard_mut().as_ptr(), slot.slice.len())?;
-                for page in (0..pages).filter(|p| resident[p / 64] >> (p % 64) & 1 == 1) {
-                    bits[(base + page) / 64] |= 1 << ((base + page) % 64);
-                }
+                or_bits_at(&mut bits, base, &resident, pages);
             }
             base += pages;
         }
@@ -604,6 +602,22 @@ impl Vm {
     }
 }
 
+/// ORs the first `pages` bits of `src` into `dst` starting at bit `base`, a word at
+/// a time when `base` is word aligned (slots are, being whole MiB), else bit by bit.
+fn or_bits_at(dst: &mut [u64], base: usize, src: &[u64], pages: usize) {
+    if base % 64 == 0 {
+        for (i, w) in src.iter().enumerate().take(pages.div_ceil(64)) {
+            let keep = pages - i * 64;
+            let w = if keep < 64 { w & ((1u64 << keep) - 1) } else { *w };
+            dst[base / 64 + i] |= w;
+        }
+        return;
+    }
+    for page in (0..pages).filter(|p| src[p / 64] >> (p % 64) & 1 == 1) {
+        dst[(base + page) / 64] |= 1 << ((base + page) % 64);
+    }
+}
+
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
 fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
@@ -700,6 +714,20 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::GuestRegionMmap;
+
+    #[test]
+    fn or_bits_at_matches_bit_by_bit() {
+        let src = vec![u64::MAX, 0b1011];
+        for (base, pages) in [(0, 70), (64, 66), (3, 70), (128, 64)] {
+            let mut fast = vec![0u64; 4];
+            or_bits_at(&mut fast, base, &src, pages);
+            let mut slow = vec![0u64; 4];
+            for p in (0..pages).filter(|p| src[p / 64] >> (p % 64) & 1 == 1) {
+                slow[(base + p) / 64] |= 1 << ((base + p) % 64);
+            }
+            assert_eq!(fast, slow, "base {base}, pages {pages}");
+        }
+    }
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> (Kvm, Vm) {
