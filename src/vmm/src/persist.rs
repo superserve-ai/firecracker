@@ -320,7 +320,7 @@ pub fn create_snapshot(
     crate::uffd_internal::clear_resident_sidecar(&params.mem_file_path);
     let resident = params.record_resident.then(|| {
         let started = std::time::Instant::now();
-        (vmm.vm.resident_pages(), started)
+        (vmm.vm.resident_pages(), started.elapsed())
     });
     let dumped =
         vmm.vm
@@ -336,8 +336,8 @@ pub fn create_snapshot(
             .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.clear_fresh());
     }
     let diff_dump = dumped?;
-    if let Some((pages, started)) = resident {
-        record_resident(pages, started, &params.mem_file_path, page_size);
+    if let Some((pages, scan)) = resident {
+        record_resident(pages, scan, &params.mem_file_path, page_size);
     }
 
     let md = std::fs::metadata(&params.mem_file_path)
@@ -463,18 +463,16 @@ fn and_plugged(mut bits: Vec<u64>, plugged: Option<&[u64]>) -> Vec<u64> {
     bits
 }
 
-/// Bitmap over the memory file's `page_size` pages (all regions back to back, in
-/// dump order) of the pages backing memory the guest has plugged. `None` when there
-/// is no virtio-mem device or none of its blocks is unplugged, so VMs without
-/// hotplug do no extra work.
 /// Writes the resident-pages side-car for a restore to prefetch. Best effort: a VM
-/// without it only restores without the prefetch.
+/// without it only restores without the prefetch. `scan` is the residency read
+/// alone; the dump between it and this write is timed by the snapshot itself.
 fn record_resident(
     pages: Result<(Vec<u64>, usize), VmError>,
-    started: std::time::Instant,
+    scan: std::time::Duration,
     mem_file_path: &Path,
     page_size: usize,
 ) {
+    let started = std::time::Instant::now();
     let result = pages.map_err(|e| e.to_string()).and_then(|(bits, npages)| {
         crate::uffd_internal::write_resident_bitmap(mem_file_path, page_size, npages, &bits)
             .map(|()| bits.iter().map(|w| w.count_ones()).sum::<u32>())
@@ -482,13 +480,18 @@ fn record_resident(
     });
     match result {
         Ok(n) => log::info!(
-            "recorded {n} resident pages in {} us",
+            "recorded {n} resident pages: scan {} us, write {} us",
+            scan.as_micros(),
             started.elapsed().as_micros()
         ),
         Err(e) => log::warn!("resident pages not recorded: {e}"),
     }
 }
 
+/// Bitmap over the memory file's `page_size` pages (all regions back to back, in
+/// dump order) of the pages backing memory the guest has plugged. `None` when there
+/// is no virtio-mem device or none of its blocks is unplugged, so VMs without
+/// hotplug do no extra work.
 pub(crate) fn plugged_page_mask(state: &MicrovmState, page_size: usize) -> Option<Vec<u64>> {
     let devices = &state.device_states;
     let dev = match &devices.mmio_state.memory_device {
