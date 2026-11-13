@@ -198,6 +198,50 @@ fn test_disallow_dump_cpu_config_without_pausing() {
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
+#[test]
+fn test_create_snapshot_records_resident_pages() {
+    let snapshot_file = TempFile::new().unwrap();
+    let memory_file = TempFile::new().unwrap();
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    thread::sleep(Duration::from_millis(200));
+    controller.handle_request(VmmAction::Pause).unwrap();
+    let mut snapshot = |record_resident| {
+        controller
+            .handle_request(VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: memory_file.as_path().to_path_buf(),
+                block_delta_dir: None,
+                flatten: false,
+                expected_session_id: None,
+                expected_generation: None,
+                record_resident,
+            }))
+            .unwrap();
+    };
+    let side = vmm::uffd_internal::resident_sidecar_path(memory_file.as_path());
+
+    // Header (magic, page size, page count), bitmap words, CRC: some of the guest's
+    // pages are resident after boot, not all, as the Full dump reads every page only
+    // after residency is taken.
+    snapshot(true);
+    let bytes = std::fs::read(&side).unwrap();
+    let npages = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+    let mem_pages = memory_file.as_file().metadata().unwrap().len() as usize / 4096;
+    assert_eq!(npages, mem_pages);
+    let resident: u32 = bytes[24..bytes.len() - 8]
+        .chunks_exact(8)
+        .map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones())
+        .sum();
+    assert!(resident > 0 && (resident as usize) < npages, "{resident} of {npages}");
+
+    // A later save to the same file without recording leaves no hint behind.
+    snapshot(false);
+    assert_eq!(std::fs::metadata(&side).unwrap().len(), 0);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
 fn verify_create_snapshot(
     is_diff: bool,
     pci_enabled: bool,
@@ -236,6 +280,7 @@ fn verify_create_snapshot(
         flatten: false,
         expected_session_id: None,
         expected_generation: None,
+        record_resident: false,
     };
 
     controller
@@ -303,6 +348,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -411,6 +457,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
         flatten: true,
         expected_session_id: None,
         expected_generation: None,
+        record_resident: false,
     };
     controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -458,6 +505,7 @@ fn test_create_snapshot_flatten_wires_through_overlay_drive() {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -525,6 +573,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
             flatten: true,
             expected_session_id: None,
             expected_generation: None,
+            record_resident: false,
         }))
         .expect("flatten snapshot");
 
@@ -573,6 +622,7 @@ fn test_create_snapshot_flatten_bakes_dirty_content_into_base() {
                 eager_overlay: false,
                 skip_zero_holes: false,
                 fault_around_kib: 0,
+                prefetch_resident: false,
                 access_log_path: None,
                 record_to: None,
             },
@@ -618,6 +668,7 @@ fn flatten_snapshot_expect_overlay_err(
             flatten: true,
             expected_session_id: None,
             expected_generation: None,
+            record_resident: false,
         }))
         .expect_err("expected overlay error from flatten");
     match err {
@@ -783,6 +834,7 @@ fn test_flatten_skips_non_overlay_device() {
             flatten: true,
             expected_session_id: None,
             expected_generation: None,
+            record_resident: false,
         }))
         .expect("flatten must succeed even with a non-overlay drive in the mix");
 
@@ -815,6 +867,7 @@ fn test_create_snapshot_flatten_requires_delta_dir() {
         flatten: true,
         expected_session_id: None,
         expected_generation: None,
+        record_resident: false,
     };
     let err = controller
         .handle_request(VmmAction::CreateSnapshot(params))
@@ -881,6 +934,7 @@ fn test_guarded_snapshot_session_lifecycle() {
                     eager_overlay: false,
                     skip_zero_holes: false,
                     fault_around_kib: 0,
+                    prefetch_resident: false,
                     access_log_path: None,
                     record_to: None,
                 },
@@ -906,6 +960,7 @@ fn test_guarded_snapshot_session_lifecycle() {
             flatten: false,
             expected_session_id: expected_session_id.map(String::from),
             expected_generation,
+            record_resident: false,
         })
     };
     fn assert_mismatch(res: Result<VmmData, VmmActionError>) {
@@ -995,6 +1050,7 @@ fn test_guarded_snapshot_session_lifecycle() {
             flatten: false,
             expected_session_id: None,
             expected_generation: None,
+            record_resident: false,
         }))
         .unwrap();
     assert_mismatch(controller.handle_request(diff_request(
@@ -1098,6 +1154,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
             eager_overlay: false,
             skip_zero_holes: false,
             fault_around_kib: 0,
+            prefetch_resident: false,
             access_log_path: None,
             record_to: None,
         },
