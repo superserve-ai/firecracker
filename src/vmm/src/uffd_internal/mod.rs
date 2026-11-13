@@ -761,6 +761,16 @@ fn start_warmer(
         page_size,
         fault_around: 0,
     };
+    // Runs come from a bitmap sized to guest memory, not to these files, and setup
+    // checks file sizes only for a layered restore: a shorter file would be read past
+    // its end.
+    let need = npages * page_size;
+    let short = |m: &SnapshotMmap| m.size < need;
+    if short(&source.overlay) || source.base.as_ref().is_some_and(short) {
+        return Err(std::io::Error::other(format!(
+            "memory file shorter than the {need} bytes of guest memory"
+        )));
+    }
     let ready = EventFd::new(EFD_NONBLOCK)?;
     let signal = ready.try_clone()?;
     let (tx, chunks) = mpsc::sync_channel(PRECOPY_LOOKAHEAD);
@@ -2957,6 +2967,20 @@ mod tests {
         warm(&overlay, &runs, &tx, &ready, &stop);
         drop(tx);
         assert_eq!(rx.iter().count(), 0, "a stopped warmer hands over nothing");
+    }
+
+    #[test]
+    fn warmer_refuses_a_memory_file_shorter_than_guest_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("mem.snap");
+        std::fs::write(&mem, vec![1u8; 4096]).unwrap();
+        let mut copy = PresenceBitmap::with_pages(2);
+        copy.set(0);
+        copy.set(1);
+        let err = start_warmer(&mem, None, Arc::new(copy), 2, 4096, Arc::new(Vec::new()))
+            .err()
+            .expect("a two-page warm over a one-page file must not start");
+        assert!(err.to_string().contains("shorter"), "{err}");
     }
 
     #[test]
