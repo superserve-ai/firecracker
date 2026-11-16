@@ -216,6 +216,10 @@ pub struct MemBackendConfig {
     /// `UffdInternal`; ignored otherwise or when the side-car is missing or stale.
     #[serde(default)]
     pub prefetch_resident: bool,
+    /// Advise the host to back guest memory with transparent huge pages. Only memory
+    /// the handler never serves benefits. Only meaningful for `UffdInternal`.
+    #[serde(default)]
+    pub transparent_huge_pages: bool,
     /// If set, the internal UFFD handler will write each served page offset to this path
     /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
     /// otherwise. When present, prefetch is disabled so the captured trace reflects the

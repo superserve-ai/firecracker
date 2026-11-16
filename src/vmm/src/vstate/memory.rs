@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
@@ -609,6 +609,28 @@ pub fn create(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// Asks the host to back anonymous guest memory with transparent huge pages, so a first
+/// touch of memory no handler serves takes one host fault per 2 MiB instead of 512.
+/// Advisory: a refusal or an unaligned region only costs the speedup, never the VM.
+pub fn advise_transparent_huge_pages(regions: &[GuestRegionMmap]) {
+    const HUGE_PAGE: usize = 2 << 20;
+    for region in regions {
+        let addr = region.as_ptr();
+        if !(addr as usize).is_multiple_of(HUGE_PAGE) {
+            warn!(
+                "guest memory at {addr:p} is not 2 MiB aligned; huge pages cover only its aligned part"
+            );
+        }
+        // SAFETY: the range is exactly this region's live mapping.
+        if unsafe { libc::madvise(addr.cast(), region.size(), libc::MADV_HUGEPAGE) } < 0 {
+            warn!(
+                "madvise(MADV_HUGEPAGE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 /// Creates a GuestMemoryMmap with `size` in MiB backed by a memfd.
 pub fn memfd_backed(
     regions: &[(GuestAddress, usize)],
@@ -969,6 +991,27 @@ mod tests {
     use crate::test_utils::single_region_mem;
     use crate::utils::{get_page_size, mib_to_bytes};
     use crate::vstate::memory::test_utils::into_region_ext;
+
+    #[test]
+    fn test_advise_transparent_huge_pages_marks_guest_memory() {
+        let regions = anonymous(
+            std::iter::once((GuestAddress(0), mib_to_bytes(4))),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        advise_transparent_huge_pages(&regions);
+        // smaps lists VM_HUGEPAGE as the `hg` VmFlag of the advised mapping.
+        let start = format!("{:x}-", regions[0].as_ptr() as usize);
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let entry = smaps
+            .split_inclusive("VmFlags:")
+            .zip(smaps.split("VmFlags:").skip(1))
+            .find(|(head, _)| head.lines().any(|l| l.starts_with(&start)))
+            .map(|(_, flags)| flags.lines().next().unwrap_or_default())
+            .expect("advised region not in smaps");
+        assert!(entry.split_whitespace().any(|f| f == "hg"), "VmFlags: {entry}");
+    }
 
     #[test]
     fn test_anonymous() {

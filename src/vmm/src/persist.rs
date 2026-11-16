@@ -935,6 +935,7 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(microvm_state.vm_info.huge_pages),
+            transparent_huge_pages: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -990,6 +991,7 @@ pub fn restore_from_snapshot(
                 params.mem_backend.skip_zero_holes,
                 params.mem_backend.fault_around_kib,
                 params.mem_backend.prefetch_resident,
+                params.mem_backend.transparent_huge_pages,
                 mem_state,
                 plugged_page_mask(
                     &microvm_state,
@@ -1128,6 +1130,7 @@ fn guest_memory_from_uffd_internal(
     skip_zero_holes: bool,
     fault_around_kib: u32,
     prefetch_resident: bool,
+    transparent_huge_pages: bool,
     mem_state: &GuestMemoryState,
     plugged: Option<Vec<u64>>,
     track_dirty_pages: bool,
@@ -1141,7 +1144,7 @@ fn guest_memory_from_uffd_internal(
     ),
     GuestMemoryFromUffdError,
 > {
-    let cfg = crate::uffd_internal::config_from_paths(
+    let mut cfg = crate::uffd_internal::config_from_paths(
         snapshot_path,
         base_path,
         access_log_path,
@@ -1152,6 +1155,7 @@ fn guest_memory_from_uffd_internal(
         fault_around_kib,
         prefetch_resident,
     );
+    cfg.transparent_huge_pages = transparent_huge_pages;
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
         mem_state,

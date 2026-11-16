@@ -165,6 +165,9 @@ pub struct Config {
     /// guest memory on a background thread, from whichever file holds each. Takes the
     /// place of `eager_overlay` when the side-car is usable.
     pub prefetch_resident: bool,
+    /// Advise transparent huge pages on guest memory. Only memory the handler never
+    /// serves (zero holes, unplugged blocks) can get them: UFFDIO_COPY installs 4 KiB.
+    pub transparent_huge_pages: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -272,6 +275,9 @@ pub fn setup(
         return Err(InternalUffdError::FaultAroundInvalid(kib));
     }
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    if cfg.transparent_huge_pages && !huge_pages.is_hugetlbfs() {
+        memory::advise_transparent_huge_pages(&guest_memory);
+    }
     let page_size = huge_pages.page_size();
     let abort_on_handler_death = cfg.abort_on_handler_death;
 
@@ -2113,6 +2119,7 @@ pub fn config_from_paths(
         skip_zero_holes,
         fault_around_kib,
         prefetch_resident,
+        transparent_huge_pages: false,
     }
 }
 
