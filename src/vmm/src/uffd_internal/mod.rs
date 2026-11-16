@@ -49,12 +49,12 @@ const PRECOPY_LOOKAHEAD: usize = 4;
 const SKIP_ZERO_BLOCK: u64 = 2 << 20;
 
 /// Most ranges registered when zero holes are skipped. Each one splits the guest
-/// mapping, so past this the restore registers whole regions as before.
+/// mapping and costs a register call on the restore path, so past this the smallest
+/// holes are registered too and the largest stay with the kernel.
 const SKIP_ZERO_MAX_RANGES: usize = 256;
 
-/// Most data extents scanned for zero holes: two seeks each on the restore path. A
-/// template built with block-aligned holes has a handful; past this the restore
-/// registers whole regions.
+/// Most data extents scanned for zero holes: two seeks each on the restore path.
+/// Past this the rest of the file is treated as data, keeping the holes found so far.
 const SKIP_ZERO_MAX_EXTENTS: usize = 64;
 
 /// Atomic counters maintained by the handler thread. Read via [`Handler::stats`] for
@@ -545,8 +545,9 @@ pub fn setup(
 /// File-offset ranges, sorted and disjoint, whose restored contents may be non-zero:
 /// every [`SKIP_ZERO_BLOCK`] holding a page the overlay provides or data in
 /// `mapped`, the file that backs every other page. A page outside them is absent
-/// from the overlay and a hole in `mapped`, so it reads as zero. None when the
-/// file is too fragmented or short to tell, or the ranges would exceed the cap.
+/// from the overlay and a hole in `mapped`, so it reads as zero. A fragmented file
+/// keeps its largest holes within the scan and range caps, so the restore's cost
+/// stays bounded. None when the file is shorter than guest memory.
 fn nonzero_ranges(
     mapped: &SnapshotMmap,
     total_mem: u64,
@@ -572,16 +573,19 @@ fn nonzero_ranges(
         }
     }
     let mut extents = 0;
-    let scan = crate::utils::sparse::try_for_each_data_extent(file, total_mem, |s, e| {
+    let mut unscanned = None;
+    // A break is the scan bound, recorded in `unscanned` below.
+    let _ = crate::utils::sparse::try_for_each_data_extent(file, total_mem, |s, e| {
         extents += 1;
         if extents > SKIP_ZERO_MAX_EXTENTS {
+            unscanned = Some(s);
             return ControlFlow::Break(());
         }
         mark(s, e);
         ControlFlow::Continue(())
     })?;
-    if scan.is_break() {
-        return Ok(None);
+    if let Some(s) = unscanned {
+        mark(s, total_mem);
     }
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for (b, _) in blocks.iter().enumerate().filter(|(_, on)| **on) {
@@ -593,12 +597,43 @@ fn nonzero_ranges(
                 continue;
             }
         }
-        if ranges.len() == SKIP_ZERO_MAX_RANGES {
-            return Ok(None);
-        }
         ranges.push((start, end));
     }
+    fill_smallest_holes(&mut ranges, SKIP_ZERO_MAX_RANGES);
     Ok(Some(ranges))
+}
+
+/// Merges `ranges` (sorted, disjoint) across their smallest gaps until at most `max`
+/// remain, so the largest holes stay unregistered.
+fn fill_smallest_holes(ranges: &mut Vec<(u64, u64)>, max: usize) {
+    if ranges.len() <= max || max == 0 {
+        return;
+    }
+    let mut gaps: Vec<(u64, usize)> = ranges
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| (w[1].0 - w[0].1, i))
+        .collect();
+    // Largest gaps first; ties keep the lower offset, so the result is deterministic.
+    let keep_n = max - 1;
+    let by_size_desc = |a: &(u64, usize), b: &(u64, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+    if keep_n > 0 {
+        gaps.select_nth_unstable_by(keep_n - 1, by_size_desc);
+    }
+    let mut keep = vec![false; ranges.len() - 1];
+    for &(_, i) in &gaps[..keep_n] {
+        keep[i] = true;
+    }
+    let mut merged = Vec::with_capacity(max);
+    merged.push(ranges[0]);
+    for (i, &r) in ranges[1..].iter().enumerate() {
+        if keep[i] {
+            merged.push(r);
+        } else if let Some(last) = merged.last_mut() {
+            last.1 = r.1;
+        }
+    }
+    *ranges = merged;
 }
 
 /// Registers the parts of each region inside `ranges` (file offsets), or every
@@ -2694,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_ranges_falls_back_to_whole_registration_past_its_caps() {
+    fn nonzero_ranges_keep_their_largest_holes_past_the_caps() {
         let ps = 4096u64;
         let block = SKIP_ZERO_BLOCK;
         let dir = tempfile::tempdir().unwrap();
@@ -2702,25 +2737,54 @@ mod tests {
             nonzero_ranges(&mmap_snapshot(path).unwrap(), total, None, ps as usize)
         };
 
-        // One data page in every other block needs more ranges than the cap.
-        let blocks = 2 * SKIP_ZERO_MAX_RANGES as u64 + 2;
+        // Overlay pages in every other block need more ranges than the cap, and one
+        // gap is wider than the rest: the cap is kept and the widest hole survives.
+        let blocks = 2 * (SKIP_ZERO_MAX_RANGES as u64 + 10);
+        let wide = 10;
         let spread = dir.path().join("spread");
-        let data: Vec<_> = (0..blocks).step_by(2).map(|b| (b * block, ps as usize, 1u8)).collect();
-        sparse_file(&spread, blocks * block, &data);
-        assert_eq!(ranges(&spread, blocks * block).unwrap(), None);
+        sparse_file(&spread, blocks * block, &[]);
+        let pages = (blocks * block / ps) as usize;
+        let mut present = PresenceBitmap { bits: vec![0; pages.div_ceil(64)] };
+        for b in (0..blocks).step_by(2).filter(|b| !(wide..wide + 6).contains(b)) {
+            let page = (b * block / ps) as usize;
+            present.bits[page / 64] |= 1 << (page % 64);
+        }
+        let r = nonzero_ranges(&mmap_snapshot(&spread).unwrap(), blocks * block, Some(&present), ps as usize)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.len(), SKIP_ZERO_MAX_RANGES);
+        assert!(
+            r.windows(2).any(|w| w[1].0 - w[0].1 >= 7 * block),
+            "the widest hole stays unregistered"
+        );
+        assert!(r.windows(2).all(|w| w[0].1 < w[1].0), "ranges stay sorted and disjoint");
 
-        // More extents than the scan bound, all inside a single block.
-        let extents = SKIP_ZERO_MAX_EXTENTS as u64 + 1;
+        // More extents than the scan bound: blocks before the bound keep their holes,
+        // everything from the first unscanned extent on is treated as data.
+        let extents = SKIP_ZERO_MAX_EXTENTS as u64 + 4;
         let frag = dir.path().join("frag");
-        let len = (2 * extents * ps).div_ceil(block) * block;
-        let data: Vec<_> = (0..extents).map(|i| (2 * i * ps, ps as usize, 1u8)).collect();
+        let len = 2 * extents * block;
+        let data: Vec<_> = (0..extents).map(|i| (2 * i * block, ps as usize, 1u8)).collect();
         sparse_file(&frag, len, &data);
-        assert_eq!(ranges(&frag, len).unwrap(), None);
+        let r = ranges(&frag, len).unwrap().unwrap();
+        let tail_start = 2 * SKIP_ZERO_MAX_EXTENTS as u64 * block;
+        assert_eq!(r.last(), Some(&(tail_start, len)), "the unscanned tail is registered");
+        assert_eq!(r.len(), SKIP_ZERO_MAX_EXTENTS + 1, "scanned holes are kept");
 
         // A file shorter than guest memory cannot vouch for the pages past its end.
         let short = dir.path().join("short");
         sparse_file(&short, block, &[]);
         assert_eq!(ranges(&short, 2 * block).unwrap(), None);
+    }
+
+    #[test]
+    fn fill_smallest_holes_keeps_the_widest_gaps() {
+        let mut r = vec![(0, 10), (12, 20), (40, 50), (51, 60), (100, 110)];
+        fill_smallest_holes(&mut r, 3);
+        assert_eq!(r, vec![(0, 20), (40, 60), (100, 110)]);
+        let mut one = vec![(0, 1), (5, 6)];
+        fill_smallest_holes(&mut one, 1);
+        assert_eq!(one, vec![(0, 6)]);
     }
 
     #[test]
