@@ -106,7 +106,9 @@ jobs:
 
   test:
     name: Unit tests
-    runs-on: ubuntu-latest
+    # Pinned: the tests drive /dev/kvm on the runner's own kernel, and the
+    # 26.04 image's KVM rejects test_setup_sregs' special registers (EINVAL).
+    runs-on: ubuntu-24.04
     # Not containerised, unlike the build: these tests need /dev/kvm and
     # /dev/net/tun, which the runner host has but a container is not given.
     # The glibc ceiling is a property of the shipped binary, not of the tests.
