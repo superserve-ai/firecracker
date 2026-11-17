@@ -115,7 +115,8 @@ pub struct MachineConfig {
     pub huge_pages: HugePageConfig,
     /// Advise the host to back anonymous guest memory with transparent huge pages.
     /// The guest page size stays 4 KiB, so snapshots are unaffected; not persisted in them.
-    #[serde(default)]
+    /// Omitted from responses while off, so existing clients see unchanged output.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transparent_huge_pages: bool,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
