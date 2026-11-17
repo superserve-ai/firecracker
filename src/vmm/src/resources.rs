@@ -492,11 +492,17 @@ impl VmResources {
                 self.machine_config.huge_pages,
             )
         } else {
-            memory::anonymous(
+            let regions = memory::anonymous(
                 regions.iter().copied(),
                 self.machine_config.track_dirty_pages,
                 self.machine_config.huge_pages,
-            )
+            )?;
+            if self.machine_config.transparent_huge_pages
+                && !self.machine_config.huge_pages.is_hugetlbfs()
+            {
+                memory::advise_transparent_huge_pages(&regions);
+            }
+            Ok(regions)
         }
     }
 
@@ -1412,6 +1418,7 @@ mod tests {
             cpu_template: Some(StaticCpuTemplate::V1N1),
             track_dirty_pages: Some(false),
             huge_pages: Some(HugePageConfig::None),
+            transparent_huge_pages: Some(false),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };

@@ -123,6 +123,7 @@ mod tests {
                 cpu_template: None,
                 track_dirty_pages: Some(false),
                 huge_pages: Some(expected),
+                transparent_huge_pages: Some(false),
                 #[cfg(feature = "gdb")]
                 gdb_socket_path: None,
             };
@@ -144,6 +145,7 @@ mod tests {
             cpu_template: Some(StaticCpuTemplate::None),
             track_dirty_pages: Some(false),
             huge_pages: Some(HugePageConfig::None),
+            transparent_huge_pages: Some(false),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };
@@ -165,6 +167,7 @@ mod tests {
             cpu_template: None,
             track_dirty_pages: Some(true),
             huge_pages: Some(HugePageConfig::None),
+            transparent_huge_pages: Some(false),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };
@@ -190,6 +193,7 @@ mod tests {
                 cpu_template: Some(StaticCpuTemplate::T2),
                 track_dirty_pages: Some(true),
                 huge_pages: Some(HugePageConfig::None),
+                transparent_huge_pages: Some(false),
                 #[cfg(feature = "gdb")]
                 gdb_socket_path: None,
             };
@@ -217,6 +221,7 @@ mod tests {
             cpu_template: None,
             track_dirty_pages: Some(true),
             huge_pages: Some(HugePageConfig::None),
+            transparent_huge_pages: Some(false),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };
@@ -317,5 +322,20 @@ mod tests {
             .unwrap()
             .into_parts();
         assert!(parsing_info.take_deprecation_message().is_none());
+    }
+
+    #[test]
+    fn test_parse_put_machine_config_transparent_huge_pages() {
+        let body = r#"{
+            "vcpu_count": 2,
+            "mem_size_mib": 1024,
+            "transparent_huge_pages": true
+        }"#;
+        let VmmAction::UpdateMachineConfiguration(config) =
+            vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap())
+        else {
+            panic!("expected a machine config update");
+        };
+        assert_eq!(config.transparent_huge_pages, Some(true));
     }
 }

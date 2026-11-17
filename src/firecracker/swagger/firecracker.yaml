@@ -1451,6 +1451,13 @@ definitions:
           - None
           - 2M
         description: Which huge pages configuration (if any) should be used to back guest memory.
+      transparent_huge_pages:
+        type: boolean
+        default: false
+        description: When true, anonymous guest memory is advised for transparent huge
+          pages, so a first touch takes one host fault per 2 MiB. The guest page size is
+          unchanged and the setting is not saved in snapshots. Support is advertised by
+          the transparent-huge-pages capability in `firecracker --version`.
 
   MemoryBackend:
     type: object
@@ -1518,6 +1525,14 @@ definitions:
           guest. Only meaningful when backend_type is UffdInternal; ignored otherwise
           or when the side-car is missing or does not match. Support is advertised by
           the resident-prefetch capability in `firecracker --version`.
+      transparent_huge_pages:
+        type: boolean
+        default: false
+        description: When true, guest memory is advised for transparent huge pages.
+          Only memory the UFFD handler never serves (zero holes, unplugged blocks)
+          benefits. Only meaningful when backend_type is UffdInternal; ignored
+          otherwise. Support is advertised by the transparent-huge-pages capability in
+          `firecracker --version`.
       record_to:
         type: string
         description: Optional path the in-process UFFD handler writes each served

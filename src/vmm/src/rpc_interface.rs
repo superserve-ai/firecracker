@@ -1318,6 +1318,7 @@ mod tests {
                     skip_zero_holes: false,
                     fault_around_kib: 0,
                     prefetch_resident: false,
+                    transparent_huge_pages: false,
                     backend_path: PathBuf::new(),
                     access_log_path: None,
                     record_to: None,
