@@ -298,7 +298,8 @@ impl Vm {
     }
 
     /// Register a list of new memory regions to this [`Vm`]. `hole_slots` are memory file
-    /// ranges holding no snapshot data, for [`Self::split_hole_slots`].
+    /// ranges holding no snapshot data, for [`Self::split_hole_slots`], which leaves
+    /// `reserved_slots` KVM slots free for devices restored afterwards.
     ///
     /// Note: regions and state.regions need to be in the same order.
     pub fn restore_memory_regions(
@@ -306,6 +307,7 @@ impl Vm {
         regions: Vec<GuestRegionMmap>,
         state: &GuestMemoryState,
         hole_slots: &[(u64, u64)],
+        reserved_slots: u32,
     ) -> Result<(), VmError> {
         let mut exts = Vec::with_capacity(state.regions.len());
         for (region, state) in regions.into_iter().zip(state.regions.iter()) {
@@ -322,7 +324,7 @@ impl Vm {
             exts.push(GuestRegionMmapExt::from_state(region, state, next_slot)?);
         }
         if !hole_slots.is_empty() {
-            self.split_hole_slots(&mut exts, unlogged_ranges(state, hole_slots));
+            self.split_hole_slots(&mut exts, unlogged_ranges(state, hole_slots), reserved_slots);
         }
         for ext in exts {
             self.register_memory_region(Arc::new(ext))?;
@@ -339,6 +341,7 @@ impl Vm {
         &self,
         exts: &mut [GuestRegionMmapExt],
         unlogged: Vec<Vec<(usize, usize)>>,
+        reserved_slots: u32,
     ) {
         let dram_pieces: Vec<_> = exts
             .iter()
@@ -357,7 +360,8 @@ impl Vm {
                 self.common
                     .next_kvm_slot
                     .load(Ordering::Relaxed)
-                    .checked_add(n)
+                    .checked_add(n)?
+                    .checked_add(reserved_slots)
             })
             .is_some_and(|end| end <= self.common.max_memslots);
         if !fits {
@@ -963,23 +967,23 @@ pub(crate) mod tests {
                 },
             ],
         };
-        let restore = |vm: &mut Vm, holes: &[(u64, u64)]| {
+        let restore = |vm: &mut Vm, holes: &[(u64, u64)], reserved: u32| {
             let regions = anonymous(state.regions(), true, HugePageConfig::None).unwrap();
-            vm.restore_memory_regions(regions, &state, holes).unwrap();
+            vm.restore_memory_regions(regions, &state, holes, reserved).unwrap();
         };
         let logged =
             |vm: &Vm, slot: u32, len: u64| vm.fd().get_dirty_log(slot, u64_to_usize(len)).is_ok();
 
         // No holes: the same single logged KVM slot per slot as without the option.
         let (_, mut vm) = setup_vm();
-        restore(&mut vm, &[]);
+        restore(&mut vm, &[], 0);
         let dram = vm.guest_memory().iter().next().unwrap();
         assert!(dram.sub_slots.is_empty());
         assert!(logged(&vm, 0, mib(64)) && logged(&vm, 1, mib(128)));
 
         // A DRAM hole gets its own unlogged KVM slot; the hotplug region is all hole.
         let (_, mut vm) = setup_vm();
-        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))]);
+        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))], 0);
         let dram = vm.guest_memory().iter().next().unwrap();
         let ids: Vec<_> = dram.sub_slots.iter().map(|s| (s.slot, s.logged)).collect();
         assert_eq!(ids, vec![(0, true), (3, false), (4, true)]);
@@ -1002,10 +1006,18 @@ pub(crate) mod tests {
         // Without free KVM slots for the split, DRAM stays one logged slot.
         let (_, mut vm) = setup_vm();
         vm.common.max_memslots = 4;
-        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))]);
+        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))], 0);
         let dram = vm.guest_memory().iter().next().unwrap();
         assert!(dram.sub_slots.is_empty());
         assert!(logged(&vm, 0, mib(64)) && !logged(&vm, 1, mib(128)));
+
+        // A slot a restored device needs is never spent on the split.
+        let (_, mut vm) = setup_vm();
+        vm.common.max_memslots = 5;
+        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))], 1);
+        let dram = vm.guest_memory().iter().next().unwrap();
+        assert!(dram.sub_slots.is_empty());
+        assert_eq!(vm.next_kvm_slot(1), Some(3));
     }
 
     // Auxiliary function being used throughout the tests.

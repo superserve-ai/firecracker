@@ -464,8 +464,16 @@ pub fn build_microvm_from_snapshot(
         .map_err(StartMicrovmError::Vm)?;
 
     let hole_slots = uffd_handler.as_ref().map_or(&[][..], |h| h.hole_slots());
-    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory, hole_slots)
-        .map_err(StartMicrovmError::Vm)?;
+    // Each restored pmem device takes a KVM slot after memory is registered.
+    let pmem_slots = microvm_state.device_states.mmio_state.pmem_devices.len()
+        + microvm_state.device_states.pci_state.pmem_devices.len();
+    vm.restore_memory_regions(
+        guest_memory,
+        &microvm_state.vm_state.memory,
+        hole_slots,
+        u32::try_from(pmem_slots).unwrap_or(u32::MAX),
+    )
+    .map_err(StartMicrovmError::Vm)?;
 
     #[cfg(target_arch = "x86_64")]
     {
