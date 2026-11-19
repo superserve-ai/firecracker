@@ -168,6 +168,9 @@ pub struct Config {
     /// Advise transparent huge pages on guest memory. Only memory the handler never
     /// serves (zero holes, unplugged blocks) can get them: UFFDIO_COPY installs 4 KiB.
     pub transparent_huge_pages: bool,
+    /// Hand the zero holes to KVM as memory slots without dirty logging; see
+    /// [`Handler::hole_slots`].
+    pub hole_huge_pages: bool,
 }
 
 /// Owning handle for a handler thread. Drop signals shutdown and joins the thread.
@@ -177,6 +180,7 @@ pub struct Handler {
     stats: Arc<Stats>,
     thread: Option<thread::JoinHandle<()>>,
     warmer: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+    hole_slots: Vec<(u64, u64)>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -219,6 +223,12 @@ impl Handler {
     /// Snapshot of the handler's counters at the time of the call.
     pub fn stats(&self) -> StatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// File-offset ranges left unregistered that hold no snapshot data, for KVM to map
+    /// without dirty logging. Empty unless `hole_huge_pages` applies.
+    pub fn hole_slots(&self) -> &[(u64, u64)] {
+        &self.hole_slots
     }
 }
 
@@ -412,6 +422,14 @@ pub fn setup(
         None => ranges,
     };
     register_ranges(&uffd, &mappings, ranges.as_deref())?;
+    let hole_slots = match (&ranges, cfg.hole_huge_pages) {
+        (Some(r), true)
+            if cfg.skip_zero_holes && track_dirty_pages && !huge_pages.is_hugetlbfs() =>
+        {
+            gaps(r, total_mem)
+        }
+        _ => Vec::new(),
+    };
     // Recording suppresses pre-copy as it does prefetch: a pre-copied page never
     // faults, so the trace would miss it. An optimization only: if the warmer cannot
     // start, the guest still faults its pages in.
@@ -544,6 +562,7 @@ pub fn setup(
             stats,
             thread: Some(thread),
             warmer,
+            hole_slots,
         },
     ))
 }
@@ -686,6 +705,22 @@ fn plugged_ranges(
         }
     }
     ranges
+}
+
+/// The parts of `[0, total)` outside `ranges` (sorted, disjoint).
+fn gaps(ranges: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for &(s, e) in ranges {
+        if at < s {
+            out.push((at, s));
+        }
+        at = at.max(e);
+    }
+    if at < total {
+        out.push((at, total));
+    }
+    out
 }
 
 fn in_ranges(ranges: &[(u64, u64)], off: u64) -> bool {
@@ -2120,6 +2155,7 @@ pub fn config_from_paths(
         fault_around_kib,
         prefetch_resident,
         transparent_huge_pages: false,
+        hole_huge_pages: false,
     }
 }
 
@@ -2782,6 +2818,12 @@ mod tests {
         let short = dir.path().join("short");
         sparse_file(&short, block, &[]);
         assert_eq!(ranges(&short, 2 * block).unwrap(), None);
+    }
+
+    #[test]
+    fn gaps_complement_the_ranges() {
+        assert_eq!(gaps(&[(2, 4), (6, 10)], 12), vec![(0, 2), (4, 6), (10, 12)]);
+        assert_eq!(gaps(&[(0, 12)], 12), vec![]);
     }
 
     #[test]

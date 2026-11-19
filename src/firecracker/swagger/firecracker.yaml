@@ -1533,6 +1533,16 @@ definitions:
           benefits. Only meaningful when backend_type is UffdInternal; ignored
           otherwise. Support is advertised by the transparent-huge-pages capability in
           `firecracker --version`.
+      hole_huge_pages:
+        type: boolean
+        default: false
+        description: When true, each large zero hole of guest memory is registered with
+          KVM without dirty logging and advised for transparent huge pages, so fresh
+          memory can be mapped 2 MiB at a time. A diff snapshot saves the non-zero pages
+          the guest populated there. Only
+          meaningful when backend_type is UffdInternal with skip_zero_holes and dirty
+          page tracking; ignored otherwise. Support is advertised by the hole-huge-pages
+          capability in `firecracker --version`.
       record_to:
         type: string
         description: Optional path the in-process UFFD handler writes each served

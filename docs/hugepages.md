@@ -59,6 +59,12 @@ snapshots are unchanged. Its limits:
   huge pages.
 - The host's THP `enabled` setting must be `madvise` or `always`, and its
   `defrag` setting decides whether a fault may stall in compaction.
+- KVM maps memory with dirty logging on 4K at a time, so with `track_dirty_pages`
+  the huge host pages bring no huge guest mappings. `hole_huge_pages` on
+  `mem_backend` (with `skip_zero_holes`) instead gives the largest zero holes
+  their own KVM memory slots without dirty logging and applies `MADV_HUGEPAGE` to
+  them only. A diff snapshot then saves the non-zero pages present there; with
+  host swap active it scans each hole whole instead.
 
 Please refer to the [Linux Documentation][thp_docs] for more information.
 
