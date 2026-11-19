@@ -63,8 +63,8 @@ snapshots are unchanged. Its limits:
   the huge host pages bring no huge guest mappings. `hole_huge_pages` on
   `mem_backend` (with `skip_zero_holes`) instead gives the largest zero holes
   their own KVM memory slots without dirty logging and applies `MADV_HUGEPAGE` to
-  them only. A diff snapshot then saves the non-zero pages present there. It is
-  ignored while the host has active swap.
+  them only. A diff snapshot then saves the non-zero pages present there; with
+  host swap active it scans each hole whole instead.
 
 Please refer to the [Linux Documentation][thp_docs] for more information.
 

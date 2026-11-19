@@ -1539,7 +1539,7 @@ definitions:
         description: When true, each large zero hole of guest memory is registered with
           KVM without dirty logging and advised for transparent huge pages, so fresh
           memory can be mapped 2 MiB at a time. A diff snapshot saves the non-zero pages
-          the guest populated there. Ignored when the host has active swap. Only
+          the guest populated there. Only
           meaningful when backend_type is UffdInternal with skip_zero_holes and dirty
           page tracking; ignored otherwise. Support is advertised by the hole-huge-pages
           capability in `firecracker --version`.

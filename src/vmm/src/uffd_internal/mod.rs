@@ -422,18 +422,11 @@ pub fn setup(
         None => ranges,
     };
     register_ranges(&uffd, &mappings, ranges.as_deref())?;
-    // A diff finds what the guest wrote in an unlogged hole by mincore, which misses
-    // swapped-out pages.
     let hole_slots = match (&ranges, cfg.hole_huge_pages) {
         (Some(r), true)
             if cfg.skip_zero_holes && track_dirty_pages && !huge_pages.is_hugetlbfs() =>
         {
-            if swap_active() {
-                log::warn!("uffd-internal: hole_huge_pages ignored: the host has active swap");
-                Vec::new()
-            } else {
-                gaps(r, total_mem)
-            }
+            gaps(r, total_mem)
         }
         _ => Vec::new(),
     };
@@ -728,11 +721,6 @@ fn gaps(ranges: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
         out.push((at, total));
     }
     out
-}
-
-/// Whether `/proc/swaps` lists a swap area; unreadable counts as yes.
-fn swap_active() -> bool {
-    std::fs::read_to_string("/proc/swaps").map_or(true, |s| s.lines().count() > 1)
 }
 
 fn in_ranges(ranges: &[(u64, u64)], off: u64) -> bool {

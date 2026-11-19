@@ -70,7 +70,7 @@ pub struct VmCommon {
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
     next_kvm_slot: AtomicU32,
-    /// Whether no memory dump has run yet. Until one does, an all-zero page in an unlogged
+    /// Whether no memory dump has run yet. Until one does, an all-zero page in a zero-base
     /// sub-slot equals the hole it was restored from; after, the file may hold what that
     /// dump wrote there, so a page zeroed since must be written.
     first_dump: AtomicBool,
@@ -373,6 +373,7 @@ impl Vm {
                         offset,
                         len,
                         logged: false,
+                        zero_base: true,
                     })
                     .collect(),
                 GuestRegionType::Dram if fits => pieces
@@ -386,6 +387,7 @@ impl Vm {
                         offset,
                         len,
                         logged,
+                        zero_base: !logged,
                     })
                     .collect(),
                 GuestRegionType::Dram => Vec::new(),
@@ -469,11 +471,24 @@ impl Vm {
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
+        // mincore misses swapped-out pages, so with swap every hole page counts as dirty and
+        // only the zero check narrows it.
+        let swap = self
+            .guest_memory()
+            .iter()
+            .any(|r| r.sub_slots.iter().any(|s| s.zero_base))
+            && swap_active();
+        if swap {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| {
+                warn!("hole_huge_pages: swap active or unknown; diffs scan whole holes")
+            });
+        }
         self.guest_memory()
             .iter()
             .flat_map(|region| region.plugged_slots())
             .map(|mem_slot| {
-                let bitmap = slot_dirty_bitmap(&mem_slot, |slot, len| {
+                let bitmap = slot_dirty_bitmap(&mem_slot, swap, |slot, len| {
                     self.fd()
                         .get_dirty_log(slot, len)
                         .map_err(VmError::GetDirtyLog)
@@ -497,7 +512,7 @@ impl Vm {
     /// `zero_ranges` are memory file `(offset, len)` ranges, page aligned, that hold zeros
     /// unless the guest has written them since: a diff punches them out of the file and reports
     /// them as dumped, and writes the dirty pages among them over the holes.
-    /// `zero_skip` lets the first dump leave out all-zero pages of unlogged sub-slots, which
+    /// `zero_skip` lets the first dump leave out all-zero pages of zero-base sub-slots, which
     /// read as zero holes of the snapshot they were restored from.
     pub(crate) fn snapshot_memory_to_file(
         &self,
@@ -705,21 +720,25 @@ impl Vm {
 
 /// Dirty bitmap of `mem_slot`, assembled from its KVM slots: `get_log` for a logged one,
 /// host presence for an unlogged one, which nothing populates but the guest and devices.
+/// With `swap`, every page of a zero-base one, as presence misses swapped-out pages.
 fn slot_dirty_bitmap(
     mem_slot: &GuestMemorySlot<'_>,
+    swap: bool,
     mut get_log: impl FnMut(u32, usize) -> Result<Vec<u64>, VmError>,
 ) -> Result<Vec<u64>, VmError> {
     let page_size = host_page_size();
-    if let [sub] = mem_slot.sub_slots[..] {
-        return match sub.logged {
-            true => get_log(sub.slot, sub.len),
-            false => mincore_bitmap(mem_slot.slice.ptr_guard_mut().as_ptr(), sub.len),
-        };
+    match mem_slot.sub_slots[..] {
+        [sub] if sub.logged => return get_log(sub.slot, sub.len),
+        [sub] if !sub.zero_base => {
+            return mincore_bitmap(mem_slot.slice.ptr_guard_mut().as_ptr(), sub.len);
+        }
+        _ => {}
     }
     let mut bitmap = vec![0u64; (mem_slot.slice.len() / page_size).div_ceil(64)];
     for sub in &mem_slot.sub_slots {
         let bits = match sub.logged {
             true => get_log(sub.slot, sub.len)?,
+            false if swap && sub.zero_base => vec![u64::MAX; (sub.len / page_size).div_ceil(64)],
             false => {
                 // SAFETY: the sub-slot is within the slot's mapping.
                 let addr = unsafe { mem_slot.slice.ptr_guard_mut().as_ptr().add(sub.offset) };
@@ -734,6 +753,11 @@ fn slot_dirty_bitmap(
         );
     }
     Ok(bitmap)
+}
+
+/// Whether `/proc/swaps` lists a swap area; unreadable counts as yes.
+fn swap_active() -> bool {
+    std::fs::read_to_string("/proc/swaps").map_or(true, |s| s.lines().count() > 1)
 }
 
 /// ORs the first `pages` bits of `src` into `dst` starting at bit `base`, a word at
@@ -883,18 +907,21 @@ pub(crate) mod tests {
                 offset: 0,
                 len: page_size * 2,
                 logged: true,
+                zero_base: false,
             },
             KvmSubSlot {
                 slot: 5,
                 offset: page_size * 2,
                 len: page_size * 3,
                 logged: false,
+                zero_base: true,
             },
             KvmSubSlot {
                 slot: 6,
                 offset: page_size * 5,
                 len: page_size * 3,
                 logged: true,
+                zero_base: false,
             },
         ];
         // Only page 3 of the unlogged pages is populated.
@@ -902,13 +929,16 @@ pub(crate) mod tests {
             .write_slice(&[1], MemoryRegionAddress((page_size * 3) as u64))
             .unwrap();
         let mut calls = Vec::new();
-        let bitmap = slot_dirty_bitmap(&region.mem_slot(0), |slot, len| {
+        let mut get_log = |slot, len| {
             calls.push((slot, len));
             Ok(vec![if slot == 0 { 0b10 } else { 0b001 }])
-        })
-        .unwrap();
+        };
+        let bitmap = slot_dirty_bitmap(&region.mem_slot(0), false, &mut get_log).unwrap();
         assert_eq!(bitmap, vec![0b10_1010]);
-        assert_eq!(calls, vec![(0, page_size * 2), (6, page_size * 3)]);
+        // With swap the whole hole counts as dirty.
+        let bitmap = slot_dirty_bitmap(&region.mem_slot(0), true, &mut get_log).unwrap();
+        assert_eq!(bitmap, vec![0b11_1110]);
+        assert_eq!(calls, [(0, page_size * 2), (6, page_size * 3)].repeat(2));
     }
 
     #[test]

@@ -117,9 +117,11 @@ pub(crate) struct KvmSubSlot {
     pub offset: usize,
     /// Byte length of the range
     pub len: usize,
-    /// Whether KVM logs dirty pages here. An unlogged range holds no snapshot data, so
-    /// what the guest has populated in it is what changed.
+    /// Whether KVM logs dirty pages here.
     pub logged: bool,
+    /// Whether this is a zero hole of the restored snapshot, unlogged: what the guest has
+    /// populated in it is what changed, and an all-zero page there is unchanged.
+    pub zero_base: bool,
 }
 
 /// A guest memory slot, which is a slice of a guest memory region
@@ -154,12 +156,12 @@ impl<'a> GuestMemorySlot<'a> {
             .collect()
     }
 
-    /// Whether the page at `offset` lies in an unlogged sub-slot and reads all zero.
-    fn unlogged_zero_page(&self, offset: usize, page_size: usize) -> bool {
+    /// Whether the page at `offset` lies in a zero-base sub-slot and reads all zero.
+    fn hole_zero_page(&self, offset: usize, page_size: usize) -> bool {
         let i = self
             .sub_slots
             .partition_point(|s| s.offset + s.len <= offset);
-        if self.sub_slots.get(i).is_none_or(|s| s.logged) {
+        if self.sub_slots.get(i).is_none_or(|s| !s.zero_base) {
             return false;
         }
         // SAFETY: the page is within the slice, page aligned, and the VM is paused.
@@ -180,7 +182,7 @@ impl<'a> GuestMemorySlot<'a> {
     /// predicate that decides what gets written — kept in one place so the
     /// two can't drift).
     ///
-    /// With `zero_skip`, an all-zero page in an unlogged sub-slot is neither written nor
+    /// With `zero_skip`, an all-zero page in a zero-base sub-slot is neither written nor
     /// recorded: it still reads as the zero hole it was restored from.
     pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
@@ -222,7 +224,7 @@ impl<'a> GuestMemorySlot<'a> {
                 }
 
                 if (is_kvm_page_dirty || is_firecracker_page_dirty)
-                    && !(zero_skip && self.unlogged_zero_page(page_offset, page_size))
+                    && !(zero_skip && self.hole_zero_page(page_offset, page_size))
                 {
                     let file_page = base_page + (i * 64) + j;
                     dumped_pages[file_page >> 6] |= 1u64 << (file_page & 63);
@@ -369,6 +371,7 @@ impl GuestRegionMmapExt {
                 offset: 0,
                 len: self.slot_size,
                 logged: self.inner.bitmap().is_some(),
+                zero_base: false,
             });
         }
 
@@ -842,7 +845,7 @@ where
     ///
     /// Returns the exact set of file pages this dump wrote, as a bitmap over
     /// the memory file's pages (one bit per host page, LSB-first per word).
-    /// `zero_skip` leaves out all-zero pages of unlogged sub-slots.
+    /// `zero_skip` leaves out all-zero pages of zero-base sub-slots.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
@@ -1260,6 +1263,7 @@ mod tests {
             offset: page_size * 2,
             len: page_size * 2,
             logged: false,
+            zero_base: true,
         }];
         assert_eq!(
             region.mem_slot(3).kvm_regions()[0].flags,
@@ -1278,7 +1282,27 @@ mod tests {
     }
 
     #[test]
-    fn test_dump_dirty_skips_zero_pages_in_unlogged_sub_slots() {
+    fn test_dump_dirty_writes_zero_pages_of_untracked_memory() {
+        let page_size = get_page_size().unwrap();
+        let regions = anonymous(
+            [(GuestAddress(0), page_size * 2)].into_iter(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let guest_memory = into_region_ext(regions);
+        guest_memory
+            .write(&vec![0u8; page_size], GuestAddress(page_size as u64))
+            .unwrap();
+        // Untracked memory is unlogged without being a hole: a page changed to zeros is dumped.
+        let bitmap = HashMap::from([(0, vec![0b10])]);
+        let mut file = TempFile::new().unwrap().into_file();
+        let dumped = guest_memory.dump_dirty(&mut file, &bitmap, true).unwrap();
+        assert_eq!(dumped, vec![0b10]);
+    }
+
+    #[test]
+    fn test_dump_dirty_skips_zero_pages_in_hole_sub_slots() {
         let page_size = get_page_size().unwrap();
         let regions = anonymous(
             [(GuestAddress(0), page_size * 4)].into_iter(),
@@ -1294,12 +1318,14 @@ mod tests {
                 offset: 0,
                 len: page_size * 2,
                 logged: true,
+                zero_base: false,
             },
             KvmSubSlot {
                 slot: 1,
                 offset: page_size * 2,
                 len: page_size * 2,
                 logged: false,
+                zero_base: true,
             },
         ];
         let guest_memory = GuestMemoryMmap::from_regions(vec![region]).unwrap();
