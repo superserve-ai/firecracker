@@ -463,7 +463,8 @@ pub fn build_microvm_from_snapshot(
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::Vm)?;
 
-    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
+    let hole_slots = uffd_handler.as_ref().map_or(&[][..], |h| h.hole_slots());
+    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory, hole_slots)
         .map_err(StartMicrovmError::Vm)?;
 
     #[cfg(target_arch = "x86_64")]

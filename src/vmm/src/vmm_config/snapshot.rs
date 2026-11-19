@@ -220,6 +220,12 @@ pub struct MemBackendConfig {
     /// the handler never serves benefits. Only meaningful for `UffdInternal`.
     #[serde(default)]
     pub transparent_huge_pages: bool,
+    /// Register each large zero hole as its own KVM memory slot without dirty logging and
+    /// advise it for transparent huge pages, so fresh guest memory can be mapped 2 MiB at a
+    /// time; a diff saves the non-zero pages present there. Only meaningful for
+    /// `UffdInternal` with `skip_zero_holes` and dirty tracking; ignored otherwise.
+    #[serde(default)]
+    pub hole_huge_pages: bool,
     /// If set, the internal UFFD handler will write each served page offset to this path
     /// (template-build recording mode). Only meaningful for `UffdInternal`; ignored
     /// otherwise. When present, prefetch is disabled so the captured trace reflects the

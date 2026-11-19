@@ -66,6 +66,7 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// accepts `mem_backend.prefetch_resident`, likewise.
 /// transparent-huge-pages: `PUT /machine-config` accepts `transparent_huge_pages` and
 /// `LoadSnapshot` accepts `mem_backend.transparent_huge_pages`, likewise.
+/// hole-huge-pages: `LoadSnapshot` accepts `mem_backend.hole_huge_pages`, likewise.
 const CAPABILITIES: &[&str] = &[
     "serial-console-cap",
     "clock-realtime-flag",
@@ -77,6 +78,7 @@ const CAPABILITIES: &[&str] = &[
     "fault-around",
     "resident-prefetch",
     "transparent-huge-pages",
+    "hole-huge-pages",
 ];
 const MMDS_CONTENT_ARG: &str = "metadata";
 

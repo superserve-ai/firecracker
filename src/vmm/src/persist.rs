@@ -322,9 +322,14 @@ pub fn create_snapshot(
         let started = std::time::Instant::now();
         (vmm.vm.resident_pages(), started.elapsed())
     });
-    let dumped =
-        vmm.vm
-            .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type, &zero_ranges);
+    // An untrusted merge writes every plugged block, as a hole there may read an earlier
+    // layer's contents, so no zero page may be left out.
+    let dumped = vmm.vm.snapshot_memory_to_file(
+        &params.mem_file_path,
+        params.snapshot_type,
+        &zero_ranges,
+        !untrusted_merge,
+    );
     // A failed dump may already have consumed the dirty bits, so a later punch could erase
     // guest writes: hand the fresh blocks back to the dirty bitmap, which dumps their contents.
     if dumped.is_err() {
@@ -992,6 +997,7 @@ pub fn restore_from_snapshot(
                 params.mem_backend.fault_around_kib,
                 params.mem_backend.prefetch_resident,
                 params.mem_backend.transparent_huge_pages,
+                params.mem_backend.hole_huge_pages,
                 mem_state,
                 plugged_page_mask(
                     &microvm_state,
@@ -1131,6 +1137,7 @@ fn guest_memory_from_uffd_internal(
     fault_around_kib: u32,
     prefetch_resident: bool,
     transparent_huge_pages: bool,
+    hole_huge_pages: bool,
     mem_state: &GuestMemoryState,
     plugged: Option<Vec<u64>>,
     track_dirty_pages: bool,
@@ -1156,6 +1163,7 @@ fn guest_memory_from_uffd_internal(
         prefetch_resident,
     );
     cfg.transparent_huge_pages = transparent_huge_pages;
+    cfg.hole_huge_pages = hole_huge_pages;
     let (guest_memory, uffd, handler) = crate::uffd_internal::setup(
         cfg,
         mem_state,

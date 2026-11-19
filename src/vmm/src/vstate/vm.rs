@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
@@ -19,7 +19,7 @@ use kvm_bindings::{
     kvm_irq_routing_entry, kvm_userspace_memory_region,
 };
 use kvm_ioctls::VmFd;
-use log::debug;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
@@ -34,8 +34,9 @@ use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemorySlot,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, GuestRegionType, KvmSubSlot,
+    MemoryError, split_logged, unlogged_ranges,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -69,6 +70,10 @@ pub struct VmCommon {
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
     next_kvm_slot: AtomicU32,
+    /// Whether no memory dump has run yet. Until one does, an all-zero page in an unlogged
+    /// sub-slot equals the hole it was restored from; after, the file may hold what that
+    /// dump wrote there, so a page zeroed since must be written.
+    first_dump: AtomicBool,
     /// Interrupts used by Vm's devices
     pub interrupts: Mutex<HashMap<u32, RoutingEntry>>,
     /// Allocator for VM resources
@@ -155,6 +160,7 @@ impl Vm {
             max_memslots: kvm.max_nr_memslots(),
             guest_memory: GuestMemoryMmap::default(),
             next_kvm_slot: AtomicU32::new(0),
+            first_dump: AtomicBool::new(true),
             interrupts: Mutex::new(HashMap::with_capacity(GSI_MSI_END as usize + 1)),
             resource_allocator: Mutex::new(ResourceAllocator::new()),
             mmio_bus: Arc::new(Bus::new()),
@@ -238,7 +244,10 @@ impl Vm {
             .slots()
             .try_for_each(|(ref slot, plugged)| match plugged {
                 // if the slot is plugged, add it to kvm user memory regions
-                true => self.set_user_memory_region(slot.into()),
+                true => slot
+                    .kvm_regions()
+                    .into_iter()
+                    .try_for_each(|r| self.set_user_memory_region(r)),
                 // if the slot is not plugged, protect accesses to it
                 false => slot.protect(true).map_err(VmError::MemoryError),
             })?;
@@ -288,14 +297,17 @@ impl Vm {
         self.register_memory_region(arcd_region)
     }
 
-    /// Register a list of new memory regions to this [`Vm`].
+    /// Register a list of new memory regions to this [`Vm`]. `hole_slots` are memory file
+    /// ranges holding no snapshot data, for [`Self::split_hole_slots`].
     ///
     /// Note: regions and state.regions need to be in the same order.
     pub fn restore_memory_regions(
         &mut self,
         regions: Vec<GuestRegionMmap>,
         state: &GuestMemoryState,
+        hole_slots: &[(u64, u64)],
     ) -> Result<(), VmError> {
+        let mut exts = Vec::with_capacity(state.regions.len());
         for (region, state) in regions.into_iter().zip(state.regions.iter()) {
             let slot_cnt = state
                 .plugged
@@ -307,12 +319,97 @@ impl Vm {
                 .next_kvm_slot(slot_cnt)
                 .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
 
-            let arcd_region = Arc::new(GuestRegionMmapExt::from_state(region, state, next_slot)?);
-
-            self.register_memory_region(arcd_region)?
+            exts.push(GuestRegionMmapExt::from_state(region, state, next_slot)?);
+        }
+        if !hole_slots.is_empty() {
+            self.split_hole_slots(&mut exts, unlogged_ranges(state, hole_slots));
+        }
+        for ext in exts {
+            self.register_memory_region(Arc::new(ext))?;
         }
 
         Ok(())
+    }
+
+    /// Backs the `unlogged` ranges of each region with KVM slots without dirty logging,
+    /// advised for transparent huge pages: KVM maps a logged slot 4 KiB at a time. A DRAM
+    /// region is split into several KVM slots, the first keeping its own number; a hotplug
+    /// slot is unlogged whole. Without enough KVM slots, DRAM stays one logged slot.
+    fn split_hole_slots(
+        &self,
+        exts: &mut [GuestRegionMmapExt],
+        unlogged: Vec<Vec<(usize, usize)>>,
+    ) {
+        let dram_pieces: Vec<_> = exts
+            .iter()
+            .zip(&unlogged)
+            .map(|(ext, ranges)| match ext.region_type {
+                GuestRegionType::Dram if !ranges.is_empty() => {
+                    split_logged(u64_to_usize(ext.len()), ranges)
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let extra: usize = dram_pieces.iter().map(|p| p.len().saturating_sub(1)).sum();
+        let fits = u32::try_from(extra)
+            .ok()
+            .and_then(|n| {
+                self.common
+                    .next_kvm_slot
+                    .load(Ordering::Relaxed)
+                    .checked_add(n)
+            })
+            .is_some_and(|end| end <= self.common.max_memslots);
+        if !fits {
+            warn!("hole_huge_pages: {extra} more KVM slots needed than free; DRAM stays logged");
+        }
+        let (mut slots, mut bytes) = (0, 0);
+        for ((ext, ranges), pieces) in exts.iter_mut().zip(unlogged).zip(dram_pieces) {
+            ext.sub_slots = match ext.region_type {
+                GuestRegionType::Hotpluggable => ranges
+                    .into_iter()
+                    .map(|(offset, len)| KvmSubSlot {
+                        slot: ext.slot_from + u32::try_from(offset / ext.slot_size).unwrap(),
+                        offset,
+                        len,
+                        logged: false,
+                    })
+                    .collect(),
+                GuestRegionType::Dram if fits => pieces
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (offset, len, logged))| KvmSubSlot {
+                        slot: match i {
+                            0 => ext.slot_from,
+                            _ => self.next_kvm_slot(1).expect("KVM slots counted above"),
+                        },
+                        offset,
+                        len,
+                        logged,
+                    })
+                    .collect(),
+                GuestRegionType::Dram => Vec::new(),
+            };
+            for sub in ext.sub_slots.iter().filter(|s| !s.logged) {
+                // SAFETY: the range is within this region's live mapping.
+                let ret = unsafe {
+                    libc::madvise(
+                        ext.as_ptr().add(sub.offset).cast(),
+                        sub.len,
+                        libc::MADV_HUGEPAGE,
+                    )
+                };
+                if ret < 0 {
+                    warn!(
+                        "madvise(MADV_HUGEPAGE) failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                slots += 1;
+                bytes += sub.len;
+            }
+        }
+        info!("hole_huge_pages: {slots} KVM slots without dirty logging cover {bytes} bytes");
     }
 
     /// Gets a reference to the kvm file descriptor owned by this VM.
@@ -339,7 +436,9 @@ impl Vm {
             .iter()
             .flat_map(|region| region.plugged_slots())
             .for_each(|mem_slot| {
-                let _ = self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len());
+                for sub in mem_slot.sub_slots.iter().filter(|s| s.logged) {
+                    let _ = self.fd().get_dirty_log(sub.slot, sub.len);
+                }
             });
     }
 
@@ -374,16 +473,11 @@ impl Vm {
             .iter()
             .flat_map(|region| region.plugged_slots())
             .map(|mem_slot| {
-                let bitmap = match mem_slot.slice.bitmap() {
-                    Some(_) => self
-                        .fd()
-                        .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
-                        .map_err(VmError::GetDirtyLog)?,
-                    None => mincore_bitmap(
-                        mem_slot.slice.ptr_guard_mut().as_ptr(),
-                        mem_slot.slice.len(),
-                    )?,
-                };
+                let bitmap = slot_dirty_bitmap(&mem_slot, |slot, len| {
+                    self.fd()
+                        .get_dirty_log(slot, len)
+                        .map_err(VmError::GetDirtyLog)
+                })?;
                 Ok((mem_slot.slot, bitmap))
             })
             .collect()
@@ -403,11 +497,14 @@ impl Vm {
     /// `zero_ranges` are memory file `(offset, len)` ranges, page aligned, that hold zeros
     /// unless the guest has written them since: a diff punches them out of the file and reports
     /// them as dumped, and writes the dirty pages among them over the holes.
+    /// `zero_skip` lets the first dump leave out all-zero pages of unlogged sub-slots, which
+    /// read as zero holes of the snapshot they were restored from.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
         zero_ranges: &[(u64, u64)],
+        zero_skip: bool,
     ) -> Result<Option<DiffDump>, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -425,6 +522,8 @@ impl Vm {
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
 
+        // Every dump counts, a failed one too: it may have written part of the file.
+        let zero_skip = self.common.first_dump.swap(false, Ordering::Relaxed) && zero_skip;
         let mut merged = false;
         if file_existed {
             let file_size = file
@@ -464,7 +563,9 @@ impl Vm {
                     }
                 }
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                let mut dumped_pages = self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                let mut dumped_pages =
+                    self.guest_memory()
+                        .dump_dirty(&mut file, &dirty_bitmap, zero_skip)?;
                 let page_size = host_page_size() as u64;
                 for &(offset, len) in zero_ranges {
                     for page in offset / page_size..(offset + len) / page_size {
@@ -602,6 +703,39 @@ impl Vm {
     }
 }
 
+/// Dirty bitmap of `mem_slot`, assembled from its KVM slots: `get_log` for a logged one,
+/// host presence for an unlogged one, which nothing populates but the guest and devices.
+fn slot_dirty_bitmap(
+    mem_slot: &GuestMemorySlot<'_>,
+    mut get_log: impl FnMut(u32, usize) -> Result<Vec<u64>, VmError>,
+) -> Result<Vec<u64>, VmError> {
+    let page_size = host_page_size();
+    if let [sub] = mem_slot.sub_slots[..] {
+        return match sub.logged {
+            true => get_log(sub.slot, sub.len),
+            false => mincore_bitmap(mem_slot.slice.ptr_guard_mut().as_ptr(), sub.len),
+        };
+    }
+    let mut bitmap = vec![0u64; (mem_slot.slice.len() / page_size).div_ceil(64)];
+    for sub in &mem_slot.sub_slots {
+        let bits = match sub.logged {
+            true => get_log(sub.slot, sub.len)?,
+            false => {
+                // SAFETY: the sub-slot is within the slot's mapping.
+                let addr = unsafe { mem_slot.slice.ptr_guard_mut().as_ptr().add(sub.offset) };
+                mincore_bitmap(addr, sub.len)?
+            }
+        };
+        or_bits_at(
+            &mut bitmap,
+            sub.offset / page_size,
+            &bits,
+            sub.len / page_size,
+        );
+    }
+    Ok(bitmap)
+}
+
 /// ORs the first `pages` bits of `src` into `dst` starting at bit `base`, a word at
 /// a time when `base` is word aligned (slots are, being whole MiB), else bit by bit.
 fn or_bits_at(dst: &mut [u64], base: usize, src: &[u64], pages: usize) {
@@ -727,6 +861,121 @@ pub(crate) mod tests {
             }
             assert_eq!(fast, slow, "base {base}, pages {pages}");
         }
+    }
+
+    #[test]
+    fn slot_dirty_bitmap_assembles_logged_and_unlogged_sub_slots() {
+        use crate::vmm_config::machine_config::HugePageConfig;
+        use crate::vstate::memory::{Bytes, MemoryRegionAddress, anonymous};
+
+        let page_size = host_page_size();
+        let regions = anonymous(
+            [(GuestAddress(0), page_size * 8)].into_iter(),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let mut region =
+            GuestRegionMmapExt::dram_from_mmap_region(regions.into_iter().next().unwrap(), 0);
+        region.sub_slots = vec![
+            KvmSubSlot {
+                slot: 0,
+                offset: 0,
+                len: page_size * 2,
+                logged: true,
+            },
+            KvmSubSlot {
+                slot: 5,
+                offset: page_size * 2,
+                len: page_size * 3,
+                logged: false,
+            },
+            KvmSubSlot {
+                slot: 6,
+                offset: page_size * 5,
+                len: page_size * 3,
+                logged: true,
+            },
+        ];
+        // Only page 3 of the unlogged pages is populated.
+        region
+            .write_slice(&[1], MemoryRegionAddress((page_size * 3) as u64))
+            .unwrap();
+        let mut calls = Vec::new();
+        let bitmap = slot_dirty_bitmap(&region.mem_slot(0), |slot, len| {
+            calls.push((slot, len));
+            Ok(vec![if slot == 0 { 0b10 } else { 0b001 }])
+        })
+        .unwrap();
+        assert_eq!(bitmap, vec![0b10_1010]);
+        assert_eq!(calls, vec![(0, page_size * 2), (6, page_size * 3)]);
+    }
+
+    #[test]
+    fn test_restore_hole_slots() {
+        use crate::vmm_config::machine_config::HugePageConfig;
+        use crate::vstate::memory::{GuestMemoryRegionState, anonymous};
+
+        let mib = |n: u64| n << 20;
+        let state = GuestMemoryState {
+            regions: vec![
+                GuestMemoryRegionState {
+                    base_address: 0,
+                    size: mib_to_bytes(64),
+                    region_type: GuestRegionType::Dram,
+                    plugged: vec![true],
+                },
+                GuestMemoryRegionState {
+                    base_address: mib(1024),
+                    size: mib_to_bytes(256),
+                    region_type: GuestRegionType::Hotpluggable,
+                    plugged: vec![true, false],
+                },
+            ],
+        };
+        let restore = |vm: &mut Vm, holes: &[(u64, u64)]| {
+            let regions = anonymous(state.regions(), true, HugePageConfig::None).unwrap();
+            vm.restore_memory_regions(regions, &state, holes).unwrap();
+        };
+        let logged =
+            |vm: &Vm, slot: u32, len: u64| vm.fd().get_dirty_log(slot, u64_to_usize(len)).is_ok();
+
+        // No holes: the same single logged KVM slot per slot as without the option.
+        let (_, mut vm) = setup_vm();
+        restore(&mut vm, &[]);
+        let dram = vm.guest_memory().iter().next().unwrap();
+        assert!(dram.sub_slots.is_empty());
+        assert!(logged(&vm, 0, mib(64)) && logged(&vm, 1, mib(128)));
+
+        // A DRAM hole gets its own unlogged KVM slot; the hotplug region is all hole.
+        let (_, mut vm) = setup_vm();
+        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))]);
+        let dram = vm.guest_memory().iter().next().unwrap();
+        let ids: Vec<_> = dram.sub_slots.iter().map(|s| (s.slot, s.logged)).collect();
+        assert_eq!(ids, vec![(0, true), (3, false), (4, true)]);
+        assert!(logged(&vm, 0, mib(8)) && !logged(&vm, 3, mib(8)) && logged(&vm, 4, mib(48)));
+        assert!(!logged(&vm, 1, mib(128)));
+        let bitmap = vm.get_dirty_bitmap().unwrap();
+        assert_eq!(
+            bitmap[&0].len(),
+            u64_to_usize(mib(64)) / host_page_size() / 64
+        );
+
+        // Unlogged across virtio-mem unplug and plug.
+        let hp = vm.guest_memory().iter().nth(1).unwrap();
+        hp.update_slot(&vm, &hp.mem_slot(2), true).unwrap();
+        assert!(!logged(&vm, 2, mib(128)));
+        hp.update_slot(&vm, &hp.mem_slot(1), false).unwrap();
+        hp.update_slot(&vm, &hp.mem_slot(1), true).unwrap();
+        assert!(!logged(&vm, 1, mib(128)));
+
+        // Without free KVM slots for the split, DRAM stays one logged slot.
+        let (_, mut vm) = setup_vm();
+        vm.common.max_memslots = 4;
+        restore(&mut vm, &[(mib(8), mib(16)), (mib(64), mib(320))]);
+        let dram = vm.guest_memory().iter().next().unwrap();
+        assert!(dram.sub_slots.is_empty());
+        assert!(logged(&vm, 0, mib(64)) && !logged(&vm, 1, mib(128)));
     }
 
     // Auxiliary function being used throughout the tests.
