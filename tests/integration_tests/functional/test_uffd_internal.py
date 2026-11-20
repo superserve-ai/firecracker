@@ -6,6 +6,9 @@ import struct
 from pathlib import Path
 
 import pytest
+from tenacity import Retrying, retry_if_exception_type, stop_after_delay, wait_fixed
+
+from framework.guest_stats import MeminfoGuest
 
 MEMHP_BOOTARGS = "console=ttyS0 reboot=k panic=1 memhp_default_state=online_movable"
 
@@ -32,6 +35,8 @@ def _restore_uffd_internal(
     record_to=None,
     track_dirty_pages=False,
     backend_type="UffdInternal",
+    resume_vm=True,
+    hotplug_requested_size_mib=None,
 ):
     """Restore `snapshot` into `vm` using the UffdInternal (or another) backend.
 
@@ -63,11 +68,15 @@ def _restore_uffd_internal(
     if record_to is not None:
         mem_backend["record_to"] = str(record_to)
 
+    load_options = {}
+    if hotplug_requested_size_mib is not None:
+        load_options["hotplug_requested_size_mib"] = hotplug_requested_size_mib
     vm.api.snapshot_load.put(
         mem_backend=mem_backend,
         snapshot_path=str(jailed_vmstate),
         track_dirty_pages=track_dirty_pages,
-        resume_vm=True,
+        resume_vm=resume_vm,
+        **load_options,
     )
 
 
@@ -182,6 +191,49 @@ def _hotplug_range_contains(mem_path, start, length, marker):
             length -= len(new)
             tail = data[-len(marker) :]
     return False
+
+
+@pytest.mark.parametrize(
+    "backend_type,resume_vm", [("File", False), ("UffdInternal", True)]
+)
+def test_restore_memory_target(uvm_plain_6_1, microvm_factory, backend_type, resume_vm):
+    """The restored guest onlines the requested memory without a subsequent PATCH."""
+    vm = uvm_plain_6_1
+    vm.memory_monitor = None
+    vm.spawn()
+    vm.basic_config(boot_args=MEMHP_BOOTARGS, mem_size_mib=512)
+    vm.api.memory_hotplug.put(total_size_mib=512, slot_size_mib=128, block_size_mib=2)
+    vm.add_net_iface()
+    vm.start()
+    baseline = MeminfoGuest(vm).get().mem_total.mib()
+    snapshot = vm.snapshot_full()
+    vm.kill()
+
+    restored = microvm_factory.build()
+    restored.memory_monitor = None
+    restored.spawn()
+    _restore_uffd_internal(
+        restored,
+        snapshot,
+        backend_type=backend_type,
+        resume_vm=resume_vm,
+        hotplug_requested_size_mib=256,
+    )
+    status = restored.api.memory_hotplug.get().json()
+    assert status["requested_size_mib"] == 256
+    if not resume_vm:
+        assert status["plugged_size_mib"] == 0
+        restored.resume()
+
+    restored.wait_for_ssh_up()
+    for attempt in Retrying(
+        retry=retry_if_exception_type(AssertionError),
+        stop=stop_after_delay(30),
+        wait=wait_fixed(0.1),
+        reraise=True,
+    ):
+        with attempt:
+            assert MeminfoGuest(restored).get().mem_total.mib() == baseline + 256
 
 
 @pytest.mark.parametrize("backend_type", ["File", "UffdInternal"])

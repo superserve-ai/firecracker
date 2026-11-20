@@ -1812,6 +1812,18 @@ definitions:
         type: boolean
         description:
           When set to true, the vm is also resumed if the snapshot load is successful.
+      hotplug_requested_size_mib:
+        type: integer
+        minimum: 0
+        maximum: 4294967295
+        x-nullable: true
+        description:
+          Requests this many MiB in the virtio-mem region, excluding boot memory,
+          before any vCPU resumes. Omission preserves the saved request. An explicit
+          target requires an active device, must be block-aligned, and must be
+          between the already-plugged size and the region capacity, inclusive.
+          The guest plugs and onlines memory asynchronously after resume.
+          Advertised by the snapshot-load-memory-target capability.
       network_overrides:
         type: array
         description: Network host device names to override
