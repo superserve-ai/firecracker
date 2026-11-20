@@ -49,6 +49,8 @@ pub enum VirtioMemError {
     InterruptError(#[from] InterruptError),
     /// Size {0} is invalid: it must be a multiple of block size and less than the total size
     InvalidSize(u64),
+    /// Restore requested {0} MiB of hotplug memory, below the {1} MiB already plugged.
+    RestoreBelowPlugged(u32, u32),
     /// Device is not active
     DeviceNotActive,
     /// Descriptor is write-only
@@ -654,6 +656,21 @@ impl VirtioMem {
         Ok(())
     }
 
+    /// Set the restored device target without unplugging memory held by the snapshot.
+    pub(crate) fn set_restore_target(
+        &mut self,
+        requested_size_mib: u32,
+    ) -> Result<(), VirtioMemError> {
+        let plugged = self.plugged_size_mib();
+        if requested_size_mib < plugged {
+            return Err(VirtioMemError::RestoreBelowPlugged(
+                requested_size_mib,
+                plugged,
+            ));
+        }
+        self.update_requested_size(requested_size_mib)
+    }
+
     /// Updates the requested size of the virtio-mem device.
     pub fn update_requested_size(&mut self, requested_size_mib: u32) -> Result<(), VirtioMemError> {
         if !self.is_activated() {
@@ -1147,6 +1164,30 @@ mod tests {
 
         th.device().update_requested_size(512).unwrap();
         assert_eq!(th.device().requested_size_mib(), 512);
+    }
+
+    #[test]
+    fn test_restore_target_preserves_plugged_memory() {
+        let dev = default_virtio_mem();
+        let guest_mem = dev.vm.guest_memory().clone();
+        let mut th = test_helper(dev, &guest_mem);
+        th.device().update_requested_size(512).unwrap();
+        let addr = th.device().guest_address();
+        let resp = emulate_request(
+            &mut th,
+            &guest_mem,
+            Request::Plug(RequestedRange { addr, nb_blocks: 1 }),
+        );
+        assert!(resp.is_ack());
+        assert!(matches!(
+            th.device().set_restore_target(0),
+            Err(VirtioMemError::RestoreBelowPlugged(0, 2))
+        ));
+        assert_eq!(th.device().requested_size_mib(), 512);
+
+        th.device().set_restore_target(64).unwrap();
+        assert_eq!(th.device().requested_size_mib(), 64);
+        assert_eq!(th.device().plugged_size_mib(), 2);
     }
 
     #[test]

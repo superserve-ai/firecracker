@@ -59,6 +59,7 @@ const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (or zeroed, where discard is unsupported) rather than exposing what the snapshot
 /// held there; an external UFFD handler sees the discard as a remove event, as for
 /// the balloon. A supervisor may therefore enable hotplug on VMs it snapshots.
+/// snapshot-load-memory-target: `LoadSnapshot` accepts `hotplug_requested_size_mib`.
 /// uffd-stats: `GET /uffd/stats` returns the internal UFFD handler's counters.
 /// fault-around: `LoadSnapshot` accepts `mem_backend.fault_around_kib`, under the
 /// deny-unknown-fields rule.
@@ -74,6 +75,7 @@ const CAPABILITIES: &[&str] = &[
     "eager-overlay",
     "skip-zero-holes",
     "memory-hotplug",
+    "snapshot-load-memory-target",
     "uffd-stats",
     "fault-around",
     "resident-prefetch",

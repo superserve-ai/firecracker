@@ -45,7 +45,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
-use crate::{EventManager, Vmm, vstate};
+use crate::{EventManager, Vmm, VmmError, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -865,6 +865,8 @@ pub enum RestoreFromSnapshotError {
     GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
+    /// Failed to set the restored memory hotplug target: {0}
+    MemoryHotplug(#[from] VmmError),
 }
 /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
 /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
@@ -1010,7 +1012,7 @@ pub fn restore_from_snapshot(
             .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
         }
     };
-    builder::build_microvm_from_snapshot(
+    let vmm = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
@@ -1020,8 +1022,19 @@ pub fn restore_from_snapshot(
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
-    )
-    .map_err(RestoreFromSnapshotError::Build)
+    )?;
+    if let Some(target) = params.hotplug_requested_size_mib {
+        // The config interrupt must be pending before any restored vCPU can run.
+        vmm.lock()
+            .expect("Poisoned lock")
+            .device_manager
+            .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| {
+                dev.set_restore_target(target)
+            })
+            .map_err(VmmError::from)?
+            .map_err(VmmError::from)?;
+    }
+    Ok(vmm)
 }
 
 /// Error type for [`snapshot_state_from_file`]

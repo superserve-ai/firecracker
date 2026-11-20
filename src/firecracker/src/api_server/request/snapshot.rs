@@ -170,6 +170,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         mem_backend,
         track_dirty_pages,
         resume_vm: snapshot_config.resume_vm,
+        hotplug_requested_size_mib: snapshot_config.hotplug_requested_size_mib,
         network_overrides: snapshot_config.network_overrides,
         block_delta_dir: snapshot_config.block_delta_dir,
         clock_realtime: snapshot_config.clock_realtime,
@@ -372,6 +373,7 @@ mod tests {
             },
             track_dirty_pages: false,
             resume_vm: false,
+            hotplug_requested_size_mib: None,
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
@@ -415,6 +417,7 @@ mod tests {
             },
             track_dirty_pages: true,
             resume_vm: false,
+            hotplug_requested_size_mib: None,
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
@@ -438,7 +441,8 @@ mod tests {
                 "backend_path": "bar",
                 "backend_type": "Uffd"
             },
-            "resume_vm": true
+            "resume_vm": true,
+            "hotplug_requested_size_mib": 0
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
@@ -458,6 +462,7 @@ mod tests {
             },
             track_dirty_pages: false,
             resume_vm: true,
+            hotplug_requested_size_mib: Some(0),
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,
@@ -507,6 +512,7 @@ mod tests {
             },
             track_dirty_pages: false,
             resume_vm: true,
+            hotplug_requested_size_mib: None,
             network_overrides: vec![NetworkOverride {
                 iface_id: String::from("eth0"),
                 host_dev_name: String::from("vmtap2"),
@@ -550,6 +556,7 @@ mod tests {
             },
             track_dirty_pages: false,
             resume_vm: true,
+            hotplug_requested_size_mib: None,
             network_overrides: vec![],
             block_delta_dir: None,
             clock_realtime: None,

@@ -102,6 +102,8 @@ pub struct LoadSnapshotParams {
     /// When set to true, the vm is also resumed if the snapshot load
     /// is successful.
     pub resume_vm: bool,
+    /// Requested size of the virtio-mem region in MiB, excluding boot memory.
+    pub hotplug_requested_size_mib: Option<u32>,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
     /// Optional directory containing block device delta files for cloning.
@@ -147,6 +149,8 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to resume the vm post snapshot load.
     #[serde(default)]
     pub resume_vm: bool,
+    /// Requested size of the virtio-mem region in MiB, excluding boot memory.
+    pub hotplug_requested_size_mib: Option<u32>,
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
