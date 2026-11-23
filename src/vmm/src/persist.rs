@@ -36,7 +36,9 @@ use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::vm::DiffDump;
 use crate::vstate::memory::{
@@ -322,6 +324,14 @@ pub fn create_snapshot(
         let started = std::time::Instant::now();
         (vmm.vm.resident_pages(), started.elapsed())
     });
+    // Pages the balloon gave back read as zeros until the guest writes them, so the ones
+    // still zero are holed rather than written. A diff keeps them where it keeps fresh
+    // blocks: a hole could be misread, or an untracked write would not be dumped over it.
+    let discarded = match params.snapshot_type {
+        SnapshotType::Diff if untrusted_merge || !tracked => Vec::new(),
+        _ => vmm.vm.guest_memory().discarded_ranges(),
+    };
+    let discarded_file = file_ranges(&microvm_state.vm_state.memory, &discarded);
     // An untrusted merge writes every plugged block, as a hole there may read an earlier
     // layer's contents, so no zero page may be left out.
     let dumped = vmm.vm.snapshot_memory_to_file(
@@ -329,6 +339,8 @@ pub fn create_snapshot(
         params.snapshot_type,
         &zero_ranges,
         !untrusted_merge,
+        &discarded,
+        &discarded_file,
     );
     // A failed dump may already have consumed the dirty bits, so a later punch could erase
     // guest writes: hand the fresh blocks back to the dirty bitmap, which dumps their contents.
@@ -341,6 +353,9 @@ pub fn create_snapshot(
             .with_virtio_device(VIRTIO_MEM_DEV_ID, |dev: &mut VirtioMem| dev.clear_fresh());
     }
     let diff_dump = dumped?;
+    // Even when this dump did not hole them: a page it wrote has lost the dirty bit that
+    // would keep a later dump from holing it.
+    vmm.vm.guest_memory().clear_discarded();
     if let Some((pages, scan)) = resident {
         record_resident(pages, scan, &params.mem_file_path, page_size);
     }

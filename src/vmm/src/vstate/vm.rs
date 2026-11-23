@@ -518,12 +518,17 @@ impl Vm {
     /// them as dumped, and writes the dirty pages among them over the holes.
     /// `zero_skip` lets the first dump leave out all-zero pages of zero-base sub-slots, which
     /// read as zero holes of the snapshot they were restored from.
+    /// `discarded` are the guest ranges the balloon gave back, sorted, and `discarded_file`
+    /// the same ranges in the memory file: either dump holes them and writes only the pages
+    /// the guest has made non-zero since, and a diff reports them as dumped.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
         zero_ranges: &[(u64, u64)],
         zero_skip: bool,
+        discarded: &[(u64, u64)],
+        discarded_file: &[(u64, u64)],
     ) -> Result<Option<DiffDump>, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -573,20 +578,17 @@ impl Vm {
             SnapshotType::Diff => {
                 // A file created above is already sparse; only a merge can hold old contents.
                 if merged {
-                    for &(offset, len) in zero_ranges {
-                        if punch_hole(&file, offset, len).is_err() {
-                            // Filesystems without hole punching get the zeros written.
-                            write_zeros(&mut file, offset, len)
-                                .map_err(|err| MemoryBackingFile("write_zeros", err))?;
-                        }
-                    }
+                    hole_ranges(&mut file, zero_ranges.iter().chain(discarded_file))?;
                 }
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                let mut dumped_pages =
-                    self.guest_memory()
-                        .dump_dirty(&mut file, &dirty_bitmap, zero_skip)?;
+                let mut dumped_pages = self.guest_memory().dump_dirty(
+                    &mut file,
+                    &dirty_bitmap,
+                    zero_skip,
+                    discarded,
+                )?;
                 let page_size = host_page_size() as u64;
-                for &(offset, len) in zero_ranges {
+                for &(offset, len) in zero_ranges.iter().chain(discarded_file) {
                     for page in offset / page_size..(offset + len) / page_size {
                         let page = u64_to_usize(page);
                         if let Some(word) = dumped_pages.get_mut(page >> 6) {
@@ -600,7 +602,10 @@ impl Vm {
                 })
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
+                if merged {
+                    hole_ranges(&mut file, discarded_file.iter())?;
+                }
+                self.guest_memory().dump(&mut file, discarded)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
                 None
@@ -825,6 +830,21 @@ impl DeviceRelocation for Vm {
     ) -> Result<(), DeviceRelocationError> {
         Err(DeviceRelocationError::NotSupported)
     }
+}
+
+/// Makes the memory file `(offset, len)` ranges read as zeros.
+fn hole_ranges<'a>(
+    file: &mut std::fs::File,
+    ranges: impl Iterator<Item = &'a (u64, u64)>,
+) -> Result<(), CreateSnapshotError> {
+    for &(offset, len) in ranges {
+        if punch_hole(file, offset, len).is_err() {
+            // Filesystems without hole punching get the zeros written.
+            write_zeros(file, offset, len)
+                .map_err(|err| CreateSnapshotError::MemoryBackingFile("write_zeros", err))?;
+        }
+    }
+    Ok(())
 }
 
 fn write_zeros(file: &mut std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
@@ -1109,6 +1129,78 @@ pub(crate) mod tests {
                     )
                 });
             }
+        }
+    }
+
+    #[test]
+    fn test_snapshot_holes_discarded_pages_the_guest_left_zero() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vmm_config::machine_config::HugePageConfig;
+        use crate::vstate::memory::{Bytes, GuestMemoryExtension, anonymous};
+
+        let ps = host_page_size();
+        let size = mib_to_bytes(1);
+        let page = |i: usize| GuestAddress((i * ps) as u64);
+        for snapshot_type in [SnapshotType::Diff, SnapshotType::Full] {
+            let (_kvm, mut vm) = setup_vm();
+            let regions = anonymous(
+                [(GuestAddress(0), size)].into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap();
+            vm.register_dram_memory_regions(regions).unwrap();
+            let mem = vm.guest_memory();
+
+            // An earlier image of the same size, so both dumps write into its contents.
+            let tmp = TempFile::new().unwrap();
+            tmp.as_file().write_all(&vec![0xaa; size]).unwrap();
+            tmp.as_file().sync_all().unwrap();
+
+            // Pages 1-3 are given back after being written: page 1 is left alone, page 2 is
+            // written again, page 3 is written again with zeros.
+            for i in 0..4 {
+                mem.write(&vec![1u8; ps], page(i)).unwrap();
+            }
+            mem.discard_free_range(page(1), ps * 3).unwrap();
+            mem.write(&vec![2u8; ps], page(2)).unwrap();
+            mem.write(&vec![0u8; ps], page(3)).unwrap();
+            let discarded = mem.discarded_ranges();
+
+            let dump = vm
+                .snapshot_memory_to_file(
+                    tmp.as_path(),
+                    snapshot_type,
+                    &[],
+                    false,
+                    &discarded,
+                    &discarded,
+                )
+                .unwrap();
+            if let Some(dump) = dump {
+                // Holed pages count as written, so a layered restore reads them as zeros.
+                assert!(dump.merged);
+                assert_eq!(dump.dumped_pages[0] & 0b1111, 0b1111);
+            }
+
+            let mut file = tmp.as_file();
+            let mut back = vec![0u8; size];
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_exact(&mut back).unwrap();
+            let pages: Vec<&[u8]> = back.chunks(ps).collect();
+            assert!(pages[0].iter().all(|&b| b == 1));
+            assert!(pages[1].iter().all(|&b| b == 0));
+            assert!(pages[2].iter().all(|&b| b == 2));
+            assert!(pages[3].iter().all(|&b| b == 0));
+            // A diff leaves the rest of the earlier image; a full image writes zeros.
+            let rest = if snapshot_type == SnapshotType::Diff { 0xaa } else { 0 };
+            assert!(pages[4..].iter().all(|p| p.iter().all(|&b| b == rest)));
+            // Pages 1 and 3 are holes.
+            assert_eq!(file.metadata().unwrap().blocks() * 512, (size - 2 * ps) as u64);
         }
     }
 
