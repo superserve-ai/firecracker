@@ -34,9 +34,9 @@ use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemorySlot,
-    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, GuestRegionType, KvmSubSlot,
-    MemoryError, split_logged, unlogged_ranges,
+    GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemorySlot, GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, GuestRegionType,
+    KvmSubSlot, MemoryError, split_logged, unlogged_ranges,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -530,6 +530,34 @@ impl Vm {
         discarded: &[(u64, u64)],
         discarded_file: &[(u64, u64)],
     ) -> Result<Option<DiffDump>, CreateSnapshotError> {
+        let saved = self.write_memory_file(
+            mem_file_path,
+            snapshot_type,
+            zero_ranges,
+            zero_skip,
+            discarded,
+            discarded_file,
+        );
+        if saved.is_err() {
+            // The save may have holed the balloon's pages and spent the dirty bits of those
+            // rewritten since, and the record outlives it: the next dump must write them.
+            for (addr, len) in self.guest_memory().discarded_ranges() {
+                self.guest_memory()
+                    .mark_dirty(GuestAddress(addr), u64_to_usize(len));
+            }
+        }
+        saved
+    }
+
+    fn write_memory_file(
+        &self,
+        mem_file_path: &Path,
+        snapshot_type: SnapshotType,
+        zero_ranges: &[(u64, u64)],
+        zero_skip: bool,
+        discarded: &[(u64, u64)],
+        discarded_file: &[(u64, u64)],
+    ) -> Result<Option<DiffDump>, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
         // Need to check this here, as we create the file in the line below
@@ -612,6 +640,10 @@ impl Vm {
             }
         };
 
+        #[cfg(test)]
+        if tests::FAIL_AFTER_DUMP.replace(false) {
+            return Err(MemoryBackingFile("flush", std::io::Error::other("injected")));
+        }
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
@@ -1202,6 +1234,58 @@ pub(crate) mod tests {
             // Pages 1 and 3 are holes.
             assert_eq!(file.metadata().unwrap().blocks() * 512, (size - 2 * ps) as u64);
         }
+    }
+
+    thread_local! {
+        /// Fails this thread's next memory save after its dump, as a failed flush would.
+        pub(super) static FAIL_AFTER_DUMP: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn test_failed_diff_save_keeps_discarded_pages_rewritten_since() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vmm_config::machine_config::HugePageConfig;
+        use crate::vstate::memory::{Bytes, GuestMemoryExtension, anonymous};
+
+        let ps = host_page_size();
+        let size = mib_to_bytes(1);
+        let (_kvm, mut vm) = setup_vm();
+        let regions = anonymous(
+            [(GuestAddress(0), size)].into_iter(),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+        let mem = vm.guest_memory();
+        let tmp = TempFile::new().unwrap();
+        tmp.as_file().set_len(size as u64).unwrap();
+
+        // Page 1 is given back, then written again.
+        mem.discard_free_range(GuestAddress(ps as u64), ps).unwrap();
+        mem.write(&vec![2u8; ps], GuestAddress(ps as u64)).unwrap();
+        let save = || {
+            let discarded = mem.discarded_ranges();
+            vm.snapshot_memory_to_file(
+                tmp.as_path(),
+                SnapshotType::Diff,
+                &[],
+                false,
+                &discarded,
+                &discarded,
+            )
+        };
+
+        // The dump spends the dirty bits, then the save fails; the retry holes page 1 again.
+        FAIL_AFTER_DUMP.set(true);
+        save().unwrap_err();
+        save().unwrap();
+
+        let mut back = vec![0u8; ps];
+        std::os::unix::fs::FileExt::read_exact_at(tmp.as_file(), &mut back, ps as u64).unwrap();
+        assert_eq!(back, vec![2u8; ps]);
     }
 
     #[test]
