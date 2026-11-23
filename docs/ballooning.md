@@ -346,6 +346,12 @@ comes with trade-offs between performance and memory reclaimed; a good target to
 maximise memory reclaim is to have the reported ranges match the backing page
 size.
 
+A build advertising `balloon-free-page-snapshot` in `GET /version` can store
+reported pages as holes in its memory snapshot. Firecracker checks each
+candidate while the guest is paused and saves its current bytes if the guest
+reused it. The memory file keeps its logical length. Use its allocated blocks
+to measure disk usage.
+
 ## Virtio balloon free page hinting
 
 Free page hinting is a

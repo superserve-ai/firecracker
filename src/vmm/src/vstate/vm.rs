@@ -28,13 +28,13 @@ pub use crate::arch::{ArchVm as Vm, ArchVmError, VmState};
 use crate::arch::{GSI_MSI_END, host_page_size};
 use crate::logger::info;
 use crate::pci::{DeviceRelocation, DeviceRelocationError, PciDevice};
-use crate::persist::CreateSnapshotError;
+use crate::persist::{CreateSnapshotError, file_ranges};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::memory::{
-    GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
     GuestMemorySlot, GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, GuestRegionType,
     KvmSubSlot, MemoryError, split_logged, unlogged_ranges,
 };
@@ -518,45 +518,16 @@ impl Vm {
     /// them as dumped, and writes the dirty pages among them over the holes.
     /// `zero_skip` lets the first dump leave out all-zero pages of zero-base sub-slots, which
     /// read as zero holes of the snapshot they were restored from.
-    /// `discarded` are the guest ranges the balloon gave back, sorted, and `discarded_file`
-    /// the same ranges in the memory file: either dump holes them and writes only the pages
-    /// the guest has made non-zero since, and a diff reports them as dumped.
+    /// When `untrusted_merge` is set, an existing same-size balloon image has no reliable
+    /// presence map. Write a full image so an old zero hole cannot inherit base data.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
         zero_ranges: &[(u64, u64)],
         zero_skip: bool,
-        discarded: &[(u64, u64)],
-        discarded_file: &[(u64, u64)],
-    ) -> Result<Option<DiffDump>, CreateSnapshotError> {
-        let saved = self.write_memory_file(
-            mem_file_path,
-            snapshot_type,
-            zero_ranges,
-            zero_skip,
-            discarded,
-            discarded_file,
-        );
-        if saved.is_err() {
-            // The save may have holed the balloon's pages and spent the dirty bits of those
-            // rewritten since, and the record outlives it: the next dump must write them.
-            for (addr, len) in self.guest_memory().discarded_ranges() {
-                self.guest_memory()
-                    .mark_dirty(GuestAddress(addr), u64_to_usize(len));
-            }
-        }
-        saved
-    }
-
-    fn write_memory_file(
-        &self,
-        mem_file_path: &Path,
-        snapshot_type: SnapshotType,
-        zero_ranges: &[(u64, u64)],
-        zero_skip: bool,
-        discarded: &[(u64, u64)],
-        discarded_file: &[(u64, u64)],
+        balloon_layout: Option<&GuestMemoryState>,
+        untrusted_merge: bool,
     ) -> Result<Option<DiffDump>, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -602,21 +573,31 @@ impl Vm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
+        let snapshot_type = if merged && untrusted_merge && balloon_layout.is_some() {
+            SnapshotType::Full
+        } else {
+            snapshot_type
+        };
+        let (discarded, discarded_file) = balloon_layout.map_or_else(Default::default, |layout| {
+            let guest = self.guest_memory().discarded_ranges(snapshot_type);
+            let file = file_ranges(layout, &guest);
+            (guest, file)
+        });
         let diff_dump = match snapshot_type {
             SnapshotType::Diff => {
                 // A file created above is already sparse; only a merge can hold old contents.
                 if merged {
-                    hole_ranges(&mut file, zero_ranges.iter().chain(discarded_file))?;
+                    hole_ranges(&mut file, zero_ranges.iter().chain(&discarded_file))?;
                 }
                 let dirty_bitmap = self.get_dirty_bitmap()?;
                 let mut dumped_pages = self.guest_memory().dump_dirty(
                     &mut file,
                     &dirty_bitmap,
                     zero_skip,
-                    discarded,
+                    &discarded,
                 )?;
                 let page_size = host_page_size() as u64;
-                for &(offset, len) in zero_ranges.iter().chain(discarded_file) {
+                for &(offset, len) in zero_ranges.iter().chain(&discarded_file) {
                     for page in offset / page_size..(offset + len) / page_size {
                         let page = u64_to_usize(page);
                         if let Some(word) = dumped_pages.get_mut(page >> 6) {
@@ -633,7 +614,7 @@ impl Vm {
                 if merged {
                     hole_ranges(&mut file, discarded_file.iter())?;
                 }
-                self.guest_memory().dump(&mut file, discarded)?;
+                self.guest_memory().dump(&mut file, &discarded)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
                 None
@@ -1201,7 +1182,6 @@ pub(crate) mod tests {
             mem.discard_free_range(page(1), ps * 3).unwrap();
             mem.write(&vec![2u8; ps], page(2)).unwrap();
             mem.write(&vec![0u8; ps], page(3)).unwrap();
-            let discarded = mem.discarded_ranges();
 
             let dump = vm
                 .snapshot_memory_to_file(
@@ -1209,8 +1189,8 @@ pub(crate) mod tests {
                     snapshot_type,
                     &[],
                     false,
-                    &discarded,
-                    &discarded,
+                    Some(&mem.describe()),
+                    false,
                 )
                 .unwrap();
             if let Some(dump) = dump {
@@ -1234,6 +1214,49 @@ pub(crate) mod tests {
             // Pages 1 and 3 are holes.
             assert_eq!(file.metadata().unwrap().blocks() * 512, (size - 2 * ps) as u64);
         }
+    }
+
+    #[test]
+    fn untrusted_balloon_merge_rebuilds_old_zero_holes_and_inherited_pages() {
+        use std::os::unix::fs::FileExt;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vmm_config::machine_config::HugePageConfig;
+        use crate::vstate::memory::{Bytes, anonymous};
+
+        let (_kvm, mut vm) = setup_vm();
+        let size = mib_to_bytes(1);
+        let ps = host_page_size();
+        let regions = anonymous(
+            [(GuestAddress(0), size)].into_iter(),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+        let mem = vm.guest_memory();
+        // The target lost its presence map. Page 0 was an authoritative zero in the
+        // overlay, while page 1 was inherited. Neither has been dirtied since restore.
+        let target = TempFile::new().unwrap();
+        target.as_file().set_len(size as u64).unwrap();
+        mem.write(&vec![0x5a; ps], GuestAddress(ps as u64)).unwrap();
+        mem.reset_dirty();
+        let diff = vm
+            .snapshot_memory_to_file(
+                target.as_path(),
+                SnapshotType::Diff,
+                &[],
+                false,
+                Some(&mem.describe()),
+                true,
+            )
+            .unwrap();
+        assert!(diff.is_none()); // derive_presence marks the entire image authoritative.
+        let mut data = vec![0; 2 * ps];
+        target.as_file().read_exact_at(&mut data, 0).unwrap();
+        assert!(data[..ps].iter().all(|&byte| byte == 0));
+        assert!(data[ps..].iter().all(|&byte| byte == 0x5a));
     }
 
     thread_local! {
@@ -1267,14 +1290,13 @@ pub(crate) mod tests {
         mem.discard_free_range(GuestAddress(ps as u64), ps).unwrap();
         mem.write(&vec![2u8; ps], GuestAddress(ps as u64)).unwrap();
         let save = || {
-            let discarded = mem.discarded_ranges();
             vm.snapshot_memory_to_file(
                 tmp.as_path(),
                 SnapshotType::Diff,
                 &[],
                 false,
-                &discarded,
-                &discarded,
+                Some(&mem.describe()),
+                false,
             )
         };
 

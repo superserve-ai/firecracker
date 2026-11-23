@@ -24,6 +24,49 @@ use vmm::seccomp::BpfProgramRef;
 use vmm::vmm_config::snapshot::SnapshotType;
 use vmm_sys_util::eventfd::EventFd;
 
+/// Build capabilities advertised by `GET /version` and `--version`.
+/// serial-console-cap: the serial device bounds guest console output per boot, so a supervisor may route it to a plain file safely.
+/// clock-realtime-flag: `LoadSnapshot` accepts `clock_realtime`, so a
+/// supervisor may choose whether a restore advances the guest clock.
+/// dirty-tracking-session: `LoadSnapshot` accepts `tracking_session_id` and
+/// `CreateSnapshot` accepts `expected_session_id`/`expected_generation`. Both
+/// bodies deny unknown fields, so a supervisor must probe for this before
+/// sending them.
+/// eager-overlay: `LoadSnapshot` accepts `mem_backend.eager_overlay`, under the
+/// same deny-unknown-fields rule.
+/// skip-zero-holes: `LoadSnapshot` accepts `mem_backend.skip_zero_holes`, likewise.
+/// memory-hotplug: virtio-mem memory the guest has unplugged is not saved as present
+/// in a snapshot, and a block the guest plugs again after any restore is discarded
+/// (or zeroed, where discard is unsupported) rather than exposing what the snapshot
+/// held there; an external UFFD handler sees the discard as a remove event, as for
+/// the balloon. A supervisor may therefore enable hotplug on VMs it snapshots.
+/// snapshot-load-memory-target: `LoadSnapshot` accepts `hotplug_requested_size_mib`.
+/// uffd-stats: `GET /uffd/stats` returns the internal UFFD handler's counters.
+/// fault-around: `LoadSnapshot` accepts `mem_backend.fault_around_kib`, under the
+/// deny-unknown-fields rule.
+/// resident-prefetch: `CreateSnapshot` accepts `record_resident` and `LoadSnapshot`
+/// accepts `mem_backend.prefetch_resident`, likewise.
+/// transparent-huge-pages: `PUT /machine-config` accepts `transparent_huge_pages` and
+/// `LoadSnapshot` accepts `mem_backend.transparent_huge_pages`, likewise.
+/// balloon-free-page-snapshot: snapshots preserve balloon-reported zero pages as sparse
+/// extents, including across incremental snapshots.
+/// hole-huge-pages: `LoadSnapshot` accepts `mem_backend.hole_huge_pages`, likewise.
+pub(crate) const CAPABILITIES: &[&str] = &[
+    "serial-console-cap",
+    "clock-realtime-flag",
+    "dirty-tracking-session",
+    "eager-overlay",
+    "skip-zero-holes",
+    "memory-hotplug",
+    "snapshot-load-memory-target",
+    "uffd-stats",
+    "fault-around",
+    "resident-prefetch",
+    "transparent-huge-pages",
+    "hole-huge-pages",
+    "balloon-free-page-snapshot",
+];
+
 /// Structure associated with the API server implementation.
 #[derive(Debug)]
 pub struct ApiServer {

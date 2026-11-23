@@ -27,6 +27,7 @@ use vmm_sys_util::errno;
 use crate::arch::host_page_size;
 use crate::utils::{get_page_size, u64_to_usize};
 use crate::vmm_config::machine_config::HugePageConfig;
+use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::vm::VmError;
 use crate::{DirtyBitmap, Vm};
 
@@ -106,9 +107,16 @@ pub struct GuestRegionMmapExt {
     /// KVM slots backing parts of this region's slots, offsets relative to the region.
     /// A slot with none here is one KVM slot, logged when the region tracks dirty pages.
     pub(crate) sub_slots: Vec<KvmSubSlot>,
-    /// Pages the guest gave back through the balloon since the last snapshot, one bit per
-    /// host page; `None` until the first.
-    pub(crate) discarded: Mutex<Option<BitVec>>,
+    /// Allocated only after the balloon's first discard.
+    discarded: Mutex<Option<BalloonDiscards>>,
+}
+
+#[derive(Debug)]
+struct BalloonDiscards {
+    /// A full image can omit a previously reported page if it still reads zero.
+    all: BitVec,
+    /// A diff must override the previous image for every newly reported page.
+    pending: Option<BitVec>,
 }
 
 /// A KVM memory slot backing part of a [`GuestMemorySlot`].
@@ -170,19 +178,6 @@ impl<'a> GuestMemorySlot<'a> {
         self.zero_page(offset, page_size)
     }
 
-    /// Whether the page at `offset` lies in one of the sorted guest `discarded` ranges and
-    /// still reads all zero.
-    fn discarded_zero_page(
-        &self,
-        discarded: &[(u64, u64)],
-        offset: usize,
-        page_size: usize,
-    ) -> bool {
-        !discarded.is_empty()
-            && in_ranges(discarded, self.guest_addr.raw_value() + offset as u64)
-            && self.zero_page(offset, page_size)
-    }
-
     fn zero_page(&self, offset: usize, page_size: usize) -> bool {
         // SAFETY: the page is within the slice, page aligned, and the VM is paused.
         let words = unsafe {
@@ -218,11 +213,12 @@ impl<'a> GuestMemorySlot<'a> {
             *done = run.1;
             Ok::<(), MemoryError>(())
         };
-        for &(addr, len) in discarded {
-            let (s, e) = (addr.max(base), (addr + len).min(end));
-            if s >= e {
-                continue;
+        let first = discarded.partition_point(|&(addr, len)| addr + len <= base);
+        for &(addr, len) in &discarded[first..] {
+            if addr >= end {
+                break;
             }
+            let (s, e) = (addr.max(base), (addr + len).min(end));
             for off in (u64_to_usize(s - base)..u64_to_usize(e - base)).step_by(page_size) {
                 if !self.zero_page(off, page_size) {
                     continue;
@@ -298,10 +294,17 @@ impl<'a> GuestMemorySlot<'a> {
                     break;
                 }
 
-                if (is_kvm_page_dirty || is_firecracker_page_dirty)
-                    && !(zero_skip && self.hole_zero_page(page_offset, page_size))
-                    && !self.discarded_zero_page(discarded, page_offset, page_size)
+                // Balloon discards need not set a dirty bit. After the caller punches the
+                // candidate, its current contents are authoritative even for unlogged slots.
+                let write_page = if !discarded.is_empty()
+                    && in_ranges(discarded, self.guest_addr.raw_value() + page_offset as u64)
                 {
+                    !self.zero_page(page_offset, page_size)
+                } else {
+                    (is_kvm_page_dirty || is_firecracker_page_dirty)
+                        && !(zero_skip && self.hole_zero_page(page_offset, page_size))
+                };
+                if write_page {
                     let file_page = base_page + (i * 64) + j;
                     dumped_pages[file_page >> 6] |= 1u64 << (file_page & 63);
                     // We are at the start of a new batch of dirty pages.
@@ -566,11 +569,16 @@ impl GuestRegionMmapExt {
     fn record_discarded(&self, caddr: MemoryRegionAddress, len: usize) {
         let page_size = host_page_size();
         let first = u64_to_usize(caddr.raw_value()) / page_size;
-        let mut discarded = self.discarded.lock().unwrap();
-        discarded
-            .get_or_insert_with(|| BitVec::repeat(false, u64_to_usize(self.len()) / page_size))
-            [first..first + len / page_size]
-            .fill(true);
+        let npages = u64_to_usize(self.len()) / page_size;
+        let pages = first..first + len / page_size;
+        let mut guard = self.discarded.lock().unwrap();
+        let discarded = guard.get_or_insert_with(|| BalloonDiscards {
+            all: BitVec::repeat(false, npages),
+            pending: None,
+        });
+        discarded.all[pages.clone()].fill(true);
+        let pending = discarded.pending.get_or_insert_with(|| BitVec::repeat(false, npages));
+        pending[pages].fill(true);
     }
 
     pub(crate) fn discard_range(
@@ -978,10 +986,10 @@ where
     ) -> Result<(), GuestMemoryError>;
 
     /// The guest `(addr, len)` ranges recorded by [`Self::discard_free_range`], sorted.
-    fn discarded_ranges(&self) -> Vec<(u64, u64)>;
+    fn discarded_ranges(&self, snapshot_type: SnapshotType) -> Vec<(u64, u64)>;
 
-    /// Forgets the recorded ranges once a snapshot has dumped memory.
-    fn clear_discarded(&self);
+    /// Starts a new interval for incremental snapshots.
+    fn clear_pending_discards(&self);
 }
 
 /// Whether guest `addr` lies in one of the sorted, disjoint `ranges`.
@@ -1208,12 +1216,15 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         })
     }
 
-    fn discarded_ranges(&self) -> Vec<(u64, u64)> {
+    fn discarded_ranges(&self, snapshot_type: SnapshotType) -> Vec<(u64, u64)> {
         let page_size = host_page_size() as u64;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for region in self.iter() {
             let discarded = region.discarded.lock().unwrap();
-            let Some(bits) = discarded.as_ref() else {
+            let Some(bits) = discarded.as_ref().and_then(|d| match snapshot_type {
+                SnapshotType::Full => Some(&d.all),
+                SnapshotType::Diff => d.pending.as_ref(),
+            }) else {
                 continue;
             };
             let base = region.start_addr().raw_value();
@@ -1228,9 +1239,11 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         ranges
     }
 
-    fn clear_discarded(&self) {
+    fn clear_pending_discards(&self) {
         for region in self.iter() {
-            *region.discarded.lock().unwrap() = None;
+            if let Some(d) = region.discarded.lock().unwrap().as_mut() {
+                d.pending = None;
+            }
         }
     }
 }
@@ -1540,7 +1553,7 @@ mod tests {
             .unwrap();
         guest_memory.write(&fill(2), page(2)).unwrap();
         guest_memory.write(&fill(0), page(3)).unwrap();
-        let discarded = guest_memory.discarded_ranges();
+        let discarded = guest_memory.discarded_ranges(SnapshotType::Diff);
         assert_eq!(discarded, vec![(page_size as u64, page_size as u64 * 3)]);
 
         let read = |file: &mut File, i: usize| {
@@ -1556,8 +1569,9 @@ mod tests {
         guest_memory.dump(&mut full, &discarded).unwrap();
         assert_eq!(full.stream_position().unwrap(), page_size as u64 * 4);
 
-        // Every page is dirty: only the discarded ones still zero are left out.
-        let bitmap = HashMap::from([(0, vec![0b1111])]);
+        // Only page 0 has a dirty bit. The rewritten page 2 must still override the base.
+        guest_memory.reset_dirty();
+        let bitmap = HashMap::from([(0, vec![0b0001])]);
         let mut diff = TempFile::new().unwrap().into_file();
         diff.set_len(page_size as u64 * 4).unwrap();
         let dumped = guest_memory
@@ -1573,8 +1587,9 @@ mod tests {
             assert_eq!(file.metadata().unwrap().blocks() * 512, page_size as u64 * 2);
         }
 
-        guest_memory.clear_discarded();
-        assert!(guest_memory.discarded_ranges().is_empty());
+        guest_memory.clear_pending_discards();
+        assert!(guest_memory.discarded_ranges(SnapshotType::Diff).is_empty());
+        assert_eq!(guest_memory.discarded_ranges(SnapshotType::Full), discarded);
     }
 
     #[test]
