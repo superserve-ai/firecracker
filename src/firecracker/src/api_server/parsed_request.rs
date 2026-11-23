@@ -198,7 +198,10 @@ impl ParsedRequest {
                 }
                 VmmData::InstanceInformation(info) => Self::success_response_with_data(info),
                 VmmData::VmmVersion(version) => Self::success_response_with_data(
-                    &serde_json::json!({ "firecracker_version": version.as_str() }),
+                    &serde_json::json!({
+                        "firecracker_version": version.as_str(),
+                        "capabilities": crate::api_server::CAPABILITIES,
+                    }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
             },
@@ -633,7 +636,11 @@ pub mod tests {
                     http_response(&serde_json::to_string(info).unwrap(), 200)
                 }
                 VmmData::VmmVersion(version) => http_response(
-                    &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
+                    &serde_json::json!({
+                        "firecracker_version": version.as_str(),
+                        "capabilities": crate::api_server::CAPABILITIES,
+                    })
+                    .to_string(),
                     200,
                 ),
             };

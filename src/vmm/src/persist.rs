@@ -36,7 +36,9 @@ use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::vm::DiffDump;
 use crate::vstate::memory::{
@@ -261,16 +263,14 @@ pub fn create_snapshot(
     // save leaves a 0-byte sentinel rather than a fresh memory file next to a
     // stale bitmap (same discipline as the vmstate `.overlay` side-car above).
     let page_size = crate::arch::host_page_size();
-    let prior_presence = match std::fs::metadata(&params.mem_file_path) {
-        Ok(md) => {
-            let npages = u64_to_usize(md.len().div_ceil(page_size as u64));
-            crate::uffd_internal::read_presence_sidecar(&params.mem_file_path, page_size, npages)
-                .ok()
-                .flatten()
-                .map(|pm| pm.bits)
-        }
-        Err(_) => None,
-    };
+    let memory_file = std::fs::metadata(&params.mem_file_path).ok();
+    let prior_presence = memory_file.as_ref().and_then(|md| {
+        let npages = u64_to_usize(md.len().div_ceil(page_size as u64));
+        crate::uffd_internal::read_presence_sidecar(&params.mem_file_path, page_size, npages)
+            .ok()
+            .flatten()
+            .map(|pm| pm.bits)
+    });
     crate::uffd_internal::write_file_durable(
         &crate::uffd_internal::presence_sidecar_path(&params.mem_file_path),
         &[],
@@ -290,7 +290,7 @@ pub fn create_snapshot(
         })
         .unwrap_or_default();
     let untrusted_merge =
-        vmm.uffd_handler.is_some() && prior_presence.is_none() && params.mem_file_path.exists();
+        vmm.uffd_handler.is_some() && prior_presence.is_none() && memory_file.is_some();
     let tracked = vmm
         .vm
         .guest_memory()
@@ -322,13 +322,19 @@ pub fn create_snapshot(
         let started = std::time::Instant::now();
         (vmm.vm.resident_pages(), started.elapsed())
     });
-    // An untrusted merge writes every plugged block, as a hole there may read an earlier
-    // layer's contents, so no zero page may be left out.
+    // A lost presence bitmap makes an old balloon-created zero hole indistinguishable
+    // from a page inherited from the base. Rebuild an authoritative image, including when
+    // the guest has reported nothing since restore and the old hole is in boot RAM.
+    let devices = &microvm_state.device_states;
+    let has_balloon = devices.mmio_state.balloon_device.is_some()
+        || devices.pci_state.balloon_device.is_some();
     let dumped = vmm.vm.snapshot_memory_to_file(
         &params.mem_file_path,
         params.snapshot_type,
         &zero_ranges,
         !untrusted_merge,
+        has_balloon.then_some(&microvm_state.vm_state.memory),
+        untrusted_merge,
     );
     // A failed dump may already have consumed the dirty bits, so a later punch could erase
     // guest writes: hand the fresh blocks back to the dirty bitmap, which dumps their contents.
@@ -397,6 +403,9 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
 
+    if has_balloon {
+        vmm.vm.guest_memory().clear_pending_discards();
+    }
     Ok(())
 }
 
@@ -550,7 +559,7 @@ fn page_mask_without(
 
 /// Memory file `(offset, len)` ranges (all regions back to back, in dump order) of the
 /// given guest `(addr, len)` ranges.
-fn file_ranges(mem: &GuestMemoryState, guest: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(crate) fn file_ranges(mem: &GuestMemoryState, guest: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut file_off = 0u64;
     for region in &mem.regions {

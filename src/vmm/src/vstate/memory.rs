@@ -27,6 +27,7 @@ use vmm_sys_util::errno;
 use crate::arch::host_page_size;
 use crate::utils::{get_page_size, u64_to_usize};
 use crate::vmm_config::machine_config::HugePageConfig;
+use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::vm::VmError;
 use crate::{DirtyBitmap, Vm};
 
@@ -106,6 +107,16 @@ pub struct GuestRegionMmapExt {
     /// KVM slots backing parts of this region's slots, offsets relative to the region.
     /// A slot with none here is one KVM slot, logged when the region tracks dirty pages.
     pub(crate) sub_slots: Vec<KvmSubSlot>,
+    /// Allocated only after the balloon's first discard.
+    discarded: Mutex<Option<BalloonDiscards>>,
+}
+
+#[derive(Debug)]
+struct BalloonDiscards {
+    /// A full image can omit a previously reported page if it still reads zero.
+    all: BitVec,
+    /// A diff must override the previous image for every newly reported page.
+    pending: Option<BitVec>,
 }
 
 /// A KVM memory slot backing part of a [`GuestMemorySlot`].
@@ -164,6 +175,10 @@ impl<'a> GuestMemorySlot<'a> {
         if self.sub_slots.get(i).is_none_or(|s| !s.zero_base) {
             return false;
         }
+        self.zero_page(offset, page_size)
+    }
+
+    fn zero_page(&self, offset: usize, page_size: usize) -> bool {
         // SAFETY: the page is within the slice, page aligned, and the VM is paused.
         let words = unsafe {
             std::slice::from_raw_parts(
@@ -172,6 +187,59 @@ impl<'a> GuestMemorySlot<'a> {
             )
         };
         words.iter().all(|&w| w == 0)
+    }
+
+    /// Writes the whole slot except the pages of the sorted guest `discarded` ranges that
+    /// still read all zero, which are seeked over.
+    fn dump_skipping_discarded<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        discarded: &[(u64, u64)],
+        page_size: usize,
+    ) -> Result<(), MemoryError> {
+        let base = self.guest_addr.raw_value();
+        let end = base + self.slice.len() as u64;
+        // `done` is how much of the slot the writer has passed; `zeros` a pending run.
+        let mut done = 0;
+        let mut zeros: Option<(usize, usize)> = None;
+        let flush = |writer: &mut T, run: (usize, usize), done: &mut usize| {
+            if run.0 > *done {
+                writer.write_all_volatile(&self.slice.subslice(*done, run.0 - *done)?)?;
+            }
+            let skip = i64::try_from(run.1 - run.0).map_err(|_| MemoryError::SlotSizeTooLarge)?;
+            writer
+                .seek(SeekFrom::Current(skip))
+                .map_err(MemoryError::SeekError)?;
+            *done = run.1;
+            Ok::<(), MemoryError>(())
+        };
+        let first = discarded.partition_point(|&(addr, len)| addr + len <= base);
+        for &(addr, len) in &discarded[first..] {
+            if addr >= end {
+                break;
+            }
+            let (s, e) = (addr.max(base), (addr + len).min(end));
+            for off in (u64_to_usize(s - base)..u64_to_usize(e - base)).step_by(page_size) {
+                if !self.zero_page(off, page_size) {
+                    continue;
+                }
+                zeros = match zeros {
+                    Some((a, b)) if b == off => Some((a, off + page_size)),
+                    Some(run) => {
+                        flush(writer, run, &mut done)?;
+                        Some((off, off + page_size))
+                    }
+                    None => Some((off, off + page_size)),
+                };
+            }
+        }
+        if let Some(run) = zeros {
+            flush(writer, run, &mut done)?;
+        }
+        if self.slice.len() > done {
+            writer.write_all_volatile(&self.slice.subslice(done, self.slice.len() - done)?)?;
+        }
+        Ok(())
     }
 
     /// Dumps the dirty pages in this slot onto the writer.
@@ -183,7 +251,9 @@ impl<'a> GuestMemorySlot<'a> {
     /// two can't drift).
     ///
     /// With `zero_skip`, an all-zero page in a zero-base sub-slot is neither written nor
-    /// recorded: it still reads as the zero hole it was restored from.
+    /// recorded: it still reads as the zero hole it was restored from. An all-zero page of
+    /// the guest `discarded` ranges is not written either; the caller has holed those.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
@@ -192,6 +262,7 @@ impl<'a> GuestMemorySlot<'a> {
         base_page: usize,
         dumped_pages: &mut [u64],
         zero_skip: bool,
+        discarded: &[(u64, u64)],
     ) -> Result<(), MemoryError> {
         let firecracker_bitmap = self.slice.bitmap();
         let mut write_size = 0;
@@ -223,9 +294,17 @@ impl<'a> GuestMemorySlot<'a> {
                     break;
                 }
 
-                if (is_kvm_page_dirty || is_firecracker_page_dirty)
-                    && !(zero_skip && self.hole_zero_page(page_offset, page_size))
+                // Balloon discards need not set a dirty bit. After the caller punches the
+                // candidate, its current contents are authoritative even for unlogged slots.
+                let write_page = if !discarded.is_empty()
+                    && in_ranges(discarded, self.guest_addr.raw_value() + page_offset as u64)
                 {
+                    !self.zero_page(page_offset, page_size)
+                } else {
+                    (is_kvm_page_dirty || is_firecracker_page_dirty)
+                        && !(zero_skip && self.hole_zero_page(page_offset, page_size))
+                };
+                if write_page {
                     let file_page = base_page + (i * 64) + j;
                     dumped_pages[file_page >> 6] |= 1u64 << (file_page & 63);
                     // We are at the start of a new batch of dirty pages.
@@ -306,6 +385,7 @@ impl GuestRegionMmapExt {
             slot_size,
             plugged: Mutex::new(BitVec::repeat(true, 1)),
             sub_slots: Vec::new(),
+            discarded: Mutex::new(None),
         }
     }
 
@@ -324,6 +404,7 @@ impl GuestRegionMmapExt {
             slot_size,
             plugged: Mutex::new(BitVec::repeat(false, slot_cnt)),
             sub_slots: Vec::new(),
+            discarded: Mutex::new(None),
         }
     }
 
@@ -344,6 +425,7 @@ impl GuestRegionMmapExt {
             slot_from,
             plugged: Mutex::new(BitVec::from_iter(state.plugged.iter())),
             sub_slots: Vec::new(),
+            discarded: Mutex::new(None),
         })
     }
 
@@ -481,6 +563,22 @@ impl GuestRegionMmapExt {
             bitmap_guard.set(idx, false);
         }
         Ok(())
+    }
+
+    /// Records a discarded range, already validated by [`Self::discard_range`].
+    fn record_discarded(&self, caddr: MemoryRegionAddress, len: usize) {
+        let page_size = host_page_size();
+        let first = u64_to_usize(caddr.raw_value()) / page_size;
+        let npages = u64_to_usize(self.len()) / page_size;
+        let pages = first..first + len / page_size;
+        let mut guard = self.discarded.lock().unwrap();
+        let discarded = guard.get_or_insert_with(|| BalloonDiscards {
+            all: BitVec::repeat(false, npages),
+            pending: None,
+        });
+        discarded.all[pages.clone()].fill(true);
+        let pending = discarded.pending.get_or_insert_with(|| BitVec::repeat(false, npages));
+        pending[pages].fill(true);
     }
 
     pub(crate) fn discard_range(
@@ -838,19 +936,26 @@ where
     /// Mark memory range as dirty
     fn mark_dirty(&self, addr: GuestAddress, len: usize);
 
-    /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
+    /// Dumps all contents of GuestMemoryMmap to a writer, seeking over the all-zero pages
+    /// of the sorted guest `discarded` ranges.
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        discarded: &[(u64, u64)],
+    ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     ///
     /// Returns the exact set of file pages this dump wrote, as a bitmap over
     /// the memory file's pages (one bit per host page, LSB-first per word).
-    /// `zero_skip` leaves out all-zero pages of zero-base sub-slots.
+    /// `zero_skip` leaves out all-zero pages of zero-base sub-slots, and every
+    /// all-zero page of the sorted guest `discarded` ranges is left out too.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
         zero_skip: bool,
+        discarded: &[(u64, u64)],
     ) -> Result<Vec<u64>, MemoryError>;
 
     /// Resets all the memory region bitmaps
@@ -871,6 +976,26 @@ where
 
     /// Discards a memory range, freeing up memory pages
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
+
+    /// Discards a range the guest gave back as free and records it, so a snapshot can
+    /// leave out the pages the guest has not written since.
+    fn discard_free_range(
+        &self,
+        addr: GuestAddress,
+        range_len: usize,
+    ) -> Result<(), GuestMemoryError>;
+
+    /// The guest `(addr, len)` ranges recorded by [`Self::discard_free_range`], sorted.
+    fn discarded_ranges(&self, snapshot_type: SnapshotType) -> Vec<(u64, u64)>;
+
+    /// Starts a new interval for incremental snapshots.
+    fn clear_pending_discards(&self);
+}
+
+/// Whether guest `addr` lies in one of the sorted, disjoint `ranges`.
+fn in_ranges(ranges: &[(u64, u64)], addr: u64) -> bool {
+    let i = ranges.partition_point(|&(s, l)| s + l <= addr);
+    ranges.get(i).is_some_and(|&(s, _)| s <= addr)
 }
 
 /// State of a guest memory region saved to file/buffer.
@@ -929,19 +1054,27 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     }
 
     /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError> {
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        discarded: &[(u64, u64)],
+    ) -> Result<(), MemoryError> {
         self.iter()
             .flat_map(|region| region.slots())
             .try_for_each(|(mem_slot, plugged)| {
                 if !plugged {
                     let ilen = i64::try_from(mem_slot.slice.len()).unwrap();
                     writer.seek(SeekFrom::Current(ilen)).unwrap();
+                } else if discarded.is_empty() {
+                    writer
+                        .write_all_volatile(&mem_slot.slice)
+                        .map_err(|e| MemoryError::WriteMemory(e.into()))?;
                 } else {
-                    writer.write_all_volatile(&mem_slot.slice)?;
+                    let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+                    mem_slot.dump_skipping_discarded(writer, discarded, page_size)?;
                 }
                 Ok(())
             })
-            .map_err(MemoryError::WriteMemory)
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -950,6 +1083,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
         zero_skip: bool,
+        discarded: &[(u64, u64)],
     ) -> Result<Vec<u64>, MemoryError> {
         let page_size = get_page_size().map_err(MemoryError::PageSize)?;
         let total_len: usize = self
@@ -981,6 +1115,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                             file_offset / page_size,
                             &mut dumped_pages,
                             zero_skip,
+                            discarded,
                         )?;
                     }
                     file_offset += mem_slot.slice.len();
@@ -1067,6 +1202,49 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
             region.discard_range(start, len)
         })
+    }
+
+    fn discard_free_range(
+        &self,
+        addr: GuestAddress,
+        range_len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
+            region.discard_range(start, len)?;
+            region.record_discarded(start, len);
+            Ok(())
+        })
+    }
+
+    fn discarded_ranges(&self, snapshot_type: SnapshotType) -> Vec<(u64, u64)> {
+        let page_size = host_page_size() as u64;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for region in self.iter() {
+            let discarded = region.discarded.lock().unwrap();
+            let Some(bits) = discarded.as_ref().and_then(|d| match snapshot_type {
+                SnapshotType::Full => Some(&d.all),
+                SnapshotType::Diff => d.pending.as_ref(),
+            }) else {
+                continue;
+            };
+            let base = region.start_addr().raw_value();
+            for page in bits.iter_ones() {
+                let addr = base + page as u64 * page_size;
+                match ranges.last_mut() {
+                    Some((s, l)) if *s + *l == addr => *l += page_size,
+                    _ => ranges.push((addr, page_size)),
+                }
+            }
+        }
+        ranges
+    }
+
+    fn clear_pending_discards(&self) {
+        for region in self.iter() {
+            if let Some(d) = region.discarded.lock().unwrap().as_mut() {
+                d.pending = None;
+            }
+        }
     }
 }
 
@@ -1297,7 +1475,7 @@ mod tests {
         // Untracked memory is unlogged without being a hole: a page changed to zeros is dumped.
         let bitmap = HashMap::from([(0, vec![0b10])]);
         let mut file = TempFile::new().unwrap().into_file();
-        let dumped = guest_memory.dump_dirty(&mut file, &bitmap, true).unwrap();
+        let dumped = guest_memory.dump_dirty(&mut file, &bitmap, true, &[]).unwrap();
         assert_eq!(dumped, vec![0b10]);
     }
 
@@ -1341,7 +1519,7 @@ mod tests {
             let mut file = TempFile::new().unwrap().into_file();
             file.set_len(page_size as u64 * 4).unwrap();
             let dumped = guest_memory
-                .dump_dirty(&mut file, &bitmap, zero_skip)
+                .dump_dirty(&mut file, &bitmap, zero_skip, &[])
                 .unwrap();
             assert_eq!(dumped, vec![if zero_skip { 0b1001 } else { 0b1101 }]);
 
@@ -1350,6 +1528,68 @@ mod tests {
             file.read_exact(&mut back).unwrap();
             assert_eq!(back, ones);
         }
+    }
+
+    #[test]
+    fn test_dumps_leave_out_discarded_pages_still_zero() {
+        let page_size = get_page_size().unwrap();
+        let regions = anonymous(
+            [(GuestAddress(0), page_size * 4)].into_iter(),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let guest_memory = into_region_ext(regions);
+        let page = |i: usize| GuestAddress((i * page_size) as u64);
+        let fill = |b: u8| vec![b; page_size];
+
+        // Pages 1-3 are given back after being written: page 1 is left alone, page 2 is
+        // written again, page 3 is written again with zeros.
+        for i in 0..4 {
+            guest_memory.write(&fill(1), page(i)).unwrap();
+        }
+        guest_memory
+            .discard_free_range(page(1), page_size * 3)
+            .unwrap();
+        guest_memory.write(&fill(2), page(2)).unwrap();
+        guest_memory.write(&fill(0), page(3)).unwrap();
+        let discarded = guest_memory.discarded_ranges(SnapshotType::Diff);
+        assert_eq!(discarded, vec![(page_size as u64, page_size as u64 * 3)]);
+
+        let read = |file: &mut File, i: usize| {
+            let mut back = vec![0u8; page_size];
+            file.seek(SeekFrom::Start((i * page_size) as u64)).unwrap();
+            file.read_exact(&mut back).unwrap();
+            back
+        };
+        let want = [fill(1), fill(0), fill(2), fill(0)];
+
+        let mut full = TempFile::new().unwrap().into_file();
+        full.set_len(page_size as u64 * 4).unwrap();
+        guest_memory.dump(&mut full, &discarded).unwrap();
+        assert_eq!(full.stream_position().unwrap(), page_size as u64 * 4);
+
+        // Only page 0 has a dirty bit. The rewritten page 2 must still override the base.
+        guest_memory.reset_dirty();
+        let bitmap = HashMap::from([(0, vec![0b0001])]);
+        let mut diff = TempFile::new().unwrap().into_file();
+        diff.set_len(page_size as u64 * 4).unwrap();
+        let dumped = guest_memory
+            .dump_dirty(&mut diff, &bitmap, false, &discarded)
+            .unwrap();
+        assert_eq!(dumped, vec![0b0101]);
+
+        for file in [&mut full, &mut diff] {
+            for (i, want) in want.iter().enumerate() {
+                assert_eq!(&read(file, i), want, "page {i}");
+            }
+            // Pages 1 and 3 were never written, so the file holds no data for them.
+            assert_eq!(file.metadata().unwrap().blocks() * 512, page_size as u64 * 2);
+        }
+
+        guest_memory.clear_pending_discards();
+        assert!(guest_memory.discarded_ranges(SnapshotType::Diff).is_empty());
+        assert_eq!(guest_memory.discarded_ranges(SnapshotType::Full), discarded);
     }
 
     #[test]
@@ -1606,7 +1846,7 @@ mod tests {
 
         // dump the full memory.
         let mut memory_file = TempFile::new().unwrap().into_file();
-        guest_memory.dump(&mut memory_file).unwrap();
+        guest_memory.dump(&mut memory_file, &[]).unwrap();
 
         let restored_guest_memory =
             into_region_ext(snapshot_file(memory_file, memory_state.regions(), false).unwrap());
@@ -1669,7 +1909,7 @@ mod tests {
 
         let mut file = TempFile::new().unwrap().into_file();
         let dumped = guest_memory
-            .dump_dirty(&mut file, &kvm_dirty_bitmap, false)
+            .dump_dirty(&mut file, &kvm_dirty_bitmap, false, &[])
             .unwrap();
         // kvm ∪ firecracker bitmaps cover all 4 file pages on the first dump.
         assert_eq!(dumped, vec![0b1111]);
@@ -1710,7 +1950,7 @@ mod tests {
         kvm_dirty_bitmap.insert(1, vec![0b10]);
 
         let dumped = guest_memory
-            .dump_dirty(&mut reader, &kvm_dirty_bitmap, false)
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap, false, &[])
             .unwrap();
         // File pages 0 (kvm), 1 (firecracker), 3 (kvm) were written; page 2 is a hole.
         assert_eq!(dumped, vec![0b1011]);
@@ -1747,7 +1987,7 @@ mod tests {
 
         let mut reader = file.into_file();
         let dumped = guest_memory
-            .dump_dirty(&mut reader, &kvm_dirty_bitmap, false)
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap, false, &[])
             .unwrap();
         // Only the firecracker bitmap is dirty this round: file pages 0 and 2.
         assert_eq!(dumped, vec![0b0101]);
@@ -1778,19 +2018,19 @@ mod tests {
         kvm_dirty_bitmap.insert(0, vec![0b1, 0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false, &[]),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         kvm_dirty_bitmap.insert(0, vec![0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b110]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false, &[]),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         kvm_dirty_bitmap.insert(0, vec![]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false, &[]),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
     }

@@ -441,7 +441,7 @@ impl Balloon {
                 let guest_addr =
                     GuestAddress(u64::from(page_frame_number) << VIRTIO_BALLOON_PFN_SHIFT);
 
-                if let Err(err) = mem.discard_range(
+                if let Err(err) = mem.discard_free_range(
                     guest_addr,
                     usize::try_from(range_len).unwrap() << VIRTIO_BALLOON_PFN_SHIFT,
                 ) {
@@ -567,7 +567,7 @@ impl Balloon {
                 }
 
                 METRICS.free_page_hint_count.inc();
-                if let Err(err) = mem.discard_range(desc.addr, desc.len as usize) {
+                if let Err(err) = mem.discard_free_range(desc.addr, desc.len as usize) {
                     METRICS.free_page_hint_fails.inc();
                     error!("balloon hinting: failed to remove range: {err:?}");
                 } else {
@@ -609,7 +609,7 @@ impl Balloon {
             let mut last_desc = Some(head);
             while let Some(desc) = last_desc {
                 METRICS.free_page_report_count.inc();
-                if let Err(err) = mem.discard_range(desc.addr, desc.len as usize) {
+                if let Err(err) = mem.discard_free_range(desc.addr, desc.len as usize) {
                     METRICS.free_page_report_fails.inc();
                     error!("balloon: failed to remove range: {err:?}");
                 } else {

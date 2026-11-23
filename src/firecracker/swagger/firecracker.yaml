@@ -2036,6 +2036,11 @@ definitions:
       firecracker_version:
         description: Firecracker build version.
         type: string
+      capabilities:
+        description: Build capabilities advertised by this running process.
+        type: array
+        items:
+          type: string
 
   Vsock:
     type: object
